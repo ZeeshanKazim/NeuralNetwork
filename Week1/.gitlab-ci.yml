@@ -1,0 +1,18 @@
+# Minimal GitLab Pages pipeline for a static site
+stages:
+- deploy
+
+
+pages:
+stage: deploy
+script:
+- mkdir -p public
+- cp index.html public/
+- cp train.csv public/
+- cp test.csv public/
+- cp gender_submission.csv public/
+artifacts:
+paths:
+- public
+only:
+- main # or 'master' depending on your default branch
