@@ -1,0 +1,6 @@
+<script>
+  // Enable dark mode with tailwind CDN
+  tailwind.config = { darkMode: 'class' }
+  const theme = localStorage.getItem('theme') || 'light';
+  document.documentElement.classList.toggle('dark', theme === 'dark');
+</script>
