@@ -1,240 +1,71 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Titanic Voyage — EDA Dashboard</title>
-
-<!-- Client-side libs -->
-<link rel="preconnect" href="https://cdn.jsdelivr.net" />
-<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
-<style>
-:root{
-  --bg:#0b1220; --bg-2:#0e1627; --panel:#101a30; --ink:#e9edf6; --muted:#a5b0c5;
-  --brand:#5bd4c7; --brand-2:#8aa3ff; --ring:rgba(91,212,199,.35);
-  --card:rgba(255,255,255,.06); --soft:rgba(255,255,255,.08);
-  --shadow:0 14px 35px rgba(0,0,0,.35);
-}
-*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-body{min-height:100vh;background: radial-gradient(1200px 700px at 10% -10%, #1a2b47 0%, var(--bg) 60%), linear-gradient(180deg, #09101c, var(--bg-2)); color:var(--ink); padding:28px}
-.container{max-width:1200px;margin:0 auto}
-
-.header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--brand),var(--brand-2));box-shadow:var(--shadow)}
-.title h1{font-size:clamp(1.6rem,2.4vw,2.1rem);line-height:1.1}
-.title p{color:var(--muted);margin-top:6px}
-
-.toolbar{display:flex;align-items:center;gap:10px}
-select,button{background:rgba(255,255,255,.06);color:var(--ink);border:1px solid rgba(255,255,255,.16);padding:8px 10px;border-radius:10px;cursor:pointer}
-button:focus,select:focus{outline:none;box-shadow:0 0 0 3px var(--ring)}
-
-.panel{background:linear-gradient(180deg,var(--panel),#0c1426);border:1px solid rgba(255,255,255,.08);border-radius:20px;box-shadow:var(--shadow);padding:18px}
-.grid{display:grid;gap:14px}
-.cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
-.cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
-@media(max-width:900px){.cols-3,.cols-2{grid-template-columns:1fr}}
-
-.kpi{background:var(--card);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px 16px;transition:.25s}
-.kpi:hover{transform:translateY(-3px);border-color:rgba(138,163,255,.45)}
-.kpi .label{color:var(--muted);font-size:.9rem}
-.kpi .value{font-size:1.7rem;font-weight:800;margin-top:6px;background:linear-gradient(90deg,var(--brand),var(--brand-2));-webkit-background-clip:text;background-clip:text;color:transparent}
-
-.pills{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
-.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:rgba(138,163,255,.12);border:1px solid rgba(138,163,255,.28);font-size:.95rem}
-.badge{font-size:.85rem;color:var(--muted)}
-
-.card{background:var(--soft);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px;box-shadow:var(--shadow)}
-.card h3{font-size:1.05rem;margin-bottom:8px}
-.chart{position:relative;height:270px}
-
-.section{display:flex;align-items:center;justify-content:space-between;margin:18px 0 8px}
-.section h2{font-size:1.2rem}
-hr.sep{border:none;height:1px;background:linear-gradient(90deg,rgba(255,255,255,.06),rgba(255,255,255,.25),rgba(255,255,255,.06));margin:16px 0}
-
-.footer{text-align:center;color:var(--muted);margin-top:22px;font-size:.9rem}
-</style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div class="brand">
-        <div class="logo"></div>
-        <div class="title">
-          <h1>Titanic Voyage — EDA Dashboard</h1>
-          <p>Client‑side analysis of <code>train.csv</code> rendered with Chart.js</p>
-        </div>
-      </div>
-      <div class="toolbar">
-        <span class="badge">Slice class chart by:</span>
-        <select id="ctlSex">
-          <option value="all">All passengers</option>
-          <option value="female">Females only</option>
-          <option value="male">Males only</option>
-        </select>
-        <span class="badge" id="ctlSexBadge">(All)</span>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="grid cols-3">
-        <div class="kpi"><div class="label">Passengers</div><div class="value" id="statTotal">—</div></div>
-        <div class="kpi"><div class="label">Survivors</div><div class="value" id="statSurvivors">—</div></div>
-        <div class="kpi"><div class="label">Overall survival</div><div class="value" id="statRate">—</div></div>
-      </div>
-      <div class="pills">
-        <span class="pill">Female survival: <strong id="pillFemale">—</strong></span>
-        <span class="pill">Male survival: <strong id="pillMale">—</strong></span>
-        <span class="pill">Gender Δ: <strong id="pillDeltaGender">—</strong></span>
-        <span class="pill">Class Δ (1st–3rd): <strong id="pillDeltaClass">—</strong></span>
-      </div>
-    </div>
-
-    <div class="section"><h2>Key Drivers</h2><span class="badge">Hover for values</span></div>
-    <div class="grid cols-2">
-      <div class="card"><h3>By Passenger Class <span class="badge" id="badgeClass">(All)</span></h3><div class="chart"><canvas id="chartPclass"></canvas></div></div>
-      <div class="card"><h3>By Gender</h3><div class="chart"><canvas id="chartSex"></canvas></div></div>
-      <div class="card"><h3>By Age Group</h3><div class="chart"><canvas id="chartAge"></canvas></div></div>
-      <div class="card"><h3>By Family Size</h3><div class="chart"><canvas id="chartFamily"></canvas></div></div>
-      <div class="card"><h3>By Fare Quartile</h3><div class="chart"><canvas id="chartFare"></canvas></div></div>
-      <div class="card"><h3>By Embarkation Port</h3><div class="chart"><canvas id="chartPort"></canvas></div></div>
-    </div>
-
-    <hr class="sep" />
-    <div class="footer">© Titanic Voyage — static single‑file dashboard</div>
-  </div>
-
-<script>
-const CSV_URL = 'train.csv'; // adjust to 'data/train.csv' if you move it
-
-// Utilities
-const pct = (x)=>Math.round(x*1000)/10;
-const mean = (xs)=> xs.length ? xs.reduce((a,b)=>a+(+b||0),0)/xs.length : 0;
-const qtl = (arr, q)=>{
-  const a = arr.filter(v=>!isNaN(v)).slice().sort((x,y)=>x-y);
-  if(!a.length) return NaN;
-  const p = (a.length-1)*q, b = Math.floor(p), r = p-b;
-  return a[b] + (a[b+1]-a[b])*(isNaN(r)?0:r||0);
-};
-const ageBand = (a)=>{
-  if(a===''||a==null||isNaN(+a)) return 'Unknown';
-  const x=+a; if(x<13) return 'Children (0-12)'; if(x<20) return 'Teens (13-19)'; if(x<60) return 'Adults (20-59)'; return 'Elderly (60+)';
-};
-const famBucket = (x)=>{ const v=(+x)||0; return v>=6?'6+':String(v); };
-
-// Chart helper
-function drawChart(ctx, type, labels, data, title){
-  return new Chart(ctx, {
-    type,
-    data: { labels, datasets: [{ label:title, data, borderWidth:2, fill:type==='line'?false:true, tension:0.2 }]},
-    options: {
-      responsive:true, maintainAspectRatio:false,
-      plugins:{ legend:{display:false}, title:{display:true,text:title}},
-      scales:(type==='pie'||type==='doughnut')?{}:{
-        y:{ beginAtZero:true, suggestedMax:100, ticks:{ callback:v=>v+'%' } },
-        x:{}
-      }
-    }
-  });
+<!doctype html>
+chart.setOption({ tooltip:{trigger:'axis',axisPointer:{type:'shadow'}}, legend:{}, grid:{left:60,right:20,top:30,bottom:40}, xAxis:{type:'category', data:['1st','2nd','3rd']}, yAxis:{type:'value'}, series:[{name:'Survived',type:'bar',stack:'tot',data:surv},{name:'Not',type:'bar',stack:'tot',data:die}] });
 }
 
-async function loadCSV(){
-  const res = await fetch(CSV_URL, {cache:'no-store'});
-  if(!res.ok) throw new Error('Cannot load CSV');
-  const text = await res.text();
-  return new Promise(resolve => Papa.parse(text, {header:true, dynamicTyping:true, complete:r=>resolve(r.data)}));
+
+function ageBox(rows){
+const g0=rows.filter(r=>Number(r.Survived)===0 && r.Age!=null).map(r=>+r.Age); const g1=rows.filter(r=>Number(r.Survived)===1 && r.Age!=null).map(r=>+r.Age);
+function boxStats(a){ const s=a.slice().sort((x,y)=>x-y); const q=(p)=>{const pos=(s.length-1)*p; const b=Math.floor(pos), r=pos-b; return s[b]+(s[b+1]-s[b])*(isNaN(r)?0:r||0)}; return [q(0), q(0.25), q(0.5), q(0.75), q(1)]; }
+const data=[boxStats(g0), boxStats(g1)];
+const chart=echarts.init(document.getElementById('chAgeBox'));
+chart.setOption({ tooltip:{trigger:'item'}, xAxis:{type:'category', data:['Not Survived','Survived']}, yAxis:{type:'value'}, series:[{ type:'boxplot', data }] });
 }
 
-function survRate(rows){ return pct(mean(rows.map(r=>+r.Survived||0))); }
 
-document.addEventListener('DOMContentLoaded', async () => {
-  const rows = (await loadCSV()).filter(r=>r && Object.keys(r).length);
-  rows.forEach(r=>{
-    r.FamilySize=(r.SibSp||0)+(r.Parch||0);
-    r.AgeBand=ageBand(r.Age);
-    r.Port = ({'C':'Cherbourg','Q':'Queenstown','S':'Southampton'})[r.Embarked] || 'Unknown';
-  });
-
-  // KPIs
-  const total = rows.length;
-  const survived = rows.filter(r=>r.Survived==1).length;
-  const overall = pct(survived/Math.max(1,total));
-  const males = rows.filter(r=>r.Sex==='male');
-  const females = rows.filter(r=>r.Sex==='female');
-  const maleR = survRate(males), femaleR = survRate(females);
-
-  document.getElementById('statTotal').textContent = total;
-  document.getElementById('statSurvivors').textContent = survived;
-  document.getElementById('statRate').textContent = `${overall}%`;
-  document.getElementById('pillFemale').textContent = `${femaleR}%`;
-  document.getElementById('pillMale').textContent = `${maleR}%`;
-  document.getElementById('pillDeltaGender').textContent = `${(femaleR - maleR).toFixed(1)}%`;
-
-  // Class
-  const pclassLabels = ['1st Class','2nd Class','3rd Class'];
-  const rateByClass = [1,2,3].map(c=>survRate(rows.filter(r=>r.Pclass===c)));
-  const classDelta = (rateByClass[0]-rateByClass[2]).toFixed(1);
-  document.getElementById('pillDeltaClass').textContent = `${classDelta}%`;
-
-  const byClassGender = {
-    all: rateByClass,
-    female: [1,2,3].map(c=>survRate(rows.filter(r=>r.Pclass===c && r.Sex==='female'))),
-    male: [1,2,3].map(c=>survRate(rows.filter(r=>r.Pclass===c && r.Sex==='male')))
-  };
-
-  let chartPclass = drawChart(document.getElementById('chartPclass').getContext('2d'), 'bar', pclassLabels, byClassGender.all, 'Survival by Class (%)');
-
-  // Gender (doughnut of rates)
-  const fRate = pct(females.filter(r=>r.Survived==1).length/Math.max(1,females.length));
-  const mRate = pct(males.filter(r=>r.Survived==1).length/Math.max(1,males.length));
-  new Chart(document.getElementById('chartSex').getContext('2d'), {
-    type:'doughnut',
-    data:{ labels:['Female Survived','Female Died','Male Survived','Male Died'], datasets:[{ data:[fRate, 100-fRate, mRate, 100-mRate] }]},
-    options:{ responsive:true, maintainAspectRatio:false, plugins:{ title:{ display:true, text:'Survival by Gender' } } }
-  });
-
-  // Age
-  const ageLabels = ['Children (0-12)','Teens (13-19)','Adults (20-59)','Elderly (60+)'];
-  const ageRates = ageLabels.map(g=>survRate(rows.filter(r=>r.AgeBand===g)));
-  drawChart(document.getElementById('chartAge').getContext('2d'), 'bar', ageLabels, ageRates, 'Survival by Age Group (%)');
-
-  // Family
-  const famLabels = ['0','1','2','3','4','5','6+'];
-  const famRates = famLabels.map(b=>survRate(rows.filter(r=>(r.FamilySize>=6?'6+':String(r.FamilySize))===b)));
-  drawChart(document.getElementById('chartFamily').getContext('2d'), 'line', famLabels, famRates, 'Survival by Family Size (%)');
-
-  // Fare quartiles
-  const fares = rows.map(r=>+r.Fare).filter(v=>!isNaN(v));
-  const q25=qtl(fares,.25), q50=qtl(fares,.50), q75=qtl(fares,.75);
-  rows.forEach(r=>{
-    const f=+r.Fare||0;
-    r.FareBin = (f<=q25)?'Lowest 25%':(f<=q50)?'25–50%':(f<=q75)?'50–75%':'Top 25%';
-  });
-  const fareLabels = ['Lowest 25%','25–50%','50–75%','Top 25%'];
-  const fareRates = fareLabels.map(b=>survRate(rows.filter(r=>r.FareBin===b)));
-  drawChart(document.getElementById('chartFare').getContext('2d'), 'bar', fareLabels, fareRates, 'Survival by Fare Quartile (%)');
-
-  // Embarked port
-  const portLabels = ['Cherbourg','Queenstown','Southampton'];
-  const portRates = portLabels.map(p=>survRate(rows.filter(r=>r.Port===p)));
-  new Chart(document.getElementById('chartPort').getContext('2d'), {
-    type:'pie', data:{ labels:portLabels, datasets:[{ data:portRates }]},
-    options:{ responsive:true, maintainAspectRatio:false, plugins:{ title:{ display:true, text:'Survival by Embarkation Port' } } }
-  });
-
-  // Control
-  const ctl = document.getElementById('ctlSex');
-  const badge = document.getElementById('ctlSexBadge');
-  ctl.addEventListener('change', e=>{
-    const k = e.target.value; // all | female | male
-    chartPclass.data.datasets[0].data = byClassGender[k];
-    chartPclass.update();
-    badge.textContent = '(' + k[0].toUpperCase() + k.slice(1) + ')';
-    document.getElementById('badgeClass').textContent = badge.textContent;
-  });
+function scatter(rows){
+const pts=rows.filter(r=>r.Age!=null && r.Fare!=null).map(r=>({ value:[+r.Age, +r.Fare, r.Survived, r.Sex, r.Pclass] }));
+const chart=echarts.init(document.getElementById('chScatter'));
+chart.setOption({
+tooltip:{formatter:(p)=>{const [age,fare,y,sex,pc]=p.data.value; return `Age: ${age}<br/>Fare: ${fare.toFixed(2)}<br/>Survived: ${y==1?'Yes':'No'}<br/>Sex: ${sex}<br/>Pclass: ${pc}`;}},
+xAxis:{name:'Age'}, yAxis:{name:'Fare'}, grid:{left:60,right:20,top:20,bottom:50},
+series:[{type:'scatter', data:pts, symbolSize:(val)=>Math.max(4, Math.min(14, Math.sqrt(val[1])))}]
 });
+}
+
+
+function embarked100(rows){
+const ports=['C','Q','S']; const names={C:'Cherbourg',Q:'Queenstown',S:'Southampton'}; const total=ports.map(p=>rows.filter(r=> (r.Embarked||'')===p).length);
+const surv=ports.map(p=>rows.filter(r=> (r.Embarked||'')===p && Number(r.Survived)===1).length);
+const die=ports.map((_,i)=> total[i]-surv[i]); const perc=(a,b)=> a.map((v,i)=> total[i]? Math.round(v/total[i]*1000)/10 : 0);
+const chart=echarts.init(document.getElementById('chEmb'));
+chart.setOption({ tooltip:{trigger:'axis', axisPointer:{type:'shadow'}}, legend:{}, grid:{left:80,right:20,top:30,bottom:40}, xAxis:{type:'category', data:ports.map(p=>names[p])}, yAxis:{type:'value', max:100, axisLabel:{formatter:(v)=>v+'%'}}, series:[{name:'Survived %',type:'bar', stack:'x', data:perc(surv,total)},{name:'Not %',type:'bar', stack:'x', data:perc(die,total)}] });
+}
+
+
+function corrHeat(rows){
+const cols=['Survived','Pclass','Age','SibSp','Parch','Fare'];
+const mat=cols.map(c=> rows.map(r=> r[c]!=null? +r[c] : null));
+const z=cols.map((_,i)=> cols.map((_,j)=> +pearson(mat[i],mat[j]).toFixed(2)) );
+const data=[]; for(let i=0;i<cols.length;i++){ for(let j=0;j<cols.length;j++){ data.push([i,j,z[i][j]]); } }
+const chart=echarts.init(document.getElementById('chCorr'));
+chart.setOption({ tooltip:{}, grid:{left:80,right:20,top:20,bottom:40}, xAxis:{type:'category', data:cols}, yAxis:{type:'category', data:cols}, visualMap:{min:-1,max:1, calculable:true, orient:'horizontal', left:'center', bottom:0}, series:[{type:'heatmap', data, label:{show:true, formatter:(p)=>p.data[2].toFixed(2)}}] });
+}
+
+
+function buildAlerts(rows){
+const alerts=[]; const miss=missingness(rows);
+for(const m of miss){ if(m.percent>=0.4) alerts.push(`⚠️ High missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`); else if(m.percent>=0.2) alerts.push(`ℹ️ Noticeable missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`); }
+const withY=rows.filter(r=>r.Survived!=null); if(withY.length){ const rate=withY.filter(r=>+r.Survived===1).length/withY.length; if(rate<=0.25||rate>=0.75) alerts.push(`⚠️ Class imbalance: survival ${(rate*100).toFixed(1)}%`); }
+const ages=rows.map(r=> r.Age!=null? +r.Age : null).filter(v=>v!=null); const s=std(ages); if(s && s>15) alerts.push(`ℹ️ Wide spread in Age (σ ≈ ${s.toFixed(1)})`);
+document.getElementById('alerts').innerHTML = alerts.length? alerts.map(a=>`<li>${a}</li>`).join('') : '<li>✅ No issues detected for current filter.</li>';
+}
+
+
+function render(){ const rows=filtered(); kpis(rows); genderDiverging(rows); classStack(rows); ageBox(rows); scatter(rows); embarked100(rows); corrHeat(rows); buildAlerts(rows); }
+
+
+// ---------- Boot ----------
+(async function(){
+try{
+TRAIN = await parseCsv('train.csv');
+// basic feature engineering
+TRAIN.forEach(r=>{ r.FamilySize=(r.SibSp||0)+(r.Parch||0); });
+render();
+['fSex','fClass','fEmb'].forEach(id=> document.getElementById(id).addEventListener('change', render));
+document.getElementById('dlBtn').addEventListener('click', ()=> downloadCsv('titanic_filtered_train.csv', filtered()));
+window.addEventListener('resize', ()=>{ ['chGender','chClass','chAgeBox','chScatter','chEmb','chCorr'].forEach(id=> echarts.getInstanceByDom(document.getElementById(id))?.resize()); });
+}catch(e){ alert('Failed to load CSV. Ensure train.csv is next to index.html.'); console.error(e); }
+})();
 </script>
 </body>
 </html>
