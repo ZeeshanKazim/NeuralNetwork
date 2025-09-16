@@ -119,4 +119,179 @@
       <div class="card"><h3>Age (Boxplot + points)</h3><div id="chAgeBox" class="chart"></div></div>
       <div class="card"><h3>Fare × Age (Scatter + regression)</h3><div id="chScatter" class="chart"></div></div>
       <div class="card"><h3>Embarked (100% stacked)</h3><div id="chEmb" class="chart small"></div></div>
-      <div class="card"><h3>Correlation (numeric)</h3><div id="
+      <div class="card"><h3>Correlation (numeric)</h3><div id="chCorr" class="chart small"></div></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>Data Quality Alerts</h3>
+      <ul id="alerts" style="line-height:1.6"></ul>
+    </div>
+
+    <div class="footer">© 2025 Titanic Ultra — static single‑file dashboard (ECharts). Drop this and the CSVs into GitHub/GitLab Pages.</div>
+  </div>
+
+<script>
+// -------------- Utilities --------------
+const pct = (x)=> (isFinite(x) ? Math.round(x*1000)/10 : 0);
+const median = (a)=>{ const b=a.filter(v=>v!=null&&!Number.isNaN(v)).sort((x,y)=>x-y); if(!b.length) return null; const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; };
+const mean = (a)=>{ const b=a.filter(v=>v!=null&&!Number.isNaN(v)); return b.length? b.reduce((s,v)=>s+v,0)/b.length : null; };
+const std = (a)=>{ const m=mean(a); if(m==null) return null; const b=a.filter(v=>v!=null&&!Number.isNaN(v)); if(b.length<2) return 0; const v=b.reduce((s,x)=>s+(x-m)**2,0)/(b.length-1); return Math.sqrt(v); };
+const pearson=(x,y)=>{ const P=[]; for(let i=0;i<Math.min(x.length,y.length);i++){const xi=x[i],yi=y[i]; if(xi!=null&&yi!=null&&!Number.isNaN(xi)&&!Number.isNaN(yi)) P.push([xi,yi]);} const xs=P.map(p=>p[0]), ys=P.map(p=>p[1]); const mx=mean(xs), my=mean(ys); if(mx==null||my==null) return 0; const sx=std(xs)||0, sy=std(ys)||0; if(!sx||!sy) return 0; const cov=xs.reduce((s,xi,j)=>s+(xi-mx)*(ys[j]-my),0)/(xs.length-1); return cov/(sx*sy); };
+const missingness=(rows)=>{ if(!rows.length) return []; const cols=Object.keys(rows[0]); const n=rows.length; return cols.map(c=>{const m=rows.reduce((s,r)=>s+((r[c]==null||r[c]==='')?1:0),0); return {column:c, missing:m, percent:n?m/n:0};}).sort((a,b)=>b.percent-a.percent) };
+const normalizeRow=(row)=>{ const r={}; for(const [k,v] of Object.entries(row)){ r[k]=(v===''||v===undefined)? null : (typeof v==='string'? v.trim(): v); } return r; };
+function downloadCsv(name, rows){ if(!rows.length) return; const cols=Object.keys(rows[0]); const esc=v=>{ if(v==null) return ''; const s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; }; const csv=[cols.join(',')].concat(rows.map(r=>cols.map(c=>esc(r[c])).join(','))).join('\n'); const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); }
+
+let TRAIN=[];
+function parseCsv(url){ return new Promise((resolve,reject)=>{ Papa.parse(url,{download:true,header:true,dynamicTyping:true,skipEmptyLines:'greedy', complete:r=>resolve(r.data.map(normalizeRow)), error:reject}); }); }
+function F(){ const s=fSex.value; const c=fClass.value; const e=fEmb.value; return TRAIN.filter(r=>{ if(s!=='ALL' && r.Sex!==s) return false; if(c!=='ALL' && String(r.Pclass)!==c) return false; const emb=(r.Embarked??'UNKNOWN'); if(e!=='ALL' && !((e==='UNKNOWN' && (emb==null||emb==='')) || emb===e)) return false; return true; }) }
+
+// -------------- Charts --------------
+function kpis(rows){
+  const total=rows.length; const withY=rows.filter(r=>r.Survived!=null); const surv=withY.filter(r=>Number(r.Survived)===1).length; const rate=pct(surv/Math.max(1,withY.length));
+  kRows.textContent=String(total); kSurv.textContent=rate+'%';
+  const ages=rows.map(r=>r.Age!=null?+r.Age:null); const fares=rows.map(r=>r.Fare!=null?+r.Fare:null);
+  kAge.textContent=(median(ages)??'—').toFixed? median(ages).toFixed(1) : '—';
+  kFare.textContent=(median(fares)??'—').toFixed? median(fares).toFixed(2) : '—';
+  const females=rows.filter(r=>r.Sex==='female'), males=rows.filter(r=>r.Sex==='male');
+  const fr=pct(females.filter(r=>+r.Survived===1).length/Math.max(1,females.length));
+  const mr=pct(males.filter(r=>+r.Survived===1).length/Math.max(1,males.length));
+  cFem.textContent=fr+'%'; cMale.textContent=mr+'%'; cDeltaG.textContent=(fr-mr).toFixed(1)+'%';
+  const cls=[1,2,3].map(cl=>pct(rows.filter(r=>r.Pclass===cl && +r.Survived===1).length/Math.max(1, rows.filter(r=>r.Pclass===cl).length)));
+  cDeltaC.textContent=((cls[0]||0)-(cls[2]||0)).toFixed(1)+'%';
+}
+
+function gauge(rows){
+  const withY=rows.filter(r=>r.Survived!=null); const rate=withY.length? withY.filter(r=>+r.Survived===1).length/withY.length : 0;
+  const chart=echarts.init(chGauge);
+  chart.setOption({
+    series:[{
+      type:'gauge', startAngle:210, endAngle:-30, center:['50%','60%'],
+      progress:{show:true, width:16}, axisLine:{lineStyle:{width:16}},
+      pointer:{show:false}, splitLine:{show:false}, axisTick:{show:false}, axisLabel:{show:false},
+      data:[{value: +(rate*100).toFixed(1)}],
+      title:{offsetCenter:[0,'-5%'], fontSize:12, color:'#aab3c6', textBorderWidth:0},
+      detail:{valueAnimation:true, formatter:(v)=>v+'%', color:'#e9edf6', fontSize:28}
+    }],
+    toolbox:{feature:{saveAsImage:{}}}
+  });
+}
+
+function genderDiverging(rows){
+  const males=rows.filter(r=>r.Sex==='male'); const females=rows.filter(r=>r.Sex==='female');
+  const mS=pct(males.filter(r=>+r.Survived===1).length/Math.max(1,males.length));
+  const fS=pct(females.filter(r=>+r.Survived===1).length/Math.max(1,females.length));
+  const chart=echarts.init(chGender);
+  chart.setOption({
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'}}, grid:{left:60,right:20,top:20,bottom:40},
+    xAxis:{type:'value', min:-100, max:100, axisLabel:{formatter:(v)=>Math.abs(v)+'%'}}, yAxis:{type:'category', data:['Female','Male']},
+    series:[
+      {type:'bar', stack:'x', data:[fS, mS], label:{show:true, formatter:(d)=>Math.abs(d.value)+'%'}},
+      {type:'bar', stack:'x', data:[-(100-fS), -(100-mS)], label:{show:true, formatter:(d)=>Math.abs(d.value)+'%'}}
+    ], toolbox:{feature:{saveAsImage:{}}}
+  });
+}
+
+function classPct(rows){
+  const classes=[1,2,3];
+  const chart=echarts.init(chClassPct);
+  const totals=classes.map(c=> rows.filter(r=>r.Pclass===c).length);
+  const surv=classes.map(c=> rows.filter(r=>r.Pclass===c && +r.Survived===1).length);
+  const die=classes.map((_,i)=> totals[i]-surv[i]);
+  const perc=(a)=>a.map((v,i)=> totals[i]? +(v/totals[i]*100).toFixed(1) : 0);
+  chart.setOption({
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'}}, grid:{left:60,right:20,top:30,bottom:40},
+    xAxis:{type:'category', data:['1st','2nd','3rd']}, yAxis:{type:'value', max:100, axisLabel:{formatter:(v)=>v+'%'}},
+    series:[{name:'Survived %', type:'bar', stack:'all', data:perc(surv)}, {name:'Not %', type:'bar', stack:'all', data:perc(die)}],
+    toolbox:{feature:{saveAsImage:{}}}
+  });
+}
+
+function sankey(rows){
+  const links=[]; const add=(s,t,v)=>{ if(!v) return; const k=s+'→'+t; const f=links.find(x=>x.source===s&&x.target===t); if(f) f.value+=v; else links.push({source:s,target:t,value:v}); };
+  const outcome = (y)=> y===1? 'Survived':'Not';
+  const classes=['1','2','3']; const sexes=['female','male'];
+  for(const sex of sexes){ for(const pc of classes){ const group=rows.filter(r=>r.Sex===sex && String(r.Pclass)===pc);
+      const s=group.filter(r=>+r.Survived===1).length; const d=group.filter(r=>+r.Survived===0).length;
+      add(sex.toUpperCase(), 'Class '+pc, s+d); add('Class '+pc, outcome(1), s); add('Class '+pc, outcome(0), d); }}
+  const chart=echarts.init(chSankey);
+  chart.setOption({
+    tooltip:{}, series:[{ type:'sankey', data:Array.from(new Set(links.flatMap(l=>[l.source,l.target]))).map(n=>({name:n})), links,
+      emphasis:{focus:'adjacency'}, layoutIterations:64, nodeGap:14, lineStyle:{color:'gradient',curveness:0.5} }],
+    toolbox:{feature:{saveAsImage:{}}}
+  });
+}
+
+function ageBox(rows){
+  const g0=rows.filter(r=>+r.Survived===0 && r.Age!=null).map(r=>+r.Age); const g1=rows.filter(r=>+r.Survived===1 && r.Age!=null).map(r=>+r.Age);
+  const boxStats=(a)=>{ if(!a.length) return [0,0,0,0,0]; const s=a.slice().sort((x,y)=>x-y); const q=(p)=>{const pos=(s.length-1)*p; const b=Math.floor(pos), r=pos-b; return s[b]+((s[b+1]??s[b])-s[b])*(isNaN(r)?0:r||0)}; return [q(0), q(0.25), q(0.5), q(0.75), q(1)]; };
+  const data=[boxStats(g0), boxStats(g1)];
+  const jitter = rows.filter(r=>r.Age!=null).map(r=>({value:[r.Survived?1:0, +r.Age], itemStyle:{opacity:.35}}));
+  const chart=echarts.init(chAgeBox);
+  chart.setOption({
+    tooltip:{trigger:'item'}, xAxis:{type:'category', data:['Not Survived','Survived']}, yAxis:{type:'value'},
+    series:[{type:'boxplot', data}, {type:'scatter', data:jitter, symbolSize:6}], toolbox:{feature:{saveAsImage:{}}}
+  });
+}
+
+function scatter(rows){
+  const pts=rows.filter(r=>r.Age!=null && r.Fare!=null).map(r=>({ value:[+r.Age, +r.Fare, r.Survived, r.Sex, r.Pclass] }));
+  // simple linear regression y = a + b*x
+  const xs=pts.map(p=>p.value[0]), ys=pts.map(p=>p.value[1]);
+  const mx=mean(xs)||0, my=mean(ys)||0; const sx=std(xs)||1; const sy=std(ys)||1; const r=pearson(xs,ys)||0; const b=r*(sy/sx); const a=my-b*mx;
+  const lineX=[Math.min(...xs), Math.max(...xs)]; const lineY=lineX.map(x=> a+b*x);
+  const chart=echarts.init(chScatter);
+  chart.setOption({
+    tooltip:{formatter:(p)=>{const [age,fare,y,sex,pc]=p.data.value; return `Age: ${age}<br/>Fare: ${fare.toFixed(2)}<br/>Survived: ${y==1?'Yes':'No'}<br/>Sex: ${sex}<br/>Pclass: ${pc}`;}},
+    grid:{left:60,right:20,top:20,bottom:50}, xAxis:{name:'Age'}, yAxis:{name:'Fare'},
+    series:[{type:'scatter', data:pts, symbolSize:(val)=>Math.max(4, Math.min(14, Math.sqrt(val[1]))), emphasis:{focus:'series'}}, {type:'line', data:[ [lineX[0], lineY[0]], [lineX[1], lineY[1]] ], smooth:true, showSymbol:false} ],
+    toolbox:{feature:{saveAsImage:{}}}
+  });
+}
+
+function embarked100(rows){
+  const ports=['C','Q','S']; const names={C:'Cherbourg',Q:'Queenstown',S:'Southampton'}; const total=ports.map(p=>rows.filter(r=> (r.Embarked||'')===p).length);
+  const surv=ports.map(p=>rows.filter(r=> (r.Embarked||'')===p && +r.Survived===1).length);
+  const die=ports.map((_,i)=> total[i]-surv[i]); const perc=(a)=> a.map((v,i)=> total[i]? Math.round(v/total[i]*1000)/10 : 0);
+  const chart=echarts.init(chEmb);
+  chart.setOption({ tooltip:{trigger:'axis', axisPointer:{type:'shadow'}}, grid:{left:80,right:20,top:30,bottom:40}, xAxis:{type:'category', data:ports.map(p=>names[p])}, yAxis:{type:'value', max:100, axisLabel:{formatter:(v)=>v+'%'}}, series:[{name:'Survived %',type:'bar', stack:'x', data:perc(surv)},{name:'Not %',type:'bar', stack:'x', data:perc(die)}], toolbox:{feature:{saveAsImage:{}}} });
+}
+
+function corrHeat(rows){
+  const cols=['Survived','Pclass','Age','SibSp','Parch','Fare'];
+  const mat=cols.map(c=> rows.map(r=> r[c]!=null? +r[c] : null));
+  const z=cols.map((_,i)=> cols.map((_,j)=> +pearson(mat[i],mat[j]).toFixed(2)) );
+  const data=[]; for(let i=0;i<cols.length;i++){ for(let j=0;j<cols.length;j++){ data.push([i,j,z[i][j]]); } }
+  const chart=echarts.init(chCorr);
+  chart.setOption({ tooltip:{}, grid:{left:80,right:20,top:20,bottom:40}, xAxis:{type:'category', data:cols}, yAxis:{type:'category', data:cols}, visualMap:{min:-1,max:1, calculable:true, orient:'horizontal', left:'center', bottom:0}, series:[{type:'heatmap', data, label:{show:true, formatter:(p)=>p.data[2].toFixed(2)}}], toolbox:{feature:{saveAsImage:{}}} });
+}
+
+function alerts(rows){
+  const out=[]; const miss=missingness(rows);
+  for(const m of miss){ if(m.percent>=0.4) out.push(`⚠️ High missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`); else if(m.percent>=0.2) out.push(`ℹ️ Noticeable missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`); }
+  const withY=rows.filter(r=>r.Survived!=null); if(withY.length){ const rate=withY.filter(r=>+r.Survived===1).length/withY.length; if(rate<=0.25||rate>=0.75) out.push(`⚠️ Class imbalance: survival ${(rate*100).toFixed(1)}%`); }
+  const ages=rows.map(r=> r.Age!=null? +r.Age : null).filter(v=>v!=null); const s=std(ages); if(s && s>15) out.push(`ℹ️ Wide spread in Age (σ ≈ ${s.toFixed(1)})`);
+  alerts.innerHTML = out.length? out.map(a=>`<li>${a}</li>`).join('') : '<li>✅ No issues detected for current filter.</li>';
+}
+
+function render(){ const rows=F(); kpis(rows); gauge(rows); genderDiverging(rows); classPct(rows); sankey(rows); ageBox(rows); scatter(rows); embarked100(rows); corrHeat(rows); alerts(rows); }
+
+// -------------- Boot --------------
+const fSex=document.getElementById('fSex'); const fClass=document.getElementById('fClass'); const fEmb=document.getElementById('fEmb');
+const kRows=document.getElementById('kRows'); const kSurv=document.getElementById('kSurv'); const kAge=document.getElementById('kAge'); const kFare=document.getElementById('kFare');
+const cFem=document.getElementById('cFem'); const cMale=document.getElementById('cMale'); const cDeltaG=document.getElementById('cDeltaG'); const cDeltaC=document.getElementById('cDeltaC');
+const chGauge=document.getElementById('chGauge'); const chGender=document.getElementById('chGender'); const chClassPct=document.getElementById('chClassPct'); const chSankey=document.getElementById('chSankey'); const chAgeBox=document.getElementById('chAgeBox'); const chScatter=document.getElementById('chScatter'); const chEmb=document.getElementById('chEmb'); const chCorr=document.getElementById('chCorr');
+
+(async function(){
+  try{
+    TRAIN = await parseCsv('train.csv');
+    // light feature engineering
+    TRAIN.forEach(r=>{ r.FamilySize=(r.SibSp||0)+(r.Parch||0); });
+    render();
+    ['fSex','fClass','fEmb'].forEach(id=> document.getElementById(id).addEventListener('change', render));
+    document.getElementById('dlBtn').addEventListener('click', ()=> downloadCsv('titanic_filtered_train.csv', F()));
+    window.addEventListener('resize', ()=>{ ['chGauge','chGender','chClassPct','chSankey','chAgeBox','chScatter','chEmb','chCorr'].forEach(id=> echarts.getInstanceByDom(document.getElementById(id))?.resize()); });
+  }catch(e){ alert('Failed to load CSV. Ensure train.csv is next to index.html.'); console.error(e); }
+})();
+</script>
+</body>
+</html>
