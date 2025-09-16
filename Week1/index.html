@@ -1,368 +1,80 @@
 <!doctype html>
-<html lang="en" class="scroll-smooth">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Titanic EDA – Interactive Dashboard</title>
-  <meta name="description" content="Attractive, vigilant Titanic EDA dashboard with filters, data-quality alerts, charts, and CSV export. Single-file HTML for GitHub Pages."/>
-  <meta property="og:title" content="Titanic EDA – Interactive Dashboard" />
-  <meta property="og:description" content="Filters, alerts, charts, and CSV export. Single-file HTML for GitHub Pages." />
-  <meta name="theme-color" content="#0ea5e9" />
+{name:'Not', type:'bar', stack:'x', data:[-fDie, -mDie], label:{show:true, formatter:(d)=>Math.abs(d.value)+'%'}},
+]
+});
+}
 
-  <!-- Tailwind CSS (CDN) -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    // Tailwind dark mode setup
-    tailwind.config = { darkMode: 'class' };
-    const theme = localStorage.getItem('theme') || 'light';
-    if (theme === 'dark') document.documentElement.classList.add('dark');
-  </script>
 
-  <!-- Plotly for charts -->
-  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-  <!-- PapaParse for CSV parsing -->
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+function classStack(rows){
+const classes=[1,2,3]; const surv=classes.map(c=>rows.filter(r=>r.Pclass===c && Number(r.Survived)===1).length); const die=classes.map(c=>rows.filter(r=>r.Pclass===c && Number(r.Survived)===0).length);
+const chart=echarts.init(document.getElementById('chClass'));
+chart.setOption({ tooltip:{trigger:'axis',axisPointer:{type:'shadow'}}, legend:{}, grid:{left:60,right:20,top:30,bottom:40}, xAxis:{type:'category', data:['1st','2nd','3rd']}, yAxis:{type:'value'}, series:[{name:'Survived',type:'bar',stack:'tot',data:surv},{name:'Not',type:'bar',stack:'tot',data:die}] });
+}
 
-  <style>
-    .card { @apply bg-white dark:bg-slate-800/70 rounded-2xl shadow p-5; }
-    .metric { @apply text-3xl font-semibold; }
-    .label { @apply text-slate-500 dark:text-slate-400 text-xs tracking-wide uppercase; }
-    .grid-auto { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid rgb(226 232 240 / 1); }
-    th { background: #f8fafc; font-weight: 600; }
-    .pill { @apply inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-200 text-sm; }
-  </style>
-</head>
-<body class="bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100">
-  <!-- Header -->
-  <header class="border-b bg-gradient-to-r from-sky-50 to-indigo-50 dark:from-slate-900 dark:to-slate-800/80 backdrop-blur sticky top-0 z-10">
-    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
-      <div class="flex items-center gap-3">
-        <div class="h-9 w-9 rounded-xl bg-sky-600/90 text-white grid place-items-center text-lg font-bold shadow">TE</div>
-        <h1 class="text-xl sm:text-2xl font-bold">Titanic EDA Dashboard</h1>
-      </div>
-      <div class="flex items-center gap-2">
-        <a class="text-sky-700 dark:text-sky-300 hover:underline text-sm" href="#help">Help</a>
-        <button id="themeToggle" class="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-sm transition hover:scale-[1.02] active:scale-[0.98]">🌙 / ☀️</button>
-      </div>
-    </div>
-  </header>
 
-  <main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
-    <!-- Status / loaders -->
-    <div id="status" class="hidden card"><div id="statusText" class="text-sm"></div></div>
+function ageBox(rows){
+const g0=rows.filter(r=>Number(r.Survived)===0 && r.Age!=null).map(r=>+r.Age); const g1=rows.filter(r=>Number(r.Survived)===1 && r.Age!=null).map(r=>+r.Age);
+function boxStats(a){ const s=a.slice().sort((x,y)=>x-y); const q=(p)=>{const pos=(s.length-1)*p; const b=Math.floor(pos), r=pos-b; return s[b]+(s[b+1]-s[b])*(isNaN(r)?0:r||0)}; return [q(0), q(0.25), q(0.5), q(0.75), q(1)]; }
+const data=[boxStats(g0), boxStats(g1)];
+const chart=echarts.init(document.getElementById('chAgeBox'));
+chart.setOption({ tooltip:{trigger:'item'}, xAxis:{type:'category', data:['Not Survived','Survived']}, yAxis:{type:'value'}, series:[{ type:'boxplot', data }] });
+}
 
-    <!-- Filters -->
-    <section class="card">
-      <div class="flex items-center justify-between gap-3 flex-wrap">
-        <div class="space-y-1">
-          <div class="label">Filters (train.csv)</div>
-          <div class="text-sm text-slate-600 dark:text-slate-300">Update charts and KPIs in real time.</div>
-        </div>
-        <div class="flex flex-wrap gap-3">
-          <label class="pill">Sex
-            <select id="filterSex" class="ml-2 bg-white dark:bg-slate-800 border dark:border-slate-700 rounded px-2 py-1">
-              <option value="ALL" selected>All</option>
-              <option value="male">Male</option>
-              <option value="female">Female</option>
-            </select>
-          </label>
-          <label class="pill">Pclass
-            <select id="filterClass" class="ml-2 bg-white dark:bg-slate-800 border dark:border-slate-700 rounded px-2 py-1">
-              <option value="ALL" selected>All</option>
-              <option value="1">1</option>
-              <option value="2">2</option>
-              <option value="3">3</option>
-            </select>
-          </label>
-          <label class="pill">Embarked
-            <select id="filterEmbarked" class="ml-2 bg-white dark:bg-slate-800 border dark:border-slate-700 rounded px-2 py-1">
-              <option value="ALL" selected>All</option>
-              <option value="C">C</option>
-              <option value="Q">Q</option>
-              <option value="S">S</option>
-              <option value="UNKNOWN">Unknown</option>
-            </select>
-          </label>
-          <button id="btnDownload" class="px-3 py-2 rounded-xl bg-emerald-600 text-white shadow transition hover:brightness-110">Download filtered CSV</button>
-        </div>
-      </div>
-    </section>
 
-    <!-- KPI cards -->
-    <section class="grid-auto">
-      <div class="card"><div class="label">Rows (train.csv)</div><div class="metric" id="kpiRows">–</div></div>
-      <div class="card"><div class="label">Overall Survival Rate</div><div class="metric"><span id="kpiSurvival">–</span>%</div></div>
-      <div class="card"><div class="label">Median Age</div><div class="metric" id="kpiAge">–</div></div>
-      <div class="card"><div class="label">Median Fare</div><div class="metric" id="kpiFare">–</div></div>
-    </section>
+function scatter(rows){
+const pts=rows.filter(r=>r.Age!=null && r.Fare!=null).map(r=>({ value:[+r.Age, +r.Fare, r.Survived, r.Sex, r.Pclass] }));
+const chart=echarts.init(document.getElementById('chScatter'));
+chart.setOption({
+tooltip:{formatter:(p)=>{const [age,fare,y,sex,pc]=p.data.value; return `Age: ${age}<br/>Fare: ${fare.toFixed(2)}<br/>Survived: ${y==1?'Yes':'No'}<br/>Sex: ${sex}<br/>Pclass: ${pc}`;}},
+xAxis:{name:'Age'}, yAxis:{name:'Fare'}, grid:{left:60,right:20,top:20,bottom:50},
+series:[{type:'scatter', data:pts, symbolSize:(val)=>Math.max(4, Math.min(14, Math.sqrt(val[1])))}]
+});
+}
 
-    <!-- Vigilant Alerts -->
-    <section class="card" id="alertsSection">
-      <h2 class="font-semibold mb-2">Data Quality Alerts</h2>
-      <ul id="alertsList" class="list-disc pl-6 text-sm space-y-1"></ul>
-    </section>
 
-    <!-- Charts -->
-    <section class="grid-auto">
-      <div class="card"><h2 class="font-semibold mb-2">Survival by Sex</h2><div id="chartSex" style="height:360px"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Survival by Passenger Class</h2><div id="chartClass" style="height:360px"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Survival by Sex × Pclass</h2><div id="chartSexClass" style="height:360px"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Age Distribution (Survived vs Not)</h2><div id="chartAge" style="height:360px"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Fare by Outcome</h2><div id="chartFare" style="height:360px"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Survival by Embarked</h2><div id="chartEmbarked" style="height:360px"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Correlation Heatmap (numeric)</h2><div id="chartCorr" style="height:420px"></div></div>
-    </section>
+function embarked100(rows){
+const ports=['C','Q','S']; const names={C:'Cherbourg',Q:'Queenstown',S:'Southampton'}; const total=ports.map(p=>rows.filter(r=> (r.Embarked||'')===p).length);
+const surv=ports.map(p=>rows.filter(r=> (r.Embarked||'')===p && Number(r.Survived)===1).length);
+const die=ports.map((_,i)=> total[i]-surv[i]); const perc=(a,b)=> a.map((v,i)=> total[i]? Math.round(v/total[i]*1000)/10 : 0);
+const chart=echarts.init(document.getElementById('chEmb'));
+chart.setOption({ tooltip:{trigger:'axis', axisPointer:{type:'shadow'}}, legend:{}, grid:{left:80,right:20,top:30,bottom:40}, xAxis:{type:'category', data:ports.map(p=>names[p])}, yAxis:{type:'value', max:100, axisLabel:{formatter:(v)=>v+'%'}}, series:[{name:'Survived %',type:'bar', stack:'x', data:perc(surv,total)},{name:'Not %',type:'bar', stack:'x', data:perc(die,total)}] });
+}
 
-    <!-- Data quality / Missingness -->
-    <section class="grid-auto">
-      <div class="card"><h2 class="font-semibold mb-2">Missing Values — train.csv</h2><div id="missingTrain"></div></div>
-      <div class="card"><h2 class="font-semibold mb-2">Missing Values — test.csv</h2><div id="missingTest"></div></div>
-    </section>
 
-    <!-- Preview tables -->
-    <section class="grid-auto">
-      <div class="card overflow-auto"><h2 class="font-semibold mb-2">Preview — train.csv (first 10)</h2><div id="previewTrain"></div></div>
-      <div class="card overflow-auto"><h2 class="font-semibold mb-2">Preview — test.csv (first 10)</h2><div id="previewTest"></div></div>
-    </section>
+function corrHeat(rows){
+const cols=['Survived','Pclass','Age','SibSp','Parch','Fare'];
+const mat=cols.map(c=> rows.map(r=> r[c]!=null? +r[c] : null));
+const z=cols.map((_,i)=> cols.map((_,j)=> +pearson(mat[i],mat[j]).toFixed(2)) );
+const data=[]; for(let i=0;i<cols.length;i++){ for(let j=0;j<cols.length;j++){ data.push([i,j,z[i][j]]); } }
+const chart=echarts.init(document.getElementById('chCorr'));
+chart.setOption({ tooltip:{}, grid:{left:80,right:20,top:20,bottom:40}, xAxis:{type:'category', data:cols}, yAxis:{type:'category', data:cols}, visualMap:{min:-1,max:1, calculable:true, orient:'horizontal', left:'center', bottom:0}, series:[{type:'heatmap', data, label:{show:true, formatter:(p)=>p.data[2].toFixed(2)}}] });
+}
 
-    <!-- Fallback local loader -->
-    <section id="localLoader" class="hidden card" aria-live="polite">
-      <h2 class="font-semibold mb-2">Local CSV Loader (fallback)</h2>
-      <p class="text-sm text-slate-600 dark:text-slate-300">If you opened this file directly via <code>file:///</code> and fetching CSVs fails, upload them here:</p>
-      <div class="mt-3 grid sm:grid-cols-3 gap-3">
-        <label class="block">train.csv <input id="fileTrain" type="file" accept=".csv" class="mt-1 block w-full"></label>
-        <label class="block">test.csv <input id="fileTest" type="file" accept=".csv" class="mt-1 block w-full"></label>
-        <label class="block">gender_submission.csv <input id="fileGender" type="file" accept=".csv" class="mt-1 block w-full"></label>
-      </div>
-      <button id="btnLoadLocal" class="mt-3 px-3 py-2 rounded-lg bg-sky-600 text-white">Load uploaded files</button>
-    </section>
 
-    <!-- Help -->
-    <section id="help" class="card">
-      <h2 class="font-semibold mb-2">How to use / Deploy on GitHub Pages</h2>
-      <ol class="list-decimal pl-6 space-y-1 text-sm">
-        <li>Place this <code>index.html</code> and the three CSV files (<code>train.csv</code>, <code>test.csv</code>, <code>gender_submission.csv</code>) in the <strong>same folder</strong> of your GitHub repo (public).</li>
-        <li>Enable GitHub Pages: <em>Settings → Pages → Deploy from branch</em> (main / root). Open the published URL.</li>
-        <li>Filtering by <strong>Sex</strong>, <strong>Pclass</strong>, <strong>Embarked</strong> updates KPIs, charts, and alerts. Use the download button to export the <em>current filtered</em> train subset.</li>
-        <li>If the site is opened locally and fetch fails, use the Local CSV Loader to parse files in-browser.</li>
-      </ol>
-    </section>
-  </main>
+function buildAlerts(rows){
+const alerts=[]; const miss=missingness(rows);
+for(const m of miss){ if(m.percent>=0.4) alerts.push(`⚠️ High missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`); else if(m.percent>=0.2) alerts.push(`ℹ️ Noticeable missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`); }
+const withY=rows.filter(r=>r.Survived!=null); if(withY.length){ const rate=withY.filter(r=>+r.Survived===1).length/withY.length; if(rate<=0.25||rate>=0.75) alerts.push(`⚠️ Class imbalance: survival ${(rate*100).toFixed(1)}%`); }
+const ages=rows.map(r=> r.Age!=null? +r.Age : null).filter(v=>v!=null); const s=std(ages); if(s && s>15) alerts.push(`ℹ️ Wide spread in Age (σ ≈ ${s.toFixed(1)})`);
+document.getElementById('alerts').innerHTML = alerts.length? alerts.map(a=>`<li>${a}</li>`).join('') : '<li>✅ No issues detected for current filter.</li>';
+}
 
-  <footer class="max-w-7xl mx-auto px-4 pb-8 text-xs text-slate-500 dark:text-slate-400">
-    Built as a single-file HTML dashboard · Tailwind + Plotly + PapaParse
-  </footer>
 
-  <script>
-    // ---------- Theme toggle ----------
-    document.getElementById('themeToggle').addEventListener('click', ()=>{
-      const isDark = document.documentElement.classList.toggle('dark');
-      localStorage.setItem('theme', isDark ? 'dark' : 'light');
-    });
+function render(){ const rows=filtered(); kpis(rows); genderDiverging(rows); classStack(rows); ageBox(rows); scatter(rows); embarked100(rows); corrHeat(rows); buildAlerts(rows); }
 
-    // ---------- Utilities ----------
-    const median = (arr) => {
-      const a = arr.filter(v => v != null && !Number.isNaN(v)).slice().sort((a,b)=>a-b);
-      if (!a.length) return null; const mid = Math.floor(a.length/2);
-      return a.length % 2 ? a[mid] : (a[mid-1]+a[mid])/2;
-    };
-    const mean = (arr) => { const a = arr.filter(v => v != null && !Number.isNaN(v)); return a.length ? a.reduce((s,v)=>s+v,0)/a.length : null; };
-    const stddev = (arr) => { const m = mean(arr); if (m==null) return null; const a = arr.filter(v => v!=null && !Number.isNaN(v)); if (a.length<2) return 0; const v = a.reduce((s,x)=>s+(x-m)**2,0)/(a.length-1); return Math.sqrt(v); };
-    const pearson = (x, y) => {
-      const xy = []; for (let i=0;i<Math.min(x.length,y.length);i++){ const xi=x[i], yi=y[i]; if (xi!=null && yi!=null && !Number.isNaN(xi) && !Number.isNaN(yi)) xy.push([xi,yi]); }
-      const xs = xy.map(p=>p[0]), ys = xy.map(p=>p[1]); const mx=mean(xs), my=mean(ys); if (mx==null || my==null) return null;
-      const sx=stddev(xs), sy=stddev(ys); if (!sx || !sy) return 0; const cov = xs.reduce((s,xi,idx)=> s + (xi-mx)*(ys[idx]-my), 0)/(xs.length-1); return cov/(sx*sy);
-    };
-    const normalizeRow = (row) => { const r={}; for(const [k,v] of Object.entries(row)){ if (v==='' || v===undefined) { r[k]=null; continue; } r[k] = (typeof v === 'string') ? v.trim() : v; } return r; };
 
-    function htmlTable(arr, opts={}){
-      const {limit=10} = opts; if (!arr || !arr.length) return '<div class="text-sm text-slate-500">(no rows)</div>';
-      const cols = Object.keys(arr[0]); const rows = arr.slice(0, limit);
-      const th = cols.map(c=>`<th>${c}</th>`).join('');
-      const tb = rows.map(r=>`<tr>${cols.map(c=>`<td>${r[c] ?? ''}</td>`).join('')}</tr>`).join('');
-      return `<div class="overflow-x-auto"><table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`;
-    }
-
-    function missingness(rows){
-      if (!rows.length) return []; const cols = Object.keys(rows[0]); const total = rows.length;
-      return cols.map(c=>{ const miss = rows.reduce((s,r)=> s + ((r[c]==null || r[c]==='' )?1:0), 0); return {column:c, missing:miss, percent: total? miss/total: 0}; }).sort((a,b)=> b.percent - a.percent);
-    }
-
-    function groupSurvivalRate(rows, field){
-      const map = new Map();
-      for (const r of rows){
-        const keyRaw = r[field]; const key = (keyRaw==null || keyRaw==='') ? 'Unknown' : String(keyRaw);
-        const surv = Number(r['Survived']); if (!Number.isFinite(surv)) continue; // test.csv has no Survived
-        if (!map.has(key)) map.set(key, {alive:0,total:0});
-        const obj = map.get(key); obj.total += 1; obj.alive += (surv===1?1:0);
-      }
-      const labels = Array.from(map.keys());
-      const rates = labels.map(k=> map.get(k).total ? map.get(k).alive / map.get(k).total : 0);
-      const totals = labels.map(k=> map.get(k).total);
-      return {labels, rates, totals};
-    }
-
-    function survivalBySexClass(rows){
-      const classes = ['1','2','3']; const sexes = ['female','male']; const y={}; for (const s of sexes) y[s]=[];
-      for (const p of classes){
-        const inClass = rows.filter(r => String(r.Pclass)===p && r.Sex!=null && r.Survived!=null);
-        for (const s of sexes){
-          const sub = inClass.filter(r => r.Sex===s);
-          const rate = sub.length ? sub.filter(r=> Number(r.Survived)===1).length / sub.length : 0;
-          y[s].push(rate * 100);
-        }
-      }
-      const data = sexes.map(s => ({ x: classes, y: y[s], type:'bar', name:s }));
-      Plotly.newPlot('chartSexClass', data, { barmode:'group', margin:{t:10,r:10,l:40,b:40}, yaxis:{title:'Survival %', rangemode:'tozero'} }, {displayModeBar:false, responsive:true});
-    }
-
-    function drawBarRates(divId, labels, rates){
-      const data = [{ x: labels, y: rates.map(r=> r*100), type:'bar', hovertemplate:'%{x}: %{y:.1f}%<extra></extra>' }];
-      const layout = { margin:{t:10,r:10,l:40,b:40}, yaxis:{title:'Survival %', rangemode:'tozero'}, xaxis:{title:''} };
-      Plotly.newPlot(divId, data, layout, {displayModeBar:false, responsive:true});
-    }
-
-    function drawAgeHistogram(rows){
-      const survAges = rows.filter(r=> Number(r.Survived)===1 && r.Age!=null).map(r=> Number(r.Age));
-      const notAges = rows.filter(r=> Number(r.Survived)===0 && r.Age!=null).map(r=> Number(r.Age));
-      const data = [
-        {x: notAges, type:'histogram', name:'Not Survived', opacity:0.6, nbinsx: 30, histnorm:'percent'},
-        {x: survAges, type:'histogram', name:'Survived', opacity:0.6, nbinsx: 30, histnorm:'percent'}
-      ];
-      const layout = { barmode:'overlay', margin:{t:10,r:10,l:40,b:40}, xaxis:{title:'Age'}, yaxis:{title:'% of passengers'} };
-      Plotly.newPlot('chartAge', data, layout, {displayModeBar:false, responsive:true});
-    }
-
-    function drawFareBox(rows){
-      const survFares = rows.filter(r=> Number(r.Survived)===1 && r.Fare!=null).map(r=> Number(r.Fare));
-      const notFares = rows.filter(r=> Number(r.Survived)===0 && r.Fare!=null).map(r=> Number(r.Fare));
-      const data = [ {y: notFares, type:'box', name:'Not Survived', boxmean:true}, {y: survFares, type:'box', name:'Survived', boxmean:true} ];
-      const layout = { margin:{t:10,r:10,l:40,b:40}, yaxis:{title:'Fare'} };
-      Plotly.newPlot('chartFare', data, layout, {displayModeBar:false, responsive:true});
-    }
-
-    function drawCorrelation(rows){
-      const cols = ['Survived','Pclass','Age','SibSp','Parch','Fare'];
-      const mat = cols.map(c => rows.map(r => r[c] != null ? Number(r[c]) : null));
-      const corr = cols.map((_, i) => cols.map((_, j) => pearson(mat[i], mat[j])));
-      const z = corr.map(row => row.map(v => (v==null? 0 : v)));
-      const text = corr.map(row => row.map(v => (v==null ? '' : v.toFixed(2))));
-      Plotly.newPlot('chartCorr', [{ z, x: cols, y: cols, type:'heatmap', text, texttemplate: '%{text}', textfont:{color:'white'}, hovertemplate:'%{y} vs %{x}: %{z:.2f}<extra></extra>' }], { margin:{t:10,r:10,l:80,b:40} }, {displayModeBar:false, responsive:true});
-    }
-
-    function renderCharts(rows){
-      const bySex = groupSurvivalRate(rows, 'Sex'); drawBarRates('chartSex', bySex.labels, bySex.rates);
-      const byClass = groupSurvivalRate(rows, 'Pclass'); drawBarRates('chartClass', byClass.labels, byClass.rates);
-      const byEmb = groupSurvivalRate(rows, 'Embarked'); drawBarRates('chartEmbarked', byEmb.labels, byEmb.rates);
-      drawAgeHistogram(rows); drawFareBox(rows); drawCorrelation(rows); survivalBySexClass(rows);
-    }
-
-    function renderTables(){
-      document.getElementById('missingTrain').innerHTML = missingTable(TRAIN);
-      document.getElementById('missingTest').innerHTML = missingTable(TEST);
-      document.getElementById('previewTrain').innerHTML = htmlTable(TRAIN, {limit:10});
-      document.getElementById('previewTest').innerHTML = htmlTable(TEST, {limit:10});
-    }
-
-    function missingTable(rows){
-      const data = missingness(rows);
-      const th = `<tr><th>Column</th><th>Missing</th><th>%</th></tr>`;
-      const tb = data.map(d=>`<tr><td>${d.column}</td><td>${d.missing}</td><td>${(d.percent*100).toFixed(1)}%</td></tr>`).join('');
-      return `<div class="overflow-x-auto"><table><thead>${th}</thead><tbody>${tb}</tbody></table></div>`;
-    }
-
-    function buildAlerts(rows){
-      const alerts = []; const miss = missingness(rows);
-      for (const m of miss){
-        if (m.percent >= 0.4) alerts.push(`⚠️ High missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`);
-        else if (m.percent >= 0.2) alerts.push(`ℹ️ Noticeable missingness in <b>${m.column}</b>: ${(m.percent*100).toFixed(1)}%`);
-      }
-      const withLabel = rows.filter(r => r.Survived != null);
-      if (withLabel.length){ const rate = withLabel.filter(r=> Number(r.Survived)===1).length / withLabel.length; if (rate <= 0.25 || rate >= 0.75) alerts.push(`⚠️ Class imbalance: Survival rate ${(rate*100).toFixed(1)}%`); }
-      const ages = rows.map(r => r.Age!=null ? Number(r.Age) : null).filter(v => v!=null);
-      if (ages.length){ const sd = stddev(ages), med = median(ages); if (sd && sd > 15) alerts.push(`ℹ️ Age shows wide spread (σ≈${sd.toFixed(1)})`); if (med && (med < 20 || med > 40)) alerts.push(`ℹ️ Median age atypical for current filter (≈${med.toFixed(1)})`); }
-      document.getElementById('alertsList').innerHTML = alerts.length ? alerts.map(a=>`<li>${a}</li>`).join('') : '<li>✅ No issues detected for this filter.</li>';
-    }
-
-    function filterTrain(){
-      let rows = TRAIN;
-      const sex = document.getElementById('filterSex').value;
-      const pclass = document.getElementById('filterClass').value;
-      const emb = document.getElementById('filterEmbarked').value;
-      if (sex !== 'ALL') rows = rows.filter(r => r.Sex === sex);
-      if (pclass !== 'ALL') rows = rows.filter(r => String(r.Pclass) === pclass);
-      if (emb !== 'ALL') rows = rows.filter(r => (r.Embarked ?? 'UNKNOWN') === emb || (emb==='UNKNOWN' && (r.Embarked==null || r.Embarked==='')));
-      return rows;
-    }
-
-    function updateKPIs(rows){
-      const surv = rows.filter(r=> Number(r.Survived)===1).length;
-      const total = rows.filter(r=> r.Survived!=null).length;
-      const ages = rows.map(r=> (r.Age!=null ? Number(r.Age): null));
-      const fares = rows.map(r=> (r.Fare!=null ? Number(r.Fare): null));
-      document.getElementById('kpiRows').textContent = String(rows.length);
-      document.getElementById('kpiSurvival').textContent = total? ((surv/total)*100).toFixed(1) : '–';
-      document.getElementById('kpiAge').textContent = median(ages)?.toFixed(1) ?? '–';
-      document.getElementById('kpiFare').textContent = median(fares)?.toFixed(2) ?? '–';
-    }
-
-    function downloadCsv(filename, rows){
-      if (!rows.length) return; const cols = Object.keys(rows[0]);
-      const esc = v => { if (v==null) return ''; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/\"/g,'""')}"` : s; };
-      const csv = [cols.join(',')].concat(rows.map(r=> cols.map(c=> esc(r[c])).join(','))).join('\n');
-      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
-    }
-
-    // ---------- Data & load ----------
-    let TRAIN=[], TEST=[], GENDER=[];
-
-    async function parseCsvFromUrl(url){
-      return new Promise((resolve, reject)=>{ Papa.parse(url, { download:true, header:true, dynamicTyping:true, skipEmptyLines:'greedy', complete: res => resolve(res.data.map(normalizeRow)), error: reject }); });
-    }
-    async function parseCsvFromFile(file){
-      return new Promise((resolve, reject)=>{ Papa.parse(file, { header:true, dynamicTyping:true, skipEmptyLines:'greedy', complete: res => resolve(res.data.map(normalizeRow)), error: reject }); });
-    }
-    function showStatus(msg, asError=false){ const box=document.getElementById('status'); const text=document.getElementById('statusText'); box.classList.remove('hidden'); text.textContent=msg; text.className='text-sm '+(asError? 'text-red-700':'text-slate-700 dark:text-slate-200'); }
-
-    async function loadInitial(){
-      try{
-        showStatus('Loading CSVs (train.csv, test.csv, gender_submission.csv)...');
-        const [train, test, gender] = await Promise.all([
-          parseCsvFromUrl('train.csv'),
-          parseCsvFromUrl('test.csv'),
-          parseCsvFromUrl('gender_submission.csv')
-        ]);
-        TRAIN = train; TEST = test; GENDER = gender; document.getElementById('status').classList.add('hidden'); init();
-      } catch(err){ console.warn('Fetch failed; enabling local loader.', err); showStatus('Could not fetch CSVs from relative paths. If you opened this file locally, use the Local CSV Loader below or host on GitHub Pages.', true); document.getElementById('localLoader').classList.remove('hidden'); }
-    }
-
-    function initFilters(){
-      for (const id of ['filterSex','filterClass','filterEmbarked']){
-        document.getElementById(id).addEventListener('change', ()=>{
-          const rows = filterTrain(); updateKPIs(rows); renderCharts(rows); buildAlerts(rows); survivalBySexClass(rows);
-        });
-      }
-      document.getElementById('btnDownload').addEventListener('click', ()=>{ const rows=filterTrain(); downloadCsv('titanic_filtered_train.csv', rows); });
-    }
-
-    function init(){
-      initFilters(); renderTables(); const rows = filterTrain(); updateKPIs(rows); renderCharts(rows); buildAlerts(rows); survivalBySexClass(rows);
-    }
-
-    // Local loader (fallback)
-    document.getElementById('btnLoadLocal').addEventListener('click', async ()=>{
-      const ft = document.getElementById('fileTrain').files[0];
-      const fte = document.getElementById('fileTest').files[0];
-      const fg = document.getElementById('fileGender').files[0];
-      if (!ft || !fte || !fg){ showStatus('Please choose all three files before loading.', true); return; }
-      showStatus('Parsing local files...'); TRAIN = await parseCsvFromFile(ft); TEST = await parseCsvFromFile(fte); GENDER = await parseCsvFromFile(fg); document.getElementById('status').classList.add('hidden'); init();
-    });
-
-    // Boot
-    loadInitial();
-  </script>
+// ---------- Boot ----------
+(async function(){
+try{
+TRAIN = await parseCsv('train.csv');
+// basic feature engineering
+TRAIN.forEach(r=>{ r.FamilySize=(r.SibSp||0)+(r.Parch||0); });
+render();
+['fSex','fClass','fEmb'].forEach(id=> document.getElementById(id).addEventListener('change', render));
+document.getElementById('dlBtn').addEventListener('click', ()=> downloadCsv('titanic_filtered_train.csv', filtered()));
+window.addEventListener('resize', ()=>{ ['chGender','chClass','chAgeBox','chScatter','chEmb','chCorr'].forEach(id=> echarts.getInstanceByDom(document.getElementById(id))?.resize()); });
+}catch(e){ alert('Failed to load CSV. Ensure train.csv is next to index.html.'); console.error(e); }
+})();
+</script>
 </body>
 </html>
