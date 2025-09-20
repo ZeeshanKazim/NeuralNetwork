@@ -1,148 +1,134 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Titanic Binary Classifier — TensorFlow.js (Week 2)</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Titanic Binary Classifier — TensorFlow.js</title>
 
-  <!-- Required CDNs per assignment -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis@latest"></script>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" />
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
-  <style>
-    :root{ --bg:#0b1220; --panel:#0e172a; --ink:#e9edf6; --muted:#a5b0c5; --card:rgba(255,255,255,.06); --border:rgba(255,255,255,.14); --ring:rgba(125,180,255,.35); }
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:radial-gradient(1100px 650px at 8% -10%, #1a2b47 0%, #0b1220 60%), linear-gradient(180deg, #09111f,#0b1220); color:var(--ink); min-height:100vh; padding:24px}
-    .wrap{max-width:1100px;margin:0 auto}
-    h1{font-size:clamp(1.4rem,2.4vw,2rem);line-height:1.1;margin-bottom:6px}
-    h2{margin-bottom:6px}
-    p.muted{color:var(--muted);margin-bottom:14px}
-    section{background:linear-gradient(180deg,var(--panel),#0b1326); border:1px solid var(--border); border-radius:16px; padding:16px; margin:10px 0}
-    .grid{display:grid;gap:10px}
-    .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
-    @media(max-width:900px){.cols-2{grid-template-columns:1fr}}
-    .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-    input[type=file],button,select{background:var(--card);color:var(--ink); border:1px solid var(--border); border-radius:10px; padding:8px 10px; cursor:pointer}
-    button:focus,select:focus,input:focus{outline:none;box-shadow:0 0 0 3px var(--ring)}
-    table{width:100%;border-collapse:collapse;margin-top:8px}
-    th,td{border:1px solid var(--border);padding:6px;text-align:left;font-size:.92rem}
-    .hint{font-size:.9rem;color:var(--muted)}
-    .kpis{display:flex;gap:10px;flex-wrap:wrap}
-    .kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
-    .kpi .big{font-weight:800;font-size:1.2rem}
-    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; font-size:.92rem}
-    .sliderRow{display:flex;gap:10px;align-items:center;margin-top:10px}
-  </style>
+<style>
+  :root{
+    --bg:#0b0f17; --panel:#101728; --ink:#e9edf6; --muted:#9fb0c8;
+    --card:#111b30; --border:#1e2a44; --pill:#13223c; --accent:#8aa3ff;
+  }
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#0a0f1a,#0b0f17);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+  h1{margin:0 0 12px} .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;margin:14px 0}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  label{font-size:.95rem;color:var(--muted)} input[type=file],button,select{background:#0f1628;border:1px solid var(--border);color:var(--ink);padding:8px 12px;border-radius:10px}
+  button{cursor:pointer} button.primary{background:#1a2847;border-color:#223255}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .kpis span{display:inline-block;background:var(--pill);border:1px solid var(--border);padding:6px 10px;border-radius:999px;margin:6px 8px 0 0;color:var(--muted)}
+  pre{white-space:pre-wrap;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;min-height:88px}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  th,td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:.92rem}
+  th{color:var(--muted);text-align:left}
+  .small{font-size:.9rem;color:var(--muted)}
+  .flex{display:flex;gap:12px;flex-wrap:wrap}
+  .chart{min-height:280px}
+</style>
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <h1>Titanic Binary Classifier — TensorFlow.js</h1>
-      <p class="muted">Week 2: shallow neural net entirely in the browser. Upload Kaggle <code>train.csv</code> / <code>test.csv</code>, then Preprocess → Build → Train → Evaluate (ROC‑AUC) → Predict/Export. No server needed.</p>
-    </header>
+    <h1>Titanic Binary Classifier — TensorFlow.js</h1>
+    <div class="small">Upload Kaggle <code>train.csv</code> / <code>test.csv</code> → Preprocess → Build → Train → Evaluate (ROC/AUC) → Predict/Export.</div>
 
-    <!-- Data Load -->
-    <section id="sec-data">
+    <div class="panel">
       <h2>Data Load</h2>
-      <div class="row" style="margin-top:6px">
-        <label>train.csv <input id="trainFile" type="file" accept=".csv"></label>
-        <label>test.csv <input id="testFile" type="file" accept=".csv"></label>
-        <button id="btnLoad">Load Files</button>
-        <span class="hint">Target: <b>Survived</b> (0/1). Features: <b>Pclass, Sex, Age, SibSp, Parch, Fare, Embarked</b>. Ignore: <b>PassengerId</b>.</span>
+      <div class="row">
+        <label>train.csv <input id="trainFile" type="file" accept=".csv" /></label>
+        <label>test.csv <input id="testFile" type="file" accept=".csv" /></label>
+        <button id="btnLoad" class="primary">Load Files</button>
       </div>
-      <div id="dataPreview" class="grid cols-2">
+      <div class="kpis">
+        <span>Train rows: <b id="kTrain">–</b></span>
+        <span>Test rows: <b id="kTest">–</b></span>
+        <span>Missing % (train): <b id="kMiss">–</b></span>
+      </div>
+      <div class="grid2">
         <div>
-          <div class="kpis" style="margin-top:8px">
-            <div class="kpi">Train rows: <span id="kTrain" class="big">–</span></div>
-            <div class="kpi">Test rows: <span id="kTest" class="big">–</span></div>
-            <div class="kpi">Missing % (train): <span id="kMiss" class="big">–</span></div>
-          </div>
+          <div class="small" style="margin:8px 0">Preview</div>
           <div id="previewTable"></div>
         </div>
         <div>
-          <div id="edaSex"></div>
-          <div id="edaClass" style="margin-top:10px"></div>
+          <div class="small" style="margin:8px 0">Quick EDA (tfjs-vis)</div>
+          <div id="edaSex" class="chart"></div>
+          <div id="edaClass" class="chart"></div>
         </div>
       </div>
-    </section>
+    </div>
 
-    <!-- Preprocessing -->
-    <section id="sec-pre">
+    <div class="panel">
       <h2>Preprocessing</h2>
       <div class="row">
-        <label><input id="featFamily" type="checkbox" checked> Add FamilySize = SibSp + Parch + 1</label>
-        <label><input id="featAlone" type="checkbox" checked> Add IsAlone = (FamilySize == 1)</label>
-        <button id="btnPre">Run Preprocessing</button>
-        <span class="hint">Impute Age = median; Embarked = mode; Standardize Age/Fare; One‑hot Sex/Pclass/Embarked.</span>
+        <label><input id="featFamily" type="checkbox" checked /> Add FamilySize = SibSp + Parch + 1</label>
+        <label><input id="featAlone" type="checkbox" checked /> Add IsAlone = (FamilySize == 1)</label>
+        <button id="btnPre" class="primary">Run Preprocessing</button>
       </div>
-      <pre id="preInfo" class="mono" style="margin-top:8px"></pre>
-    </section>
+      <div class="small" style="margin-top:8px">Impute Age = median; Embarked = mode; Standardize Age/Fare; One-hot Sex/Pclass/Embarked.</div>
+      <pre id="preInfo"></pre>
+    </div>
 
-    <!-- Model -->
-    <section id="sec-model">
+    <div class="panel">
       <h2>Model</h2>
       <div class="row">
-        <button id="btnBuild">Build Model</button>
+        <button id="btnBuild" class="primary">Build Model</button>
         <button id="btnSummary">Show Summary</button>
       </div>
-      <pre id="modelSummary" class="mono" style="margin-top:8px"></pre>
-      <p class="hint">Architecture: Dense(16, relu) → Dense(1, sigmoid). Compile: adam + binaryCrossentropy + accuracy.</p>
-    </section>
+      <div class="small" style="margin:8px 0">Architecture: Dense(16, relu) → Dense(1, sigmoid). Compile: adam + binaryCrossentropy + accuracy.</div>
+      <pre id="modelSummary"></pre>
+    </div>
 
-    <!-- Training -->
-    <section id="sec-train">
+    <div class="panel">
       <h2>Training</h2>
       <div class="row">
-        <button id="btnTrain">Train (50 epochs, batch 32)</button>
+        <button id="btnTrain" class="primary">Train (50 epochs, batch 32)</button>
         <button id="btnStop">Early Stop</button>
       </div>
-      <p class="hint">80/20 stratified split; tfjs‑vis live charts; early stopping on val_loss (patience=5). The tfjs‑vis visor will pop up with loss/accuracy.</p>
-      <div id="visLossAcc" class="mono"></div>
-    </section>
+      <div class="small" style="margin-top:8px">80/20 stratified split; tfjs-vis live charts; early stopping with best-weight restore.</div>
+    </div>
 
-    <!-- Metrics (ROC/AUC + threshold slider) -->
-    <section id="sec-metrics">
+    <div class="panel">
       <h2>Metrics</h2>
-      <div id="rocPlot"></div>
-      <div class="sliderRow">
-        <label>Threshold: <span id="thVal">0.50</span></label>
-        <input id="thSlider" type="range" min="0" max="1" step="0.01" value="0.5" style="width:240px">
-        <span class="hint">Move slider to update confusion matrix & F1.</span>
+      <div class="row">
+        <label>Threshold: <b id="thVal">0.50</b></label>
+        <input id="thSlider" type="range" min="0" max="1" value="0.5" step="0.01" style="width:260px" />
       </div>
-      <div class="grid cols-2" style="margin-top:8px">
-        <div id="confMat"></div>
+      <div class="grid2">
+        <div id="rocPlot" class="chart"></div>
         <div>
-          <pre id="prf" class="mono"></pre>
+          <div id="confMat" class="chart"></div>
+          <pre id="prf"></pre>
         </div>
       </div>
-    </section>
+    </div>
 
-    <!-- Prediction / Export -->
-    <section id="sec-pred">
+    <div class="panel">
       <h2>Prediction & Export</h2>
       <div class="row">
-        <button id="btnPredict">Predict test.csv</button>
+        <button id="btnPredict" class="primary">Predict test.csv</button>
         <button id="btnSub">Download submission.csv</button>
         <button id="btnProb">Download probabilities.csv</button>
         <button id="btnSaveModel">Save model</button>
       </div>
-      <p id="predInfo" class="hint" style="margin-top:6px"></p>
-    </section>
+      <pre id="predInfo"></pre>
+    </div>
 
-    <!-- Deployment notes -->
-    <section id="sec-notes">
+    <div class="panel">
       <h2>Deployment Notes</h2>
-      <ol class="hint">
+      <ol class="small">
         <li>Create a public GitHub repo.</li>
         <li>Add <code>index.html</code> and <code>app.js</code> to the root (you can include sample CSVs for testing).</li>
         <li>Enable GitHub Pages: Settings → Pages → Deploy from branch (main/root).</li>
         <li>Open the URL and upload <code>train.csv</code>/<code>test.csv</code> via the inputs above.</li>
       </ol>
-    </section>
+    </div>
   </div>
 
-  <!-- Link the unified robust app.js -->
-  <script defer src="app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
