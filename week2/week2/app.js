@@ -334,14 +334,46 @@ async function onTrain(){
     if(!state.model){ alert('Build the model first'); return; }
     stopFlag=false;
 
+    // tfjs-vis (optional)
     const cbs = [];
     if (window.tfvis) {
       const surface = {name:'Training', tab:'Fit'};
-      const fitCbs = tfvis.show.fitCallbacks(surface, ['loss','val_loss','acc','val_acc'], {callbacks:['onEpochEnd']});
+      const fitCbs = tfvis.show.fitCallbacks(surface,
+        ['loss','val_loss','acc','val_acc','accuracy','val_accuracy'],
+        {callbacks:['onEpochEnd']}
+      );
       cbs.push(fitCbs);
     }
-    cbs.push(tf.callbacks.earlyStopping({monitor:'val_loss', patience:5, restoreBestWeights:true}));
-    cbs.push(new tf.CustomCallback({ onEpochEnd: async()=>{ if(stopFlag) state.model.stopTraining=true; }}));
+
+    // Custom EarlyStopping with restore-best-weights (since tfjs doesn't support restoreBestWeights)
+    function earlyStopWithRestore(patience=5, monitor='val_loss'){
+      let best = Infinity, wait = 0, snapshot = null;
+      return new tf.CustomCallback({
+        onEpochEnd: async (epoch, logs)=>{
+          const cur = logs?.[monitor];
+          if (cur != null) {
+            if (cur < best - 1e-12) {
+              best = cur; wait = 0;
+              if (snapshot) snapshot.forEach(t=>t.dispose());
+              snapshot = state.model.getWeights().map(w=>w.clone());
+            } else {
+              wait += 1;
+              if (wait >= patience) {
+                if (snapshot) {
+                  const restored = snapshot.map(w=>w.clone());
+                  state.model.setWeights(restored);
+                  snapshot.forEach(t=>t.dispose());
+                  snapshot = null;
+                }
+                state.model.stopTraining = true;
+              }
+            }
+          }
+          if (stopFlag) state.model.stopTraining = true;
+        }
+      });
+    }
+    cbs.push(earlyStopWithRestore(5, 'val_loss'));
 
     await state.model.fit(state.xsTrain, state.ysTrain, {
       epochs:50, batchSize:32,
