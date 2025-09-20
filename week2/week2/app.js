@@ -1,12 +1,15 @@
 /*
-  Titanic Binary Classifier — Week 2 (TensorFlow.js)
-  FINAL unified app.js with:
-   - Robust CSV parsing (auto-detect delimiter + quote, or use optional UI if present)
-   - Row normalization ('' -> null, trim strings)
-   - Hardened preprocessing (safe medians/modes, safe standardization)
-   - Shallow NN (Dense(16,'relu') -> Dense(1,'sigmoid'))
-   - ROC/AUC + threshold, confusion matrix, PR/F1
-   - Predict + downloads (submission.csv, probabilities.csv) + model save
+  Titanic Binary Classifier — TensorFlow.js (Week 2)
+  FINAL SAFE build (after "Preprocessing failed" screenshot)
+
+  What this file does:
+   • Robust CSV parsing (auto-detect delimiter+quote; uses optional #csvDelimiter/#csvQuote if present)
+   • Row normalization ('' -> null, trims strings)
+   • Bullet‑proof preprocessing (JS medians/modes, JS mean/std, clamps non‑finite, fixed feature length)
+   • Shallow NN: Dense(16,'relu') -> Dense(1,'sigmoid'); adam + binaryCrossentropy + accuracy
+   • Training with tfjs‑vis charts, early stopping
+   • ROC/AUC, threshold slider -> confusion matrix + Precision/Recall/F1
+   • Predict on test.csv; download submission.csv, probabilities.csv; save model to disk
 */
 
 // ----------------------------- Global State -----------------------------
@@ -22,16 +25,16 @@ const state = {
   thresh: 0.5,
 };
 
-// Schema (adjust if you reuse on another dataset)
+// Schema (swap here if reusing for another dataset)
 const SCHEMA = {
   target: 'Survived',
   id: 'PassengerId',
   cols: ['Pclass','Sex','Age','SibSp','Parch','Fare','Embarked'],
 };
 
-// Expected columns for Titanic used to validate correct parsing
+// Expected columns for Titanic; used to score CSV parses
 const EXPECTED_MIN = ['PassengerId','Survived','Pclass','Sex','Age','SibSp','Parch','Fare','Embarked'];
-const NICE_TO_HAVE = ['Name']; // presence suggests quotes handled for comma-containing names
+const NICE_TO_HAVE = ['Name'];
 
 // UI helpers
 const el  = id => document.getElementById(id);
@@ -131,60 +134,79 @@ async function edaCharts(rows){
   el('edaClass') && await tfvis.render.barchart(el('edaClass'), byClass, {xLabel:'Pclass', yLabel:'Survival %', width:450, height:220});
 }
 
-// ----------------------------- Preprocessing -----------------------------
+// ----------------------------- Preprocessing (SAFE) -----------------------------
 function median(arr){ const a=arr.filter(v=>v!=null && !Number.isNaN(+v)).map(Number).sort((x,y)=>x-y); if(!a.length) return null; const m=Math.floor(a.length/2); return a.length%2? a[m] : (a[m-1]+a[m])/2; }
 function mode(arr){ const m=new Map(); let best=null,cnt=0; for(const v of arr){ if(v==null||v==='') continue; const c=(m.get(v)||0)+1; m.set(v,c); if(c>cnt){cnt=c;best=v;} } return best; }
 function oneHot(value, cats){ const v=new Array(cats.length).fill(0); const i=cats.indexOf(value); if(i>=0) v[i]=1; return v; }
+function jsMean(a){ const b=a.filter(Number.isFinite); return b.length? b.reduce((s,x)=>s+x,0)/b.length : 0; }
+function jsStd(a){ const b=a.filter(Number.isFinite); if (b.length<2) return 0; const mu=jsMean(b); const v=b.reduce((s,x)=>s+(x-mu)**2,0)/(b.length-1); return Math.sqrt(v); }
+function clampFinite(x, def=0){ return Number.isFinite(x) ? x : def; }
 
 function buildPreprocessor(trainRows){
-  // Robust medians/modes with defaults
   const ageMedRaw = median(trainRows.map(r=> r.Age));
-  const ageMed = Number.isFinite(ageMedRaw)? ageMedRaw : 30;
-  const embModeRaw = mode(trainRows.map(r=> r.Embarked));
-  const embMode = embModeRaw ?? 'S';
+  const ageMed    = Number.isFinite(ageMedRaw) ? ageMedRaw : 30;
+  const embMode   = (mode(trainRows.map(r=> r.Embarked))) ?? 'S';
 
-  const sexCats=['female','male'];
-  const pclassCats=[1,2,3];
-  const embCats=['C','Q','S','UNKNOWN'];
+  const sexCats    = ['female','male'];
+  const pclassCats = [1,2,3];
+  const embCats    = ['C','Q','S','UNKNOWN'];
 
-  // Clean numeric arrays to avoid NaNs in tf ops
-  const ageVals = trainRows.map(r=>{ const v=(r.Age!=null && !Number.isNaN(+r.Age))? +r.Age : ageMed; return Number.isFinite(v)? v : ageMed; });
-  const fareVals= trainRows.map(r=>{ const v=(r.Fare!=null && !Number.isNaN(+r.Fare))? +r.Fare : 0;     return Number.isFinite(v)? v : 0;     });
+  const ageVals  = trainRows.map(r => { const v=(r.Age!=null && !Number.isNaN(+r.Age))? +r.Age : ageMed; return Number.isFinite(v)? v : ageMed; });
+  const fareVals = trainRows.map(r => { const v=(r.Fare!=null && !Number.isNaN(+r.Fare))? +r.Fare : 0;     return Number.isFinite(v)? v : 0;     });
 
-  const muAge  = tf.tensor1d(ageVals).mean().arraySync();
-  const sdAge  = tf.tensor1d(ageVals).sub(muAge).pow(2).mean().sqrt().arraySync();
-  const muFare = tf.tensor1d(fareVals).mean().arraySync();
-  const sdFare = tf.tensor1d(fareVals).sub(muFare).pow(2).mean().sqrt().arraySync();
+  const muAge  = jsMean(ageVals);  const sdAge  = jsStd(ageVals);
+  const muFare = jsMean(fareVals); const sdFare = jsStd(fareVals);
 
   const useFamily = !!(opt('featFamily')?.checked ?? true);
   const useAlone  = !!(opt('featAlone')?.checked  ?? true);
 
+  const mapRowBase = (r)=>{
+    const age  = (r.Age!=null && !Number.isNaN(+r.Age)) ? +r.Age : ageMed;
+    const emb  = (r.Embarked==null || r.Embarked==='') ? 'UNKNOWN' : r.Embarked;
+    const fare = (r.Fare!=null && !Number.isNaN(+r.Fare)) ? +r.Fare : 0;
+    const fam   = (+r.SibSp||0) + (+r.Parch||0) + 1;
+    const alone = (fam===1) ? 1 : 0;
+    const ageZ  = sdAge  ? (age - muAge)/sdAge   : 0;
+    const fareZ = sdFare ? (fare - muFare)/sdFare: 0;
+    const sexOH = oneHot(r.Sex, sexCats);
+    const pclOH = oneHot(+r.Pclass, pclassCats);
+    const embOH = oneHot(emb, embCats);
+    let feats = [ageZ, fareZ, ...sexOH, ...pclOH, ...embOH];
+    if (useFamily) feats.push(fam);
+    if (useAlone)  feats.push(alone);
+    return feats.map(x=>clampFinite(+x,0));
+  };
+
+  const FEAT_LEN = mapRowBase(trainRows[0] || {}).length;
+
   return {
-    ageMed, embMode, sexCats, pclassCats, embCats, muAge, sdAge, muFare, sdFare, useFamily, useAlone,
+    ageMed, embMode, sexCats, pclassCats, embCats, muAge, sdAge, muFare, sdFare,
+    useFamily, useAlone, featLen: FEAT_LEN,
     mapRow: (r)=>{
-      const age  = (r.Age!=null && !Number.isNaN(+r.Age))? +r.Age : ageMed;
-      const emb  = (r.Embarked==null || r.Embarked==='')? 'UNKNOWN' : r.Embarked;
-      const fare = (r.Fare!=null && !Number.isNaN(+r.Fare))? +r.Fare : 0;
-      const fam  = (+r.SibSp||0) + (+r.Parch||0) + 1;
-      const alone= (fam===1)? 1 : 0;
-      const ageZ  = sdAge  ? (age - muAge)/sdAge   : 0;
-      const fareZ = sdFare ? (fare - muFare)/sdFare: 0;
-      const sexOH = oneHot(r.Sex, sexCats);
-      const pclOH = oneHot(+r.Pclass, pclassCats);
-      const embOH = oneHot(emb, embCats);
-      const feats = [ageZ, fareZ, ...sexOH, ...pclOH, ...embOH];
-      if(useFamily) feats.push(fam);
-      if(useAlone)  feats.push(alone);
-      return feats;
+      const v = mapRowBase(r);
+      if (v.length !== FEAT_LEN) { // enforce fixed width
+        if (v.length < FEAT_LEN) v.push(...Array(FEAT_LEN - v.length).fill(0));
+        else v.length = FEAT_LEN;
+      }
+      return v;
     }
   };
 }
 
 function tensorize(rows, pre){
-  const X = rows.map(pre.mapRow);
-  const xs = tf.tensor2d(X);
-  let ys=null; if(rows.length && SCHEMA.target in rows[0]) ys = tf.tensor1d(rows.map(r=> +r[SCHEMA.target]));
-  return {xs, ys, nFeat: X[0]?.length || 0};
+  const X=[]; const Y=[];
+  for (const r of rows){
+    const f = pre.mapRow(r);
+    if (f.every(Number.isFinite)) {
+      X.push(f);
+      if (SCHEMA.target in r) Y.push(+r[SCHEMA.target]);
+    }
+  }
+  if (!X.length) throw new Error('No valid rows after preprocessing.');
+  const xs = tf.tensor2d(X, [X.length, pre.featLen], 'float32');
+  let ys = null;
+  if (Y.length) ys = tf.tensor2d(Y, [Y.length, 1], 'float32'); // labels as (N,1)
+  return { xs, ys, nFeat: pre.featLen };
 }
 
 function stratifiedSplit(rows, valRatio=0.2){
@@ -251,7 +273,7 @@ async function onLoadFiles(){
     const manualQuote = opt('csvQuote')?     opt('csvQuote').value     : 'auto';
 
     const bestTrain = await robustParseCSV(fTrain, manualDelim, manualQuote);
-    state.rawTrain = bestTrain.rows.map(normalizeRow); // normalize
+    state.rawTrain = bestTrain.rows.map(normalizeRow);
     opt('parseDiag') && (opt('parseDiag').textContent = `Train: ${bestTrain.diag}`);
 
     if(fTest){
@@ -286,14 +308,14 @@ function onPreprocess(){
     const info=[
       `Features count: ${tTrain.nFeat}`,
       `Train shape: ${state.xsTrain.shape}  |  Val shape: ${state.xsVal.shape}`,
-      `Impute Age: median = ${state.pre.ageMed?.toFixed?.(2)}`,
+      `Impute Age: median = ${state.pre.ageMed}`,
       `Impute Embarked: mode = ${state.pre.embMode}`,
       `Standardize Age/Fare with TRAIN means/stdevs` ,
       `One‑hot: Sex=[${state.pre.sexCats}], Pclass=[${state.pre.pclassCats}], Embarked=[${state.pre.embCats}]`,
       `Engineered: FamilySize=${state.pre.useFamily?'ON':'OFF'}, IsAlone=${state.pre.useAlone?'ON':'OFF'}`
     ].join('\n');
     el('preInfo') && (el('preInfo').textContent = info);
-  }catch(err){ console.error(err); alert('Preprocessing failed.'); }
+  }catch(err){ console.error(err); alert('Preprocessing failed: ' + (err?.message || err)); }
 }
 
 function onBuild(){
@@ -311,14 +333,21 @@ async function onTrain(){
   try{
     if(!state.model){ alert('Build the model first'); return; }
     stopFlag=false;
-    const surface={name:'Training',tab:'Fit'};
-    const metrics=['loss','val_loss','acc','val_acc'];
-    const fitCallbacks = window.tfvis ? tfvis.show.fitCallbacks(surface, metrics, {callbacks:['onEpochEnd']}) : {};
 
-    const es = tf.callbacks.earlyStopping({monitor:'val_loss', patience:5, restoreBestWeights:true});
-    const stopCb = new tf.CustomCallback({ onEpochEnd: async()=>{ if(stopFlag) state.model.stopTraining=true; } });
+    const cbs = [];
+    if (window.tfvis) {
+      const surface = {name:'Training', tab:'Fit'};
+      const fitCbs = tfvis.show.fitCallbacks(surface, ['loss','val_loss','acc','val_acc'], {callbacks:['onEpochEnd']});
+      cbs.push(fitCbs);
+    }
+    cbs.push(tf.callbacks.earlyStopping({monitor:'val_loss', patience:5, restoreBestWeights:true}));
+    cbs.push(new tf.CustomCallback({ onEpochEnd: async()=>{ if(stopFlag) state.model.stopTraining=true; }}));
 
-    await state.model.fit(state.xsTrain, state.ysTrain, {epochs:50, batchSize:32, validationData:[state.xsVal, state.ysVal], callbacks:[fitCallbacks, es, stopCb]});
+    await state.model.fit(state.xsTrain, state.ysTrain, {
+      epochs:50, batchSize:32,
+      validationData:[state.xsVal, state.ysVal],
+      callbacks: cbs
+    });
 
     const valPred = state.model.predict(state.xsVal).dataSync();
     state.valProbs = Float32Array.from(valPred);
@@ -327,7 +356,10 @@ async function onTrain(){
     const {points, auc} = rocPoints(yTrue, state.valProbs, 200);
     await plotROC(el('rocPlot'), points, auc);
     updateThreshold(state.thresh);
-  }catch(err){ console.error(err); alert('Training failed.'); }
+  }catch(err){
+    console.error(err);
+    alert('Training failed: ' + (err?.message || err));
+  }
 }
 
 function onStop(){ stopFlag=true; alert('Early stop requested. Will stop after this epoch.'); }
@@ -346,7 +378,7 @@ async function onPredict(){
     if(!state.model){ alert('Train the model first'); return; }
     if(!state.rawTest.length){ alert('Load test.csv'); return; }
     const X = state.rawTest.map(state.pre.mapRow);
-    const xs = tf.tensor2d(X);
+    const xs = tf.tensor2d(X, [X.length, state.pre.featLen]);
     const probs = state.model.predict(xs).dataSync();
     state.testProbs = Float32Array.from(probs);
     el('predInfo') && (el('predInfo').textContent = `Predicted ${state.rawTest.length} rows. You can now download submission.csv or probabilities.csv.`);
