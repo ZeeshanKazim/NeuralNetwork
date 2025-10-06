@@ -1,7 +1,8 @@
 /* =======================================================================
-   Titanic Binary Classifier — TensorFlow.js (final, with Kaggle CSV fix)
-   - Uses PapaParse and TensorFlow.js (load via CDN in index.html)
-   - Option A FIX: force comma delimiter + double-quote for Kaggle CSV files
+   Titanic Binary Classifier — TensorFlow.js (FINAL)
+   - Forces Kaggle CSV settings (',' and '"')
+   - Repairs mis-parsed rows (split Name -> joined, shifted fields fixed)
+   - Fully client-side: PapaParse + TensorFlow.js
    ======================================================================= */
 
 /* ------------------------------ State --------------------------------- */
@@ -71,6 +72,63 @@ function previewTable(rows, limit=8){
     '<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>'
   ).join('')+'</tbody>';
   el('previewTable').innerHTML = `<table>${head}${body}</table>`;
+}
+
+/* -------------------- CSV REPAIR HELPERS (FINAL) ---------------------- */
+// Detect & fix the “split name / shifted columns” problem seen in your screenshot.
+
+function isGoodSex(v){ return typeof v === 'string' && /^(male|female)$/i.test(v.trim()); }
+function numOrNull(v){ const x = Number(v); return Number.isFinite(x) ? x : null; }
+function stripQuotes(s){
+  if (typeof s !== 'string') return s;
+  return s.replace(/^\s*"+/, '').replace(/"+\s*$/, '');
+}
+
+// Row is "shifted" when Sex isn't male/female but Age looks like 'male'/'female'
+function looksShifted(row){
+  const sexBad = !isGoodSex(row.Sex);
+  const ageLooksSex = typeof row.Age === 'string' && /^(male|female)$/i.test(row.Age.trim());
+  return sexBad && ageLooksSex;
+}
+
+// Repair a single shifted row by joining Name pieces and shifting fields right
+function repairShiftedRow(row){
+  const r = { ...row };
+
+  // 1) Join Name (left) + Sex (right piece) into a single Name
+  const left  = stripQuotes(r.Name ?? '');
+  const right = stripQuotes((r.Sex ?? '').toString());
+  const joinedName = (left ? left : '') + (right ? (left ? ', ' : '') + right : '');
+  r.Name = stripQuotes(joinedName);
+
+  // 2) Shift remaining fields back to their rightful place
+  r.Sex    = (r.Age ?? '').toString().trim();     // 'male'/'female'
+  r.Age    = numOrNull(r.SibSp);
+  r.SibSp  = numOrNull(r.Parch);
+  r.Parch  = numOrNull(r.Ticket);
+  r.Ticket = (r.Fare ?? '').toString();
+  r.Fare   = numOrNull(r.Cabin);
+
+  // 3) Embarked may be shoved into __parsed_extra – recover the last token
+  if (Array.isArray(r.__parsed_extra) && r.__parsed_extra.length){
+    r.Embarked = r.__parsed_extra[r.__parsed_extra.length - 1];
+  }
+  delete r.__parsed_extra;
+
+  return r;
+}
+
+// Clean a batch of rows: repair if needed; strip __parsed_extra otherwise
+function repairTitanicRows(rows){
+  return rows.map(row => {
+    if (looksShifted(row)) {
+      try { return repairShiftedRow(row); }
+      catch { /* on repair error, fall through to basic cleanup */ }
+    }
+    const r = { ...row };
+    delete r.__parsed_extra;
+    return r;
+  });
 }
 
 /* --------------------------- Preprocessing ---------------------------- */
@@ -201,24 +259,22 @@ function earlyStopWithRestore(patience=5, monitor='val_loss'){
 }
 
 /* ------------------------------ Handlers ------------------------------ */
+// FINAL: load + normalize + REPAIR rows
 async function onLoadFiles(){
   try{
     const fT = el('trainFile')?.files?.[0];
     const fX = el('testFile')?.files?.[0];
     if(!fT){ alert('Please choose train.csv'); return; }
 
-    // ====== OPTION A FIX: force Kaggle defaults (comma + double-quote) ======
+    // Force Kaggle defaults (comma + double-quote)
     const trainRows = await parseWithPapa(fT, ',', '"');
-    state.rawTrain = trainRows.map(normalizeRow);
+    const testRows  = fX ? await parseWithPapa(fX, ',', '"') : [];
 
-    if (fX) {
-      const testRows = await parseWithPapa(fX, ',', '"');
-      state.rawTest = testRows.map(normalizeRow);
-    } else {
-      state.rawTest = [];
-    }
-    // =======================================================================
+    // Normalize, then repair any mis-parsed rows (split Name / shifts)
+    state.rawTrain = repairTitanicRows(trainRows.map(normalizeRow));
+    state.rawTest  = repairTitanicRows(testRows.map(normalizeRow));
 
+    // Update UI
     el('kTrain').textContent = state.rawTrain.length;
     el('kTest').textContent  = state.rawTest.length || '—';
     el('kMiss').textContent  = roughMissingPct(state.rawTrain) + '%';
