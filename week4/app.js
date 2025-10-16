@@ -1,182 +1,361 @@
-// app.js — adds a **DOV specialist** fine-tune after the main training.
-// Keeps the same UI; no cheating on evaluation.
+// app.js
+// Glue UI: data loading, model training, evaluation, and visualizations.
 
-import { prepareDatasetFromFile, DEFAULT_SEQ_LEN, DEFAULT_HORIZONS } from './data-loader.js';
-import { GRUDAEClassifier } from './gru.js';
+import { DataLoader } from './data-loader.js';
+import { GRUStockModel, computePerStockMetrics } from './gru.js';
 
-const ui = {
+const els = {
   file: document.getElementById('csvFile'),
-  load: document.getElementById('btnLoad'),
-  train: document.getElementById('btnTrain'),
-  predict: document.getElementById('btnPredict'),
-  save: document.getElementById('btnSave'),
+  prepareBtn: document.getElementById('prepareBtn'),
+  trainBtn: document.getElementById('trainBtn'),
+  predictBtn: document.getElementById('predictBtn'),
+  runAllBtn: document.getElementById('runAllBtn'),
+  saveBtn: document.getElementById('saveBtn'),
+  loadBtn: document.getElementById('loadBtn'),
+  resetBtn: document.getElementById('resetBtn'),
+  status: document.getElementById('status'),
+  prog: document.getElementById('prog'),
+  log: document.getElementById('log'),
+  dataInfo: document.getElementById('dataInfo'),
+  accChart: document.getElementById('accChart'),
+  trainChart: document.getElementById('trainChart'),
+  timeline: document.getElementById('timeline'),
+  confusions: document.getElementById('confusions'),
+  seqLen: document.getElementById('seqLen'),
+  horizon: document.getElementById('horizon'),
   epochs: document.getElementById('epochs'),
   batch: document.getElementById('batch'),
-  aeEpochs: document.getElementById('aeEpochs'),
-  aeNoise: document.getElementById('aeNoise'),
-  shapes: document.getElementById('shapes'),
-  tuned: document.getElementById('tunedThreshold'),
-  log: document.getElementById('log'),
-  bar: document.getElementById('progressBar'),
-  barText: document.getElementById('progressText'),
-  accCanvas: document.getElementById('accChart'),
-  timelineContainer: document.getElementById('timelineContainer'),
-  confusionContainer: document.getElementById('confusionContainer'),
+  valsplit: document.getElementById('valsplit'),
+  lr: document.getElementById('lr'),
+  units: document.getElementById('units'),
+  dropout: document.getElementById('dropout'),
+  bidi: document.getElementById('bidi'),
 };
 
-let ds=null, model=null, accChart=null, tunedThresholds=null;
+let loader = null;
+let dataset = null;
+let model = null;
+let charts = { acc: null, train: null };
 
-function setDisabled(el,v){ el.disabled=!!v; }
-function setState(s){ setDisabled(ui.train,s!=='loaded'); setDisabled(ui.predict,s!=='trained'); setDisabled(ui.save,s!=='trained'); }
-function log(msg){ const t=new Date().toLocaleTimeString(); ui.log.textContent += `[${t}] ${msg}\n`; ui.log.scrollTop = ui.log.scrollHeight; }
-function progress(p,txt){ const v=Math.max(0,Math.min(100,Math.round(p))); ui.bar.style.width=`${v}%`; ui.barText.textContent = txt || `${v}%`; }
-function showShapes(meta, symbols){ ui.shapes.textContent = `SeqLen=${meta.seqLen}, FeatureDim=${meta.featureDim} (${meta.featuresPerStock}/stock), Samples=${meta.totalSamples} (train ${meta.numTrain} | val ${meta.numVal} | test ${meta.numTest}), Stocks=${symbols.length}`; }
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  els.log.textContent += `[${time}] ${msg}\n`;
+  els.log.scrollTop = els.log.scrollHeight;
+}
 
-function computePerStockMetrics(pred, truth, symbols, horizons, thrArr){
-  const S=symbols.length,H=horizons.length,N=truth.length;
-  const per=symbols.map(()=>({correct:0,total:0,timeline:Array.from({length:H},()=>[]),confusion:[0,0,0,0]}));
-  for(let i=0;i<N;i++){
-    const gt=truth[i], pp=pred[i];
-    for(let s=0;s<S;s++){
-      for(let h=0;h<H;h++){
-        const idx=s*H+h, thr=Array.isArray(thrArr)?thrArr[idx]:thrArr;
-        const y=gt[idx]>=0.5?1:0, p=pp[idx]>=thr?1:0, ok=y===p;
-        per[s].correct+=ok?1:0; per[s].total++; per[s].timeline[h].push(ok);
-        if (y===0&&p===0) per[s].confusion[0]++; else if (y===0&&p===1) per[s].confusion[1]++; else if (y===1&&p===0) per[s].confusion[2]++; else per[s].confusion[3]++;
-      }
+function setStatus(msg, progress = null) {
+  els.status.textContent = msg;
+  if (progress != null) {
+    els.prog.value = progress;
+  }
+}
+
+function enableControls({ prepared = false, trained = false } = {}) {
+  els.trainBtn.disabled = !prepared;
+  els.predictBtn.disabled = !(prepared && trained);
+  els.runAllBtn.disabled = !prepared;
+  els.saveBtn.disabled = !trained;
+}
+
+function parseUnits(str) {
+  const arr = (str || '').split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0);
+  return arr.length ? arr : [64, 32];
+}
+
+function releaseTensors(obj) {
+  for (const k of Object.keys(obj)) {
+    if (obj[k] && typeof obj[k].dispose === 'function') {
+      try { obj[k].dispose(); } catch {}
     }
   }
-  return per.map((st,i)=>({symbol:ds.symbols[i], accuracy:st.total?st.correct/st.total:0, timeline:st.timeline, confusion:st.confusion}));
-}
-function overallAccuracy(pred, truth, thrArr){
-  let c=0,n=0; const D=truth[0].length;
-  for(let i=0;i<truth.length;i++){ const t=truth[i], p=pred[i];
-    for(let j=0;j<D;j++){ const thr=Array.isArray(thrArr)?thrArr[j]:thrArr; c += ((t[j]>=0.5)===(p[j]>=thr))?1:0; n++; } }
-  return c/Math.max(1,n);
-}
-function tuneThresholds(valPred, yVal, lo=0.30, hi=0.70, step=0.01){
-  const D=yVal[0].length,N=yVal.length,th=new Array(D).fill(0.5);
-  for(let j=0;j<D;j++){ let best=-1,thrBest=0.5;
-    for(let thr=lo;thr<=hi+1e-9;thr+=step){ let c=0; for(let i=0;i<N;i++){ c += ((yVal[i][j]>=0.5)===(valPred[i][j]>=thr))?1:0; } const acc=c/N; if(acc>best){ best=acc; thrBest=+thr.toFixed(3);} }
-    th[j]=thrBest;
-  }
-  return th;
-}
-function drawAccuracyBarChart(results){
-  const sorted=[...results].sort((a,b)=>b.accuracy-a.accuracy);
-  const labels=sorted.map(r=>r.symbol);
-  const data=sorted.map(r=>(r.accuracy*100).toFixed(2));
-  if (accChart){ accChart.destroy(); accChart=null; }
-  const ctx=ui.accCanvas.getContext('2d');
-  accChart=new Chart(ctx,{type:'bar',data:{labels,datasets:[{label:'Accuracy (%)',data}]},options:{indexAxis:'y',scales:{x:{min:0,max:100,ticks:{callback:v=>`${v}%`}}},plugins:{legend:{display:false}},responsive:true}});
-}
-function drawTimelines(results,horizons,baseDates){
-  ui.timelineContainer.innerHTML=''; const H=horizons.length;
-  results.forEach(r=>{
-    const wrap=document.createElement('div'); wrap.className='timeline';
-    const title=document.createElement('div'); title.className='timeline-title'; title.textContent=`${r.symbol} — prediction correctness (rows: +1d, +2d, +3d)`; wrap.appendChild(title);
-    const canvas=document.createElement('canvas'); canvas.width=Math.max(640,r.timeline[0].length*6); canvas.height=H*18+26; wrap.appendChild(canvas);
-    const legend=document.createElement('div'); legend.className='legend'; legend.innerHTML='<span style="display:inline-block;width:12px;height:12px;background:#27ae60;margin-right:4px;"></span>Correct &nbsp; <span style="display:inline-block;width:12px;height:12px;background:#e74c3c;margin-right:4px;"></span>Wrong'; wrap.appendChild(legend);
-    const ctx=canvas.getContext('2d'); const cellW=6,cellH=12,padL=58,padT=8; ctx.font='12px system-ui, sans-serif';
-    for(let h=0;h<H;h++){ const seq=r.timeline[h]; ctx.fillStyle='#444'; ctx.fillText(`+${h+1}d`,6,padT+h*(cellH+6)+cellH-2);
-      for(let i=0;i<seq.length;i++){ ctx.fillStyle=seq[i]?'#27ae60':'#e74c3c'; ctx.fillRect(padL+i*cellW, padT+h*(cellH+6), cellW-1, cellH); } }
-    const N=r.timeline[0].length, step=Math.max(1,Math.floor(N/12)); ctx.fillStyle='#222';
-    for(let i=0;i<N;i+=step){ const x=padL+i*cellW; ctx.fillRect(x,canvas.height-10,1,8); ctx.save(); ctx.translate(x+2,canvas.height-2); ctx.rotate(-Math.PI/4); ctx.fillText(baseDates[i]||'',0,0); ctx.restore(); }
-    ui.timelineContainer.appendChild(wrap);
-  });
-}
-function drawConfusions(results){
-  ui.confusionContainer.innerHTML=''; const grid=document.createElement('div'); grid.className='cm-grid';
-  results.forEach(r=>{ const [tn,fp,fn,tp]=r.confusion; const card=document.createElement('div'); card.className='cm-card';
-    card.innerHTML=`<div class="cm-title">${r.symbol}</div><table class="cm-table"><thead><tr><th></th><th>Pred 0</th><th>Pred 1</th></tr></thead><tbody><tr><td>True 0</td><td>${tn}</td><td>${fp}</td></tr><tr><td>True 1</td><td>${fn}</td><td>${tp}</td></tr></tbody></table>`;
-    grid.appendChild(card);
-  }); ui.confusionContainer.appendChild(grid);
 }
 
-// ---------- Flow ----------
-async function handleLoad(){
+function clearVisuals() {
+  if (charts.acc) { charts.acc.destroy(); charts.acc = null; }
+  if (charts.train) { charts.train.destroy(); charts.train = null; }
+  els.timeline.innerHTML = '';
+  els.confusions.innerHTML = '';
+}
+
+async function prepare() {
   try {
-    const f = ui.file.files?.[0]; if (!f){ alert('Choose a CSV file first.'); return; }
-    progress(5,'Preparing dataset...');
-    ds?.X_train?.dispose(); ds?.y_train?.dispose(); ds?.X_val?.dispose(); ds?.y_val?.dispose(); ds?.X_test?.dispose(); ds?.y_test?.dispose();
-    ds = await prepareDatasetFromFile(f, { seqLen: DEFAULT_SEQ_LEN, horizons: DEFAULT_HORIZONS, testSplit: 0.2, valSplitWithinTrain: 0.12 });
-    showShapes(ds.meta, ds.symbols);
-    log('Dataset prepared.');
-    progress(25,'Dataset ready'); setState('loaded');
-  } catch (e){ console.error(e); alert(`Data load error: ${e.message}`); log(`Error: ${e.message}`); progress(0,''); setState('init'); }
-}
+    clearVisuals();
+    if (!els.file.files[0]) {
+      alert('Please choose a CSV file first.');
+      return;
+    }
+    const seqLen = Math.max(6, Math.min(60, parseInt(els.seqLen.value, 10) || 12));
+    const horizon = Math.max(1, Math.min(5, parseInt(els.horizon.value, 10) || 3));
 
-async function handleTrain(){
-  if (!ds){ alert('Load data first.'); return; }
-  try {
-    const aeEpochs = Math.max(0, parseInt(ui.aeEpochs.value || '20', 10));
-    const aeNoise  = Math.max(0, Math.min(0.3, parseFloat(ui.aeNoise.value || '0.08')));
-    const epochs   = Math.max(1, parseInt(ui.epochs.value || '40', 10));
-    const batch    = Math.max(1, parseInt(ui.batch.value || '32', 10));
+    loader = new DataLoader({ seqLen, horizon, testSplit: 0.2 });
+    setStatus('Parsing CSV & preparing dataset…', 0.05);
+    log('Parsing CSV…');
 
-    model?.dispose();
-    model = new GRUDAEClassifier({
-      seqLen: ds.meta.seqLen, featureDim: ds.meta.featureDim,
-      numStocks: ds.symbols.length, horizons: ds.horizons,
-      latentDim: 128, encoderGRU: 96, denseHead: 192,
-      aeLR: 1e-3, clsLR: 7e-4, dropout: 0.25
+    dataset = await loader.loadFromFile(els.file.files[0], (info) => {
+      els.dataInfo.innerHTML = `
+        <div>Symbols: <b>${info.symbols.join(', ')}</b></div>
+        <div>Dates: <b>${info.start}</b> → <b>${info.end}</b></div>
+        <div>Samples: <b>${info.samples}</b> (Train ${info.train}, Test ${info.test})</div>
+        <div>Shapes: X[${info.train}, ${info.seqLen}, ${info.featDim}], y[${info.train}, ${info.outDim}]</div>
+      `;
+      log(`Aligned ${info.symbols.length} symbols across ${info.samples} samples.`);
     });
 
-    // AE pretrain
-    progress(30,'Pretraining autoencoder...');
-    if (aeEpochs > 0) {
-      await model.pretrainAE(ds.X_train, { epochs: aeEpochs, batchSize: batch, noiseStd: aeNoise },
-        (e, logs) => log(`AE Epoch ${e+1}/${aeEpochs} — mse=${logs.loss?.toFixed(6)}`));
-    } else { log('AE pretraining skipped.'); }
-
-    // Classifier
-    progress(60,'Training classifier...');
-    await model.fitClassifier(ds.X_train, ds.y_train, ds.X_val, ds.y_val,
-      { epochs, batchSize: batch, freezeEncoder: true, patience: 6, minDelta: 1e-4 },
-      (epoch, logs, tag) => log(`${tag} Epoch ${epoch+1} — loss=${logs.loss?.toFixed(4)} valLoss=${logs.val_loss?.toFixed(4)} acc=${(logs.binaryAccuracy*100).toFixed(2)}%`)
-    );
-
-    // **DOV specialist** (only if DOV exists)
-    const sIdx = ds.symbols.indexOf('DOV');
-    if (sIdx !== -1) {
-      progress(82,'Fine-tuning DOV specialist...');
-      await model.fitStockHead(ds.X_train, ds.y_train, ds.X_val, ds.y_val, sIdx,
-        { epochs: Math.round(epochs*0.7), batchSize: batch, lr: 1e-3, hidden: 128, patience: 5 },
-        (epoch, logs) => log(`SPC Epoch ${epoch+1} — loss=${logs.loss?.toFixed(4)} valLoss=${logs.val_loss?.toFixed(4)} acc=${(logs.binaryAccuracy*100).toFixed(2)}%`)
-      );
-      log('DOV specialist head trained.');
-    } else {
-      log('DOV not in symbols list; specialist skipped.');
-    }
-
-    // Threshold tuning on validation (uses override if present)
-    progress(88,'Tuning thresholds...');
-    const valPredT = model.predict(ds.X_val);
-    const valPred = await valPredT.array(); valPredT.dispose();
-    const yValArr = await ds.y_val.array();
-    tunedThresholds = tuneThresholds(valPred, yValArr, 0.30, 0.70, 0.01);
-    const valAcc = overallAccuracy(valPred, yValArr, tunedThresholds);
-    const avgThr = tunedThresholds.reduce((a,b)=>a+b,0)/tunedThresholds.length;
-    ui.tuned.textContent = `avg thr ${avgThr.toFixed(2)} (val acc ${(valAcc*100).toFixed(2)}%)`;
-    log(`Validation accuracy ${(valAcc*100).toFixed(2)}% with tuned thresholds (avg ${avgThr.toFixed(2)}).`);
-
-    progress(90,'Training complete'); setState('trained');
-  } catch (e){ console.error(e); alert(`Training error: ${e.message}`); log(`Error: ${e.message}`); progress(0,''); }
+    setStatus('Dataset ready.', 0.2);
+    enableControls({ prepared: true, trained: false });
+    log('Dataset prepared.');
+  } catch (err) {
+    console.error(err);
+    alert('Error preparing data: ' + err.message);
+    setStatus('Error.');
+  }
 }
 
-async function handlePredict(){
-  if (!ds || !model){ alert('Train model first.'); return; }
+async function train() {
+  if (!dataset) return;
+  clearVisuals();
+
+  const params = {
+    seqLen: dataset.seqLen,
+    featDim: dataset.featDim,
+    horizon: dataset.horizon,
+    numStocks: dataset.symbols.length,
+    units: parseUnits(els.units.value),
+    dropout: parseFloat(els.dropout.value || '0.2'),
+    learningRate: parseFloat(els.lr.value || '0.001'),
+    bidirectional: !!els.bidi.checked,
+  };
+  model = new GRUStockModel(params);
+  model.summary();
+
+  const epochs = parseInt(els.epochs.value || '25', 10);
+  const batchSize = parseInt(els.batch.value || '32', 10);
+  const validationSplit = Math.min(0.4, Math.max(0, parseFloat(els.valsplit.value || '0.1')));
+
+  const lossSeries = [];
+  const accSeries = [];
+  setStatus('Training…', 0.25);
+
+  const history = await model.fit(dataset.X_train, dataset.y_train, {
+    epochs,
+    batchSize,
+    validationSplit,
+    onEpoch: (epoch, logs) => {
+      const { loss, val_loss, binaryAccuracy, val_binaryAccuracy } = logs;
+      lossSeries.push({ epoch, loss, val_loss });
+      accSeries.push({ epoch, acc: binaryAccuracy, val_acc: val_binaryAccuracy });
+      setStatus(`Epoch ${epoch + 1}/${epochs} — loss ${loss.toFixed(4)} acc ${(binaryAccuracy * 100).toFixed(2)}%`, 0.25 + 0.65 * ((epoch + 1) / epochs));
+      log(`Epoch ${epoch + 1}: loss=${loss.toFixed(4)}, val_loss=${val_loss?.toFixed(4)}, acc=${(binaryAccuracy * 100).toFixed(2)}%, val_acc=${(val_binaryAccuracy * 100).toFixed(2)}%`);
+      renderTrainChart(lossSeries, accSeries);
+    },
+  });
+
+  const final = history.history;
+  log(`Training complete. Final acc=${(final.binaryAccuracy.slice(-1)[0] * 100).toFixed(2)}%, val_acc=${(final.val_binaryAccuracy.slice(-1)[0] * 100).toFixed(2)}%`);
+  setStatus('Training complete.', 0.9);
+  enableControls({ prepared: true, trained: true });
+
+  // Free training tensors (keep test set)
+  releaseTensors({ X_train: dataset.X_train, y_train: dataset.y_train });
+  dataset.X_train = null; dataset.y_train = null;
+}
+
+async function evaluate() {
+  if (!model || !dataset) return;
+
+  setStatus('Evaluating…', 0.92);
+  const evalStats = await model.evaluate(dataset.X_test, dataset.y_test);
+  log(`Eval — loss=${evalStats.loss.toFixed(4)}, acc=${(evalStats.acc * 100).toFixed(2)}%`);
+
+  const predsT = await model.predict(dataset.X_test);
+  const yTrue = await dataset.y_test.array();
+  const yPred = await predsT.array();
+
+  // Metrics & timelines
+  const { accuracies, confusions, timelines } = computePerStockMetrics({
+    yTrue, yPred, symbols: dataset.symbols, horizon: dataset.horizon, threshold: 0.5,
+  });
+
+  // Render Accuracy Ranking
+  renderAccuracyChart(dataset.symbols, accuracies);
+
+  // Render Timelines
+  renderTimelines(dataset.symbols, timelines, dataset.testDates, dataset.horizon);
+
+  // Render Confusions
+  renderConfusions(confusions);
+
+  // Cleanup
+  predsT.dispose();
+  setStatus('Done.', 1);
+}
+
+function renderAccuracyChart(symbols, accuracies) {
+  const pairs = symbols.map((s, i) => ({ s, a: accuracies[i] })).sort((a, b) => b.a - a.a);
+  const labels = pairs.map(p => p.s);
+  const data = pairs.map(p => +(p.a * 100).toFixed(2));
+
+  if (charts.acc) charts.acc.destroy();
+  charts.acc = new Chart(els.accChart.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ label: 'Accuracy (%)', data, borderWidth: 1 }],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      scales: {
+        x: { min: 0, max: 100, ticks: { callback: v => v + '%' } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => `${ctx.raw}%` } },
+      },
+    },
+  });
+}
+
+function renderTrainChart(lossSeries, accSeries) {
+  const ctx = els.trainChart.getContext('2d');
+  if (charts.train) charts.train.destroy();
+
+  charts.train = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: lossSeries.map(d => d.epoch + 1),
+      datasets: [
+        { label: 'loss', data: lossSeries.map(d => d.loss), yAxisID: 'y' },
+        { label: 'val_loss', data: lossSeries.map(d => d.val_loss ?? null), yAxisID: 'y' },
+        { label: 'acc', data: accSeries.map(d => d.acc), yAxisID: 'y1' },
+        { label: 'val_acc', data: accSeries.map(d => d.val_acc ?? null), yAxisID: 'y1' },
+      ],
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: { type: 'linear', position: 'left' },
+        y1: { type: 'linear', position: 'right', min: 0, max: 1, grid: { drawOnChartArea: false } },
+      },
+      plugins: { legend: { position: 'bottom' } },
+    },
+  });
+}
+
+function renderTimelines(symbols, timelines, dates, horizon) {
+  els.timeline.innerHTML = '';
+  symbols.forEach((sym, si) => {
+    const card = document.createElement('div');
+    card.className = 'stock-timeline';
+    const title = document.createElement('h4');
+    title.textContent = sym;
+    card.appendChild(title);
+
+    const H = horizon;
+    for (let h = 0; h < H; h++) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = `D+${h + 1}`;
+      row.appendChild(label);
+
+      const cells = document.createElement('div');
+      cells.className = 'cells';
+      const arr = timelines[sym][h];
+      for (let i = 0; i < arr.length; i++) {
+        const cell = document.createElement('div');
+        cell.className = `cell ${arr[i] ? 'ok' : 'bad'}`;
+        cell.title = `${sym} @ ${dates[i]} • D+${h + 1} • ${arr[i] ? 'Correct' : 'Wrong'}`;
+        cells.appendChild(cell);
+      }
+      row.appendChild(cells);
+      card.appendChild(row);
+    }
+    els.timeline.appendChild(card);
+  });
+}
+
+function renderConfusions(confusions) {
+  const table = document.createElement('table');
+  table.style.borderCollapse = 'collapse';
+  table.style.width = '100%';
+  const thead = document.createElement('thead');
+  thead.innerHTML = `<tr>
+      <th style="text-align:left;padding:6px;border-bottom:1px solid #1f2937">Symbol</th>
+      <th style="padding:6px;border-bottom:1px solid #1f2937">TP</th>
+      <th style="padding:6px;border-bottom:1px solid #1f2937">FP</th>
+      <th style="padding:6px;border-bottom:1px solid #1f2937">TN</th>
+      <th style="padding:6px;border-bottom:1px solid #1f2937">FN</th>
+    </tr>`;
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const sym of Object.keys(confusions)) {
+    const { TP, FP, TN, FN } = confusions[sym];
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td style="padding:6px;border-bottom:1px solid #1f2937">${sym}</td>
+      <td style="padding:6px;border-bottom:1px solid #1f2937">${TP}</td>
+      <td style="padding:6px;border-bottom:1px solid #1f2937">${FP}</td>
+      <td style="padding:6px;border-bottom:1px solid #1f2937">${TN}</td>
+      <td style="padding:6px;border-bottom:1px solid #1f2937">${FN}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  els.confusions.innerHTML = '';
+  els.confusions.appendChild(table);
+}
+
+els.prepareBtn.addEventListener('click', prepare);
+els.trainBtn.addEventListener('click', train);
+els.predictBtn.addEventListener('click', evaluate);
+
+els.runAllBtn.addEventListener('click', async () => {
+  if (!dataset) await prepare();
+  await train();
+  await evaluate();
+});
+
+els.saveBtn.addEventListener('click', async () => {
+  if (!model) return;
+  setStatus('Saving model…');
+  await model.save('multi_stock_gru');
+  setStatus('Model saved to browser storage.');
+  log('Model saved (localstorage://multi_stock_gru).');
+});
+
+els.loadBtn.addEventListener('click', async () => {
   try {
-    progress(95,'Predicting...');
-    const predT = model.predict(ds.X_test);
-    const predArr = await predT.array(); predT.dispose();
-    const truthArr = await ds.y_test.array();
+    setStatus('Loading saved model…');
+    model = await GRUStockModel.load('multi_stock_gru');
+    setStatus('Model loaded.');
+    log('Loaded model from localstorage://multi_stock_gru');
+    enableControls({ prepared: !!dataset, trained: true });
+  } catch (e) {
+    alert('No saved model found or load failed.');
+    setStatus('Load failed.');
+  }
+});
 
-    const results = computePerStockMetrics(predArr, truthArr, ds.symbols, ds.horizons, tunedThresholds || 0.5);
-    drawAccuracyBarChart(results);
-    drawTimelines(results, ds.horizons, ds.baseDatesTest);
-    drawConfusions(results);
+els.resetBtn.addEventListener('click', () => {
+  try {
+    if (model?.model) model.model.dispose();
+    model = null;
+    if (dataset) {
+      releaseTensors(dataset);
+      dataset = null;
+    }
+    clearVisuals();
+    els.log.textContent = '';
+    els.dataInfo.textContent = '';
+    setStatus('Reset.');
+    enableControls({ prepared: false, trained: false });
+  } catch {}
+});
 
-    const overall = overallAccuracy(predArr, truthArr, tunedThresholds || 0.5);
-    const dov = results.find(r => r.symbol === 'DOV');
-    log
+// Auto-enable prepare when file chosen
+els.file.addEventListener('change', () => {
+  setStatus('CSV selected. Click "Load CSV & Prepare".');
+});
