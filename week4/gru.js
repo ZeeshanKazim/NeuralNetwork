@@ -1,13 +1,11 @@
-// gru.js
-// Denoising Autoencoder (DAE) + GRU classifier (browser, TF.js).
-// No unsupported callbacks -> avoids "setParams is not a function" error.
-// Uses tf.CustomCallback for logging, and manual early-stopping with best-weight restore.
+// gru.js — Denoising AE + GRU classifier + **per-stock specialist head**
+// Keeps the clean callback usage (tf.CustomCallback), avoids setParams issues.
 
 export class GRUDAEClassifier {
   constructor(cfg = {}) {
     const {
       seqLen = 12,
-      featureDim = 140,           // MAX_STOCKS(10) × FEATURES_PER_STOCK(14)
+      featureDim = 140,           // 10 stocks × 14 features
       numStocks = 10,
       horizons = [1,2,3],
       latentDim = 128,
@@ -32,8 +30,10 @@ export class GRUDAEClassifier {
     this.dropout = dropout;
 
     this.ae = null;
-    this.encoder = null;
-    this.classifier = null;
+    this.encoder = null;     // inp -> latent
+    this.classifier = null;  // inp -> outDim
+    this.stockHead = null;   // specialist head (inp -> H) for one stock
+    this.stockIndex = null;  // which stock the specialist targets
   }
 
   // ---------- Build models ----------
@@ -61,12 +61,9 @@ export class GRUDAEClassifier {
     if (!this.encoder) throw new Error('Encoder not built. Call pretrainAE first.');
     const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
 
-    // Reuse encoder layers (by calling encoder on input)
     let x = this.encoder.apply(inp);
-    // Optionally freeze encoder by marking its layers non-trainable
     this.encoder.layers.forEach(ly => ly.trainable = !freezeEncoder);
 
-    // Head
     x = tf.layers.dropout({ rate: this.dropout }).apply(x);
     x = tf.layers.dense({ units: this.denseHead, activation: 'relu' }).apply(x);
     x = tf.layers.dropout({ rate: this.dropout }).apply(x);
@@ -80,11 +77,9 @@ export class GRUDAEClassifier {
     });
   }
 
-  // ---------- Training ----------
+  // ---------- AE pretraining with noise ----------
   async pretrainAE(X_train, { epochs = 25, batchSize = 32, noiseStd = 0.08 }, onEpochEnd) {
     if (!this.ae) this._buildAE();
-
-    // Manual per-epoch noise injection to avoid requiring special layers
     for (let e = 0; e < epochs; e++) {
       const noise = tf.randomNormal(X_train.shape, 0, noiseStd);
       const noisy = tf.clipByValue(tf.add(X_train, noise), 0, 1);
@@ -100,6 +95,7 @@ export class GRUDAEClassifier {
     }
   }
 
+  // ---------- Classifier training (freeze → unfreeze) ----------
   async fitClassifier(X_train, y_train, X_val, y_val, { epochs = 40, batchSize = 32, freezeEncoder = true, patience = 6, minDelta = 1e-4 }, onEpochEnd) {
     if (!this.classifier) this._buildClassifier(freezeEncoder, this.clsLR);
 
@@ -117,9 +113,7 @@ export class GRUDAEClassifier {
           bestWeights = this.classifier.getWeights().map(w => w.clone());
         } else {
           wait++;
-          if (wait >= patience) {
-            this.classifier.stopTraining = true;
-          }
+          if (wait >= patience) this.classifier.stopTraining = true;
         }
         await tf.nextFrame();
       }
@@ -129,15 +123,14 @@ export class GRUDAEClassifier {
       epochs, batchSize, shuffle: false, validationData: [X_val, y_val], callbacks: [cb]
     });
 
-    // Restore best weights
     if (bestWeights) {
       const cloned = bestWeights.map(w => w.clone());
       this.classifier.setWeights(cloned);
       bestWeights.forEach(w => w.dispose());
     }
 
-    // Optional fine-tune: unfreeze encoder and run a few small-LR epochs
-    this._buildClassifier(false, this.clsLR * 0.5); // unfreeze + lower LR, reuse same encoder graph
+    // light fine-tune (unfreeze)
+    this._buildClassifier(false, this.clsLR * 0.5);
     await this.classifier.fit(X_train, y_train, {
       epochs: Math.max(4, Math.floor(epochs * 0.25)),
       batchSize,
@@ -147,19 +140,93 @@ export class GRUDAEClassifier {
     });
   }
 
+  // ---------- NEW: per-stock specialist head (e.g., DOV) ----------
+  async fitStockHead(X_train, y_train, X_val, y_val, stockIndex, {
+    epochs = 28, batchSize = 32, lr = 1e-3, hidden = 128, patience = 5, minDelta = 1e-4
+  } = {}, onEpochEnd) {
+    if (!this.encoder) throw new Error('Encoder not ready.');
+    this.stockIndex = stockIndex;
+
+    // Build specialist head on top of the shared encoder (frozen)
+    const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
+    const latent = this.encoder.apply(inp);
+    this.encoder.layers.forEach(ly => ly.trainable = false);
+
+    let h = tf.layers.dropout({ rate: this.dropout }).apply(latent);
+    h = tf.layers.dense({ units: hidden, activation: 'relu' }).apply(h);
+    h = tf.layers.dropout({ rate: this.dropout }).apply(h);
+
+    const H = this.horizons.length;
+    const out = tf.layers.dense({ units: H, activation: 'sigmoid' }).apply(h);
+
+    this.stockHead = tf.model({ inputs: inp, outputs: out });
+    this.stockHead.compile({ optimizer: tf.train.adam(lr), loss: 'binaryCrossentropy', metrics: ['binaryAccuracy'] });
+
+    // Slice y for the target stock (columns s*H .. s*H+H-1)
+    const start = stockIndex * H;
+    const yTr = y_train.slice([0, start], [-1, H]);
+    const yVa = y_val.slice([0, start], [-1, H]);
+
+    let bestVal = Number.POSITIVE_INFINITY;
+    let bestW = null, wait = 0;
+
+    const cb = new tf.CustomCallback({
+      onEpochEnd: async (epoch, logs) => {
+        if (onEpochEnd) onEpochEnd(epoch, logs, 'SPC');
+        const v = logs.val_loss;
+        if (Number.isFinite(v) && v < bestVal - minDelta) {
+          bestVal = v; wait = 0;
+          if (bestW) bestW.forEach(w => w.dispose());
+          bestW = this.stockHead.getWeights().map(w => w.clone());
+        } else {
+          wait++;
+          if (wait >= patience) this.stockHead.stopTraining = true;
+        }
+        await tf.nextFrame();
+      }
+    });
+
+    await this.stockHead.fit(X_train, yTr, {
+      epochs, batchSize, shuffle: false, validationData: [X_val, yVa], callbacks: [cb]
+    });
+
+    if (bestW) {
+      const cloned = bestW.map(w => w.clone());
+      this.stockHead.setWeights(cloned);
+      bestW.forEach(w => w.dispose());
+    }
+
+    yTr.dispose(); yVa.dispose();
+  }
+
+  // Predict with optional specialist override (replaces that stock’s 3 columns)
   predict(X) {
-    if (!this.classifier) throw new Error('Classifier is not built.');
-    return this.classifier.predict(X);
+    const base = this.classifier.predict(X);                  // [N, outDim]
+    if (!this.stockHead || this.stockIndex == null) return base;
+
+    const N = base.shape[0];
+    const H = this.horizons.length;
+    const start = this.stockIndex * H;
+
+    const left  = start > 0 ? base.slice([0,0],[N,start]) : null;
+    const rightLen = this.outDim - (start + H);
+    const right = rightLen > 0 ? base.slice([0,start+H],[N,rightLen]) : null;
+    const mid   = this.stockHead.predict(X);                  // [N, H]
+
+    const parts = [];
+    if (left)  parts.push(left);
+    parts.push(mid);
+    if (right) parts.push(right);
+
+    const out = tf.concat(parts, 1);
+    base.dispose();
+    if (left) left.dispose();
+    if (right) right.dispose();
+    // mid is kept till concat copies; safe to let GC reclaim after return or explicitly dispose here:
+    // (do not dispose mid before concat)
+    return out;
   }
 
-  async save(prefix='tfjs_gru_ae') {
-    if (this.classifier) await this.classifier.save(`downloads://${prefix}_classifier`);
-    if (this.ae)         await this.ae.save(`downloads://${prefix}_ae`);
-  }
-
-  dispose() {
-    this.classifier?.dispose();
-    this.encoder?.dispose();
-    this.ae?.dispose();
-  }
+  async save(prefix='tfjs_gru_ae'){ if (this.classifier) await this.classifier.save(`downloads://${prefix}_classifier`); if (this.ae) await this.ae.save(`downloads://${prefix}_ae`); if (this.stockHead) await this.stockHead.save(`downloads://${prefix}_specialist`); }
+  dispose(){ this.classifier?.dispose(); this.encoder?.dispose(); this.ae?.dispose(); this.stockHead?.dispose(); }
 }
