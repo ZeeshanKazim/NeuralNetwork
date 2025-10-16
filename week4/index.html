@@ -3,56 +3,59 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Multi-Stock GRU Prediction Demo (TensorFlow.js)</title>
+  <title>Stock Denoising Autoencoder + GRU (TensorFlow.js)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <!-- TF.js + Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
-    :root { --border:#e5e7eb; --muted:#6b7280; --bg:#fafafa; }
+    :root { --b:#e5e7eb; --m:#6b7280; --bg:#fafafa; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:18px; color:#1f2937; background:var(--bg); }
     h1 { margin:0 0 6px; font-size:22px; }
-    .muted { color:var(--muted); font-size:13px; }
-    .card { border:1px solid var(--border); background:#fff; border-radius:12px; padding:14px; box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:14px; }
+    .muted { color:var(--m); font-size:13px; }
+    .card { border:1px solid var(--b); background:#fff; border-radius:12px; padding:14px; box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:14px; }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .controls label { font-weight:600; margin-right:6px; }
     .controls input[type="number"] { width:80px; }
-    button { padding:8px 12px; border:1px solid var(--border); border-radius:8px; background:#0ea5e9; color:#fff; cursor:pointer; }
+    button { padding:8px 12px; border:1px solid var(--b); border-radius:8px; background:#0ea5e9; color:#fff; cursor:pointer; }
     button[disabled] { background:#cbd5e1; cursor:not-allowed; }
-    #log { height:150px; background:#f9fafb; border:1px solid var(--border); border-radius:8px; padding:8px; overflow:auto; white-space:pre-wrap; }
+    #log { height:160px; background:#f9fafb; border:1px solid var(--b); border-radius:8px; padding:8px; overflow:auto; white-space:pre-wrap; }
     .progress { display:flex; align-items:center; gap:8px; }
-    .progress-wrap { position:relative; height:16px; background:#f3f4f6; border:1px solid var(--border); border-radius:8px; overflow:hidden; flex:1; }
+    .progress-wrap { position:relative; height:16px; background:#f3f4f6; border:1px solid var(--b); border-radius:8px; overflow:hidden; flex:1; }
     .progress-bar { position:absolute; inset:0 auto 0 0; width:0%; background:#2563eb; transition:width .2s ease; }
-    .progress-text { font-size:12px; color:var(--muted); min-width:160px; }
-    #accChart { width:100%; max-width:960px; height:420px; }
+    .progress-text { font-size:12px; color:var(--m); min-width:160px; }
+    #accChart { width:100%; max-width:980px; height:420px; }
     .timeline { margin:12px 0 18px; }
     .timeline-title { font-weight:600; margin-bottom:6px; }
     .legend { font-size:12px; color:#6b7280; margin-top:4px; }
     .cm-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:12px; }
-    .cm-card { border:1px solid var(--border); border-radius:10px; padding:10px; background:#fff; }
+    .cm-card { border:1px solid var(--b); border-radius:10px; padding:10px; background:#fff; }
     .cm-title { font-weight:600; margin-bottom:6px; }
     .cm-table { width:100%; border-collapse:collapse; font-size:13px; }
-    .cm-table th, .cm-table td { border:1px solid var(--border); padding:4px 6px; text-align:center; }
+    .cm-table th, .cm-table td { border:1px solid var(--b); padding:4px 6px; text-align:center; }
     code { background:#f3f4f6; padding:2px 4px; border-radius:6px; }
   </style>
 </head>
 <body>
-  <h1>Multi-Stock GRU Prediction Demo</h1>
-  <div class="muted">Upload CSV (<code>Date, Symbol, Open, Close</code>) for 10 stocks. This app engineers indicators in-browser, trains a Conv1D+BiGRU model, tunes thresholds on a validation slice, and evaluates on a held‑out test segment.</div>
+  <h1>Stock Denoising Autoencoder + GRU (TF.js)</h1>
+  <div class="muted">Upload CSV (<code>Date, Symbol, Open, High, Low, Close, Volume</code>) for ≤10 symbols. The app pretrains a denoising autoencoder, then fine‑tunes a GRU classifier to predict up/down over the next 3 days. All in the browser.</div>
 
   <div class="card">
     <div class="row controls">
       <div>
         <label for="csvFile">CSV</label>
         <input type="file" id="csvFile" accept=".csv" />
-        <span id="fileName" class="muted"></span>
       </div>
       <div>
-        <label for="seqLen">SeqLen</label>
-        <input type="number" id="seqLen" min="16" value="48" />
+        <label for="aeEpochs">AE Epochs</label>
+        <input type="number" id="aeEpochs" min="0" value="20" />
       </div>
       <div>
-        <label for="epochs">Epochs</label>
+        <label for="aeNoise">AE Noise</label>
+        <input type="number" id="aeNoise" min="0" max="0.30" step="0.01" value="0.08" />
+      </div>
+      <div>
+        <label for="epochs">CLS Epochs</label>
         <input type="number" id="epochs" min="1" value="40" />
       </div>
       <div>
