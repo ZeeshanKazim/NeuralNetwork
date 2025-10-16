@@ -1,6 +1,6 @@
 // gru.js
-// Conv1D + BiGRU + GRU + Attention + Dense head (sigmoid).
-// Early stopping supported.
+// Conv1D feature extractor + BiGRU + GRU + Dense head (sigmoid).
+// Manual early stopping implemented via a CustomCallback to avoid callback API issues.
 
 export class GRUClassifier {
   constructor(cfg = {}) {
@@ -25,20 +25,6 @@ export class GRUClassifier {
     this.model = this._build({ convFilters, gruUnits, denseUnits, learningRate, dropout });
   }
 
-  _attentionOverTime(seqTensor) {
-    // seqTensor: [B, T, F]
-    const T = this.seqLen;
-    // score_t = tanh(W*h_t + b) -> [B,T,1]
-    let scores = tf.layers.dense({ units: 1, activation: 'tanh' }).apply(seqTensor);
-    // -> [B, T]
-    scores = tf.layers.reshape({ targetShape: [T] }).apply(scores);
-    // softmax over time -> [B, T]
-    const weights = tf.layers.activation({ activation: 'softmax' }).apply(scores);
-    // context = weights · seqTensor over time axis -> [B, F]
-    const context = tf.layers.dot({ axes: [1, 1] }).apply([weights, seqTensor]);
-    return context; // [B, F]
-  }
-
   _build({ convFilters, gruUnits, denseUnits, learningRate, dropout }) {
     const input = tf.input({ shape: [this.seqLen, this.featureDim] });
 
@@ -50,18 +36,14 @@ export class GRUClassifier {
       mergeMode: 'concat'
     }).apply(x);
 
-    // second GRU (sequence)
-    x = tf.layers.gru({ units: gruUnits, returnSequences: true, dropout: 0.15 }).apply(x);
+    x = tf.layers.gru({ units: gruUnits, returnSequences: false, dropout: 0.15 }).apply(x);
 
-    // attention over time -> fixed length
-    const ctx = this._attentionOverTime(x);
+    x = tf.layers.dense({ units: denseUnits, activation: 'relu' }).apply(x);
+    x = tf.layers.dropout({ rate: dropout }).apply(x);
 
-    // dense head
-    let out = tf.layers.dense({ units: denseUnits, activation: 'relu' }).apply(ctx);
-    out = tf.layers.dropout({ rate: dropout }).apply(out);
-    out = tf.layers.dense({ units: this.outputDim, activation: 'sigmoid' }).apply(out);
+    const output = tf.layers.dense({ units: this.outputDim, activation: 'sigmoid' }).apply(x);
 
-    const model = tf.model({ inputs: input, outputs: out });
+    const model = tf.model({ inputs: input, outputs: output });
     model.compile({
       optimizer: tf.train.adam(learningRate),
       loss: 'binaryCrossentropy',
@@ -70,33 +52,66 @@ export class GRUClassifier {
     return model;
   }
 
-  async fit(X_train, y_train, X_val, y_val, trainOpts = {}, onEpochEnd) {
+  async fit(X_train, y_train, X_val, y_val, opts = {}, onEpochEnd) {
     const {
       epochs = 40,
       batchSize = 32,
       shuffle = false,
-      patience = 6
-    } = trainOpts;
+      patience = 6,
+      minDelta = 1e-4
+    } = opts;
 
-    const cbs = [
-      tf.callbacks.earlyStopping({ monitor: 'val_loss', patience, verbose: 0 })
-    ];
-    if (onEpochEnd) {
-      cbs.push({ onEpochEnd: async (epoch, logs) => { onEpochEnd(epoch, logs); await tf.nextFrame(); } });
-    }
+    let bestVal = Number.POSITIVE_INFINITY;
+    let bestWeights = null;
+    let wait = 0;
+    const self = this;
 
-    return await this.model.fit(X_train, y_train, {
+    const history = await this.model.fit(X_train, y_train, {
       epochs,
       batchSize,
       shuffle,
       validationData: [X_val, y_val],
-      callbacks: cbs
+      callbacks: {
+        onEpochEnd: async function(epoch, logs) {
+          if (onEpochEnd) onEpochEnd(epoch, logs);
+
+          const v = logs.val_loss;
+          if (Number.isFinite(v) && v < bestVal - minDelta) {
+            bestVal = v;
+            wait = 0;
+            if (bestWeights) bestWeights.forEach(w => w.dispose());
+            bestWeights = self.model.getWeights().map(w => w.clone());
+          } else {
+            wait++;
+            if (wait >= patience) {
+              self.model.stopTraining = true;
+              if (bestWeights) {
+                const cloned = bestWeights.map(w => w.clone());
+                self.model.setWeights(cloned);
+                bestWeights.forEach(w => w.dispose());
+                bestWeights = null;
+              }
+            }
+          }
+          await tf.nextFrame();
+        }
+      }
     });
+
+    // Ensure best weights restored at the end if training didn't early-stop.
+    if (bestWeights) {
+      const cloned = bestWeights.map(w => w.clone());
+      this.model.setWeights(cloned);
+      bestWeights.forEach(w => w.dispose());
+      bestWeights = null;
+    }
+
+    return history;
   }
 
   predict(X) { return this.model.predict(X); }
 
-  dispose() { this.model?.dispose(); }
-
   async save(name = 'tfjs_gru_stock_demo') { await this.model.save(`downloads://${name}`); }
+
+  dispose() { if (this.model) this.model.dispose(); }
 }
