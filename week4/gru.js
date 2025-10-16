@@ -1,15 +1,15 @@
 // gru.js
-// GRU-based multi-output classifier in TensorFlow.js (browser-only)
+// GRU-based multi-output binary classifier in TensorFlow.js
 
 export class GRUClassifier {
   constructor(config = {}) {
     const {
       seqLen = 12,
-      featureDim = 20,
+      featureDim = 20,         // 10 stocks × 2 features
       numStocks = 10,
       horizons = [1, 2, 3],
       units = 64,
-      learningRate = 1e-3,
+      learningRate = 1e-3
     } = config;
 
     this.seqLen = seqLen;
@@ -33,7 +33,7 @@ export class GRUClassifier {
     }).apply(input);
 
     x = tf.layers.gru({
-      units: Math.max(32, Math.floor(units / 1.25)),
+      units: Math.max(32, Math.floor(units * 0.75)),
       returnSequences: false,
       dropout: 0.1,
       recurrentDropout: 0.0,
@@ -41,6 +41,7 @@ export class GRUClassifier {
     }).apply(x);
 
     x = tf.layers.dropout({ rate: 0.2 }).apply(x);
+
     const output = tf.layers.dense({
       units: this.outputDim,
       activation: 'sigmoid',
@@ -61,14 +62,11 @@ export class GRUClassifier {
       epochs = 25,
       batchSize = 32,
       validationSplit = 0.1,
-      shuffle = false // keep chronological
+      shuffle = false // keep chronological order
     } = options;
 
     return await this.model.fit(X_train, y_train, {
-      epochs,
-      batchSize,
-      validationSplit,
-      shuffle,
+      epochs, batchSize, validationSplit, shuffle,
       callbacks: {
         onEpochEnd: async (epoch, logs) => {
           if (onEpochEnd) onEpochEnd(epoch, logs);
