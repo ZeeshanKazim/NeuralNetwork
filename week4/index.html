@@ -7,30 +7,94 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <!-- TensorFlow.js -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
-  <!-- Chart.js for bar chart -->
+  <!-- Chart.js for accuracy bar chart -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
-    :root {
-      --border: #e5e7eb;
-      --muted: #6b7280;
-    }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; color: #1f2937; background: #fafafa; }
-    h1 { margin: 0 0 4px; font-size: 22px; }
-    .muted { color: var(--muted); font-size: 13px; }
-    .card { border: 1px solid var(--border); background: #fff; border-radius: 12px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); margin-bottom: 14px; }
-    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    .controls label { font-weight: 600; margin-right: 6px; }
-    .controls input[type="number"] { width: 80px; }
-    button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: #0ea5e9; color: #fff; cursor: pointer; }
-    button[disabled] { background: #cbd5e1; cursor: not-allowed; }
-    #log { height: 140px; background: #f9fafb; border: 1px solid var(--border); border-radius: 8px; padding: 8px; overflow: auto; white-space: pre-wrap; }
-    #accChart { width: 100%; max-width: 920px; height: 420px; }
-    .progress { position: relative; height: 16px; background: #f3f4f6; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
-    .progress-bar { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: #2563eb; transition: width .2s ease; }
-    .progress-text { font-size: 12px; margin-left: 6px; color: var(--muted); }
-    .timeline { margin: 12px 0 18px; }
-    .timeline-title { font-weight: 600; margin-bottom: 6px; }
-    .legend { font-size: 12px; color: var(--muted); margin-top: 4px; }
-    .legend .ok, .legend .bad { display: inline-block; width: 12px; height: 12px; vertical-align: middle; margin-right: 4px; }
-    .legend .ok { background: #27ae60; } .legend .bad { background: #e74c3c; }
-    .cm-grid { display: grid; grid-template-columns:analysis
+    :root { --border:#e5e7eb; --muted:#6b7280; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; color:#1f2937; background:#fafafa; }
+    h1 { margin:0 0 6px; font-size:22px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .card { border:1px solid var(--border); background:#fff; border-radius:12px; padding:14px; box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:14px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .controls label { font-weight:600; margin-right:6px; }
+    .controls input[type="number"] { width:80px; }
+    button { padding:8px 12px; border:1px solid var(--border); border-radius:8px; background:#0ea5e9; color:#fff; cursor:pointer; }
+    button[disabled] { background:#cbd5e1; cursor:not-allowed; }
+    #log { height:150px; background:#f9fafb; border:1px solid var(--border); border-radius:8px; padding:8px; overflow:auto; white-space:pre-wrap; }
+    #accChart { width:100%; max-width:960px; height:420px; }
+    .progress { display:flex; align-items:center; gap:8px; }
+    .progress-bar-wrap { position:relative; height:16px; background:#f3f4f6; border:1px solid var(--border); border-radius:8px; overflow:hidden; flex:1; }
+    .progress-bar { position:absolute; inset:0 auto 0 0; width:0%; background:#2563eb; transition:width .2s ease; }
+    .progress-text { font-size:12px; color:var(--muted); min-width:160px; }
+    .timeline { margin:12px 0 18px; }
+    .timeline-title { font-weight:600; margin-bottom:6px; }
+    .legend { font-size:12px; color:var(--muted); margin-top:4px; }
+    .legend .green, .legend .red { display:inline-block; width:12px; height:12px; vertical-align:middle; margin-right:4px; }
+    .legend .green { background:#2ecc71; } .legend .red { background:#e74c3c; }
+    .cm-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:12px; }
+    .cm-card { border:1px solid var(--border); border-radius:10px; padding:10px; background:#fff; }
+    .cm-title { font-weight:600; margin-bottom:6px; }
+    .cm-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .cm-table th, .cm-table td { border:1px solid var(--border); padding:4px 6px; text-align:center; }
+    code { background:#f3f4f6; padding:2px 4px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <h1>Multi-Stock GRU Prediction Demo</h1>
+  <div class="muted">Upload CSV (<code>Date, Symbol, Open, Close</code>) for 10 S&amp;P 500 stocks. Train a TensorFlow.js GRU fully in the browser and visualize 3-day-ahead up/down predictions.</div>
+
+  <div class="card">
+    <div class="row controls">
+      <div>
+        <label for="csvFile">CSV</label>
+        <input type="file" id="csvFile" accept=".csv" />
+        <span id="fileName" class="muted"></span>
+      </div>
+      <button id="btnLoad">Load &amp; Prepare</button>
+      <div>
+        <label for="epochs">Epochs</label>
+        <input type="number" id="epochs" min="1" value="25" />
+      </div>
+      <div>
+        <label for="batch">Batch</label>
+        <input type="number" id="batch" min="1" value="32" />
+      </div>
+      <button id="btnTrain" disabled>Train Model</button>
+      <button id="btnPredict" disabled>Run Prediction</button>
+      <button id="btnSave" disabled>Save Weights</button>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <div class="progress" style="width:100%;">
+        <div class="progress-bar-wrap">
+          <div id="progressBar" class="progress-bar"></div>
+        </div>
+        <div id="progressText" class="progress-text">—</div>
+      </div>
+    </div>
+    <div class="muted" style="margin-top:8px;">Shapes: <span id="shapes">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Logs</div>
+    <pre id="log"></pre>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Per-Stock Accuracy (sorted)</div>
+    <canvas id="accChart"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Per-Stock Prediction Timelines</div>
+    <div id="timelineContainer"></div>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Per-Stock Confusion Matrices (optional)</div>
+    <div id="confusionContainer"></div>
+  </div>
+
+  <!-- App entry -->
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
