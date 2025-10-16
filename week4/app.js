@@ -1,23 +1,22 @@
 // app.js
-// Orchestrates UI, data loading, model training, prediction, and visualization
+// UI orchestration, model training, evaluation, and interactive visualizations.
 
 import { prepareDatasetFromFile, DEFAULT_SEQ_LEN, DEFAULT_HORIZONS } from './data-loader.js';
 import { GRUClassifier } from './gru.js';
 
 const ui = {
   fileInput: document.getElementById('csvFile'),
+  fileName: document.getElementById('fileName'),
   loadBtn: document.getElementById('btnLoad'),
   trainBtn: document.getElementById('btnTrain'),
   predictBtn: document.getElementById('btnPredict'),
   saveBtn: document.getElementById('btnSave'),
   epochs: document.getElementById('epochs'),
   batch: document.getElementById('batch'),
-  progress: document.getElementById('progress'),
+  shapes: document.getElementById('shapes'),
+  log: document.getElementById('log'),
   progressBar: document.getElementById('progressBar'),
   progressText: document.getElementById('progressText'),
-  shapes: document.getElementById('shapes'),
-  fileName: document.getElementById('fileName'),
-  log: document.getElementById('log'),
   accCanvas: document.getElementById('accChart'),
   timelineContainer: document.getElementById('timelineContainer'),
   confusionContainer: document.getElementById('confusionContainer'),
@@ -26,30 +25,10 @@ const ui = {
 let dataset = null;
 let model = null;
 let accChart = null;
-let latestResults = null;
 
-function setDisabled(el, flag) {
-  el.disabled = !!flag;
-}
-
-function log(msg) {
-  const time = new Date().toLocaleTimeString();
-  ui.log.textContent += `[${time}] ${msg}\n`;
-  ui.log.scrollTop = ui.log.scrollHeight;
-}
-
-function showShapes(meta, symbols) {
-  ui.shapes.textContent = `SeqLen=${meta.seqLen}, FeatureDim=${meta.featureDim}, Samples: ${meta.totalSamples} (train ${meta.numTrain} / test ${meta.numTest}), Stocks=${symbols.length}`;
-}
-
-function updateProgress(pct, text) {
-  const v = Math.max(0, Math.min(100, Math.round(pct)));
-  ui.progressBar.style.width = `${v}%`;
-  ui.progressText.textContent = text || `${v}%`;
-}
-
-function enableControls(state) {
-  // state: 'init' | 'loaded' | 'trained'
+function setDisabled(el, v) { el.disabled = !!v; }
+function enableState(state) {
+  // 'init' | 'loaded' | 'trained'
   if (state === 'init') {
     setDisabled(ui.trainBtn, true);
     setDisabled(ui.predictBtn, true);
@@ -65,41 +44,51 @@ function enableControls(state) {
   }
 }
 
-function computePerStockMetrics(predProbs, yTrue, symbols, horizons, threshold = 0.5) {
-  const S = symbols.length;
-  const H = horizons.length;
-  const numTest = yTrue.length;
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  ui.log.textContent += `[${time}] ${msg}\n`;
+  ui.log.scrollTop = ui.log.scrollHeight;
+}
 
-  const perStock = symbols.map(() => ({
-    correct: 0,
-    total: 0,
+function progress(pct, text) {
+  const v = Math.max(0, Math.min(100, Math.round(pct)));
+  ui.progressBar.style.width = `${v}%`;
+  ui.progressText.textContent = text || `${v}%`;
+}
+
+function showShapes(meta, symbols) {
+  ui.shapes.textContent = `SeqLen=${meta.seqLen}, FeatureDim=${meta.featureDim}, Samples=${meta.totalSamples} (train ${meta.numTrain} / test ${meta.numTest}), Stocks=${symbols.length}`;
+}
+
+function computePerStockMetrics(predProbs, yTrue, symbols, horizons, threshold = 0.5) {
+  const S = symbols.length, H = horizons.length, N = yTrue.length;
+  const per = symbols.map(() => ({
+    correct: 0, total: 0,
     timeline: Array.from({ length: H }, () => []),
-    confusion: [0, 0, 0, 0], // TN, FP, FN, TP
+    confusion: [0, 0, 0, 0] // TN FP FN TP
   }));
 
-  for (let i = 0; i < numTest; i++) {
-    const gt = yTrue[i];
-    const pp = predProbs[i];
+  for (let i = 0; i < N; i++) {
+    const t = yTrue[i], p = predProbs[i];
     for (let s = 0; s < S; s++) {
       for (let h = 0; h < H; h++) {
         const idx = s * H + h;
-        const y = gt[idx] >= 0.5 ? 1 : 0;
-        const p = pp[idx] >= threshold ? 1 : 0;
-        const ok = y === p;
-        perStock[s].correct += ok ? 1 : 0;
-        perStock[s].total += 1;
-        perStock[s].timeline[h].push(ok);
+        const y = t[idx] >= 0.5 ? 1 : 0;
+        const ph = p[idx] >= threshold ? 1 : 0;
+        const ok = y === ph;
+        per[s].correct += ok ? 1 : 0;
+        per[s].total += 1;
+        per[s].timeline[h].push(ok);
 
-        if (y === 0 && p === 0) perStock[s].confusion[0]++;
-        else if (y === 0 && p === 1) perStock[s].confusion[1]++;
-        else if (y === 1 && p === 0) perStock[s].confusion[2]++;
-        else if (y === 1 && p === 1) perStock[s].confusion[3]++;
+        if (y === 0 && ph === 0) per[s].confusion[0]++;
+        else if (y === 0 && ph === 1) per[s].confusion[1]++;
+        else if (y === 1 && ph === 0) per[s].confusion[2]++;
+        else per[s].confusion[3]++;
       }
     }
   }
-
-  return perStock.map((st, idx) => ({
-    symbol: symbols[idx],
+  return per.map((st, i) => ({
+    symbol: symbols[i],
     accuracy: st.total ? st.correct / st.total : 0,
     timeline: st.timeline,
     confusion: st.confusion
@@ -111,29 +100,16 @@ function drawAccuracyBarChart(results) {
   const labels = sorted.map(r => r.symbol);
   const data = sorted.map(r => +(r.accuracy * 100).toFixed(2));
 
-  if (accChart) {
-    accChart.destroy();
-    accChart = null;
-  }
+  if (accChart) { accChart.destroy(); accChart = null; }
   const ctx = ui.accCanvas.getContext('2d');
   accChart = new Chart(ctx, {
     type: 'bar',
-    data: {
-      labels,
-      datasets: [{ label: 'Accuracy (%)', data, borderWidth: 1 }]
-    },
+    data: { labels, datasets: [{ label: 'Accuracy (%)', data }] },
     options: {
-      responsive: true,
       indexAxis: 'y',
-      scales: {
-        x: { min: 0, max: 100, ticks: { callback: v => `${v}%` } }
-      },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: { label: (it) => `Accuracy: ${it.parsed.x.toFixed(2)}%` }
-        }
-      }
+      scales: { x: { min: 0, max: 100, ticks: { callback: v => `${v}%` } } },
+      plugins: { legend: { display: false } },
+      responsive: true
     }
   });
 }
@@ -141,50 +117,46 @@ function drawAccuracyBarChart(results) {
 function drawTimelines(results, horizons, baseDates) {
   ui.timelineContainer.innerHTML = '';
   const H = horizons.length;
-
   results.forEach(r => {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'timeline';
+    const wrap = document.createElement('div');
+    wrap.className = 'timeline';
 
     const title = document.createElement('div');
     title.className = 'timeline-title';
-    title.textContent = `${r.symbol} Prediction Timeline`;
-    wrapper.appendChild(title);
+    title.textContent = `${r.symbol} — prediction correctness (rows: +1d, +2d, +3d)`;
+    wrap.appendChild(title);
 
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(600, r.timeline[0].length * 6);
-    canvas.height = 24 + H * 18;
-    wrapper.appendChild(canvas);
+    canvas.height = H * 18 + 28;
+    wrap.appendChild(canvas);
 
     const legend = document.createElement('div');
     legend.className = 'legend';
-    legend.innerHTML = `<span class="ok"></span> Correct &nbsp;&nbsp; <span class="bad"></span> Wrong`;
-    wrapper.appendChild(legend);
+    legend.innerHTML = `<span class="green"></span>Correct &nbsp; <span class="red"></span>Wrong`;
+    wrap.appendChild(legend);
 
     const ctx = canvas.getContext('2d');
-    const cellW = 6, cellH = 12, padLeft = 60, padTop = 6;
+    const cellW = 6, cellH = 12, padL = 60, padT = 8;
 
-    ctx.font = '12px sans-serif';
-    ctx.fillStyle = '#333';
-    ctx.fillText('Correct', 5, 12);
-    ctx.fillText('Wrong', 5, 30);
+    ctx.font = '12px system-ui, sans-serif';
 
     for (let h = 0; h < H; h++) {
+      ctx.fillStyle = '#444';
+      ctx.fillText(`+${h + 1}d`, 8, padT + h * (cellH + 6) + cellH - 2);
       const seq = r.timeline[h];
-      ctx.fillStyle = '#555';
-      ctx.fillText(`+${h + 1}d`, 5, padTop + h * (cellH + 6) + cellH - 2);
       for (let i = 0; i < seq.length; i++) {
-        ctx.fillStyle = seq[i] ? '#27ae60' : '#e74c3c';
-        ctx.fillRect(padLeft + i * cellW, padTop + h * (cellH + 6), cellW - 1, cellH);
+        ctx.fillStyle = seq[i] ? '#2ecc71' : '#e74c3c';
+        ctx.fillRect(padL + i * cellW, padT + h * (cellH + 6), cellW - 1, cellH);
       }
     }
 
-    // Date ticks
-    ctx.fillStyle = '#222';
+    // bottom date ticks
     const N = r.timeline[0].length;
     const step = Math.max(1, Math.floor(N / 12));
+    ctx.fillStyle = '#222';
     for (let i = 0; i < N; i += step) {
-      const x = padLeft + i * cellW;
+      const x = padL + i * cellW;
       ctx.fillRect(x, canvas.height - 10, 1, 8);
       ctx.save();
       ctx.translate(x + 2, canvas.height - 2);
@@ -193,7 +165,7 @@ function drawTimelines(results, horizons, baseDates) {
       ctx.restore();
     }
 
-    ui.timelineContainer.appendChild(wrapper);
+    ui.timelineContainer.appendChild(wrap);
   });
 }
 
@@ -201,7 +173,6 @@ function renderConfusionMatrices(results) {
   ui.confusionContainer.innerHTML = '';
   const grid = document.createElement('div');
   grid.className = 'cm-grid';
-
   results.forEach(r => {
     const [tn, fp, fn, tp] = r.confusion;
     const card = document.createElement('div');
@@ -217,23 +188,17 @@ function renderConfusionMatrices(results) {
       </table>`;
     grid.appendChild(card);
   });
-
   ui.confusionContainer.appendChild(grid);
 }
 
-// --- Event Handlers ----------------------------------------------------------
+// --- Handlers ----------------------------------------------------------------
 
 async function handleLoad() {
   try {
     const f = ui.fileInput.files?.[0];
-    if (!f) {
-      alert('Choose a CSV file first.');
-      return;
-    }
+    if (!f) { alert('Choose a CSV file first.'); return; }
     ui.fileName.textContent = f.name;
-    log('Loading & preparing dataset...');
-    updateProgress(2, 'Preparing...');
-    // Dispose old dataset tensors
+    progress(5, 'Preparing dataset...');
     dataset?.X_train?.dispose();
     dataset?.y_train?.dispose();
     dataset?.X_test?.dispose();
@@ -244,25 +209,21 @@ async function handleLoad() {
       horizons: DEFAULT_HORIZONS,
       testSplit: 0.2
     });
-
+    progress(20, 'Dataset ready');
     showShapes(dataset.meta, dataset.symbols);
-    updateProgress(10, 'Dataset ready');
     log('Dataset prepared successfully.');
-    enableControls('loaded');
-  } catch (err) {
-    console.error(err);
-    alert(`Data load error: ${err.message}`);
-    log(`Error: ${err.message}`);
-    enableControls('init');
-    updateProgress(0, '');
+    enableState('loaded');
+  } catch (e) {
+    console.error(e);
+    alert(`Data load error: ${e.message}`);
+    log(`Error: ${e.message}`);
+    enableState('init');
+    progress(0, '');
   }
 }
 
 async function handleTrain() {
-  if (!dataset) {
-    alert('Load data first.');
-    return;
-  }
+  if (!dataset) { alert('Load data first.'); return; }
   try {
     const epochs = Math.max(1, parseInt(ui.epochs.value || '25', 10));
     const batch = Math.max(1, parseInt(ui.batch.value || '32', 10));
@@ -277,80 +238,66 @@ async function handleTrain() {
       learningRate: 1e-3
     });
 
-    log('Training model...');
-    updateProgress(12, 'Training...');
+    log('Training started...');
+    progress(25, 'Training...');
+
     await model.fit(
       dataset.X_train, dataset.y_train,
-      {
-        epochs, batchSize: batch, validationSplit: 0.1, shuffle: false
-      },
+      { epochs, batchSize: batch, validationSplit: 0.1, shuffle: false },
       (epoch, logs) => {
-        const pct = 12 + Math.round(((epoch + 1) / epochs) * 78); // 12%→90%
-        const txt = `Epoch ${epoch + 1}/${epochs} — loss ${logs.loss?.toFixed(4)} acc ${(logs.binaryAccuracy * 100).toFixed(2)}%`;
-        updateProgress(pct, txt);
-        log(txt);
+        const pct = 25 + Math.round(((epoch + 1) / epochs) * 60); // -> 85%
+        progress(pct, `Epoch ${epoch + 1}/${epochs} • loss ${logs.loss?.toFixed(4)} • acc ${(logs.binaryAccuracy * 100).toFixed(1)}%`);
+        log(`Epoch ${epoch + 1}/${epochs} — loss=${logs.loss?.toFixed(4)} valLoss=${logs.val_loss?.toFixed(4)} acc=${(logs.binaryAccuracy * 100).toFixed(2)}%`);
       }
     );
 
-    updateProgress(92, 'Training complete');
     log('Training complete.');
-    enableControls('trained');
-  } catch (err) {
-    console.error(err);
-    alert(`Training error: ${err.message}`);
-    log(`Error: ${err.message}`);
-    updateProgress(0, '');
+    progress(88, 'Training complete');
+    enableState('trained');
+  } catch (e) {
+    console.error(e);
+    alert(`Training error: ${e.message}`);
+    log(`Error: ${e.message}`);
+    progress(0, '');
   }
 }
 
 async function handlePredict() {
-  if (!dataset || !model) {
-    alert('Load data and train model first.');
-    return;
-  }
+  if (!dataset || !model) { alert('Train a model first.'); return; }
   try {
-    log('Running prediction on test split...');
-    updateProgress(94, 'Predicting...');
-    const predTensor = model.predict(dataset.X_test);
-    const predArray = await predTensor.array();
-    const yTrueArray = await dataset.y_test.array();
-    predTensor.dispose();
+    log('Predicting on test set...');
+    progress(92, 'Predicting...');
+    const predT = model.predict(dataset.X_test);
+    const predArr = await predT.array();
+    const yTrueArr = await dataset.y_test.array();
+    predT.dispose();
 
-    latestResults = computePerStockMetrics(
-      predArray, yTrueArray,
-      dataset.symbols, dataset.horizons, 0.5
-    );
+    const results = computePerStockMetrics(predArr, yTrueArr, dataset.symbols, dataset.horizons, 0.5);
+    drawAccuracyBarChart(results);
+    drawTimelines(results, dataset.horizons, dataset.baseDatesTest);
+    renderConfusionMatrices(results);
 
-    drawAccuracyBarChart(latestResults);
-    drawTimelines(latestResults, dataset.horizons, dataset.baseDatesTest);
-    renderConfusionMatrices(latestResults);
-    updateProgress(100, 'Prediction completed');
     log('Prediction completed. Results displayed below.');
-  } catch (err) {
-    console.error(err);
-    alert(`Prediction error: ${err.message}`);
-    log(`Error: ${err.message}`);
-    updateProgress(0, '');
+    progress(100, 'Done');
+  } catch (e) {
+    console.error(e);
+    alert(`Prediction error: ${e.message}`);
+    log(`Error: ${e.message}`);
+    progress(0, '');
   }
 }
 
 async function handleSave() {
-  if (!model) {
-    alert('Train a model first.');
-    return;
-  }
+  if (!model) { alert('No trained model to save.'); return; }
   await model.save('tfjs_gru_stock_demo');
-  log('Weights saved (downloaded).');
+  log('Weights downloaded.');
 }
 
-// --- Init --------------------------------------------------------------------
-
 function init() {
-  enableControls('init');
+  enableState('init');
   ui.loadBtn.addEventListener('click', handleLoad);
   ui.trainBtn.addEventListener('click', handleTrain);
   ui.predictBtn.addEventListener('click', handlePredict);
   ui.saveBtn.addEventListener('click', handleSave);
 }
-
 init();
