@@ -28,8 +28,6 @@
     .timeline { margin:12px 0 18px; }
     .timeline-title { font-weight:600; margin-bottom:6px; }
     .legend { font-size:12px; color:#6b7280; margin-top:4px; }
-    .legend .ok, .legend .bad { display:inline-block; width:12px; height:12px; vertical-align:middle; margin-right:4px; }
-    .legend .ok { background:#27ae60; } .legend .bad { background:#e74c3c; }
     .cm-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:12px; }
     .cm-card { border:1px solid var(--border); border-radius:10px; padding:10px; background:#fff; }
     .cm-title { font-weight:600; margin-bottom:6px; }
@@ -40,7 +38,7 @@
 </head>
 <body>
   <h1>Multi-Stock GRU Prediction Demo</h1>
-  <div class="muted">Upload CSV (<code>Date, Symbol, Open, Close</code>) for 10 stocks. The app engineers indicators, trains a Conv1D+BiGRU+Attention model entirely in your browser, tunes the decision threshold on a validation slice, and evaluates on a held‑out test segment.</div>
+  <div class="muted">Upload CSV (<code>Date, Symbol, Open, Close</code>) for 10 stocks. This app engineers indicators in-browser, trains a Conv1D+BiGRU model, tunes thresholds on a validation slice, and evaluates on a held‑out test segment.</div>
 
   <div class="card">
     <div class="row controls">
