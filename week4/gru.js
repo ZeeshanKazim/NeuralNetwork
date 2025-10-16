@@ -100,4 +100,75 @@ export default class GRUModel {
       let bestTh = 0.5, bestAcc = -1;
       for (let t = 0.3; t <= 0.7; t += 0.02) {
         let ok = 0, tot = 0;
-        for (let i = 0; i < gt.l
+        for (let i = 0; i < gt.length; i++) {
+          const y = gt[i] >= 0.5 ? 1 : 0;
+          const p = pr[i] >= t ? 1 : 0;
+          ok += (y === p) ? 1 : 0; tot++;
+        }
+        const acc = ok / Math.max(1, tot);
+        if (acc > bestAcc) { bestAcc = acc; bestTh = t; }
+      }
+      return bestTh;
+    };
+
+    for (let s = 0; s < numStocks; s++) {
+      const gtS = [], prS = [];
+      for (let i = 0; i < T.length; i++) {
+        for (let h = 0; h < horizon; h++) {
+          const idx = s * horizon + h;
+          gtS.push(T[i][idx]);
+          prS.push(P[i][idx]);
+        }
+      }
+      thresholds[symbols[s]] = scan(gtS, prS);
+    }
+    this.perStockThresholds = thresholds;
+    return thresholds;
+  }
+
+  evaluatePerStock(yTrue, yPred, symbols, horizon = 3, thresholds = null) {
+    const yTrueArray = yTrue.arraySync();
+    const yPredArray = yPred.arraySync();
+    const numStocks = symbols.length;
+
+    const stockAccuracies = {};
+    const stockPredictions = {};
+    const confusions = {};
+
+    symbols.forEach((symbol, stockIdx) => {
+      let correct = 0, total = 0;
+      const predictions = [];
+      const th = thresholds?.[symbol] ?? 0.5;
+
+      let TP=0,FP=0,TN=0,FN=0;
+
+      for (let i = 0; i < yTrueArray.length; i++) {
+        for (let offset = 0; offset < horizon; offset++) {
+          const targetIdx = stockIdx * horizon + offset;
+          const trueVal = yTrueArray[i][targetIdx] >= 0.5 ? 1 : 0;
+          const predVal = yPredArray[i][targetIdx] >= th ? 1 : 0;
+
+          predictions.push({ true: trueVal, pred: predVal, correct: trueVal === predVal, horizon: offset+1 });
+
+          if (trueVal === predVal) correct++;
+          total++;
+
+          if (trueVal===1 && predVal===1) TP++;
+          else if (trueVal===0 && predVal===1) FP++;
+          else if (trueVal===0 && predVal===0) TN++;
+          else if (trueVal===1 && predVal===0) FN++;
+        }
+      }
+      stockAccuracies[symbol] = correct / Math.max(1,total);
+      stockPredictions[symbol] = predictions;
+      confusions[symbol] = {TP,FP,TN,FN};
+    });
+
+    return { stockAccuracies, stockPredictions, confusions };
+  }
+
+  async save(name = 'multi_stock_gru') { await this.model.save(`localstorage://${name}`); }
+  static async load(name = 'multi_stock_gru') { return tf.loadLayersModel(`localstorage://${name}`); }
+
+  dispose() { if (this.model) this.model.dispose(); }
+}
