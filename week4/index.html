@@ -1,136 +1,99 @@
 <!-- index.html -->
+<!-- Base scaffold adapted from the user's upload. :contentReference[oaicite:0]{index=0} -->
+<!-- Assignment prompt (RNN/GRU spec & allowance for feature/model tweaks on page 24). :contentReference[oaicite:1]{index=1} -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Multi-Stock GRU (Client‑Side)</title>
+  <meta charset="utf-8" />
+  <title>Multi-Stock GRU — Client-Side (tf.js)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- Reference slides / prompt for this assignment (RNN tutorial). :contentReference[oaicite:0]{index=0} -->
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
-    :root{
-      --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --accent:#38bdf8; --ok:#10b981; --bad:#ef4444;
-    }
-    html,body{margin:0;padding:0;background:var(--bg);color:#e5e7eb;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial;}
-    header{padding:16px 20px;border-bottom:1px solid #1f2937;background:#0b1220;position:sticky;top:0;z-index:2}
-    header h1{margin:0;font-size:20px;font-weight:600;letter-spacing:.2px}
-    main{padding:18px;display:grid;grid-template-columns:340px 1fr;gap:18px}
-    .card{background:var(--panel);border:1px solid #1f2937;border-radius:10px;box-shadow:0 0 0 1px #0003 inset}
-    .card h3{margin:0;padding:12px 14px;border-bottom:1px solid #1f2937;font-size:14px;color:#cbd5e1}
+    :root{--bg:#0b1220;--panel:#0f172a;--muted:#94a3b8;--accent:#38bdf8;--ok:#10b981;--bad:#ef4444}
+    html,body{margin:0;background:var(--bg);color:#e5e7eb;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    header{padding:14px 18px;border-bottom:1px solid #111827;background:#0b1220;position:sticky;top:0;z-index:2}
+    header h1{margin:0;font-size:18px}
+    main{padding:16px;display:grid;grid-template-columns:360px 1fr;gap:16px}
+    .card{background:var(--panel);border:1px solid #111827;border-radius:10px}
+    .card h3{margin:0;padding:12px 14px;border-bottom:1px solid #111827;font-size:14px;color:#cbd5e1}
     .card .body{padding:12px 14px}
-    .controls label{display:block;margin-bottom:10px;font-size:13px;color:#cbd5e1}
-    .controls input[type=file]{width:100%}
-    .btn{display:inline-flex;align-items:center;gap:8px;background:#0ea5e9;border:0;color:#fff;padding:9px 12px;border-radius:8px;font-weight:600;cursor:pointer}
-    .btn[disabled]{opacity:.5;cursor:not-allowed}
-    .btn.secondary{background:#374151}
+    .controls label{display:block;margin:8px 0;font-size:13px}
     .kv{display:grid;grid-template-columns:1fr auto;gap:6px;font-size:12px;color:var(--muted)}
-    .log{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;height:160px;overflow:auto;background:#0b1220;padding:10px;border-radius:8px;border:1px solid #1f2937}
-    .status{display:flex;align-items:center;gap:10px;margin:10px 0}
-    progress{width:100%;height:12px}
-    .charts{display:grid;grid-template-columns:1fr;gap:18px}
-    .chartRow{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-    canvas{background:#0b1220;border:1px solid #1f2937;border-radius:10px}
+    .btn{background:#0ea5e9;border:0;color:#fff;padding:8px 12px;border-radius:8px;font-weight:600;cursor:pointer}
+    .btn.secondary{background:#374151}
+    .btn[disabled]{opacity:.5;cursor:not-allowed}
+    progress{width:100%;height:10px}
+    .small{font-size:12px;color:#94a3b8}
+    .charts{display:grid;grid-template-columns:1fr 1fr;gap:16px}
     .timeline{display:flex;flex-direction:column;gap:12px}
-    .stock-timeline{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px}
-    .stock-timeline h4{margin:0 0 8px 0;font-size:13px;color:#e2e8f0}
+    .stock{background:#0b1220;border:1px solid #111827;border-radius:10px;padding:10px}
+    .stock h4{margin:0 0 8px 0;font-size:13px}
     .row{display:flex;align-items:center;gap:8px;margin:2px 0}
-    .row .label{width:42px;font-size:11px;color:var(--muted)}
-    .cells{display:grid;grid-auto-flow:column;grid-auto-columns:10px;gap:2px;overflow-x:auto;padding-bottom:2px}
+    .row .label{width:36px;font-size:11px;color:var(--muted)}
+    .cells{display:grid;grid-auto-flow:column;grid-auto-columns:10px;gap:2px;overflow-x:auto}
     .cell{width:10px;height:10px;border-radius:2px;background:#334155}
     .cell.ok{background:var(--ok)}
     .cell.bad{background:var(--bad)}
-    .legend{display:flex;gap:12px;font-size:11px;color:var(--muted);margin-top:6px}
-    .legend .dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
-    footer{padding:12px 18px;color:#94a3b8;font-size:12px}
-    .hr{height:1px;background:#1f2937;margin:10px 0}
-    .small{font-size:12px;color:#94a3b8}
+    .legend{display:flex;gap:12px;font-size:11px;color:var(--muted);margin:6px 0}
   </style>
 </head>
 <body>
-  <header>
-    <h1>Multi‑Stock GRU Prediction Demo (Client‑Only • TensorFlow.js)</h1>
-  </header>
+  <header><h1>Multi-Stock GRU — Client-Only (TensorFlow.js)</h1></header>
 
   <main>
     <section class="card">
       <h3>Controls</h3>
       <div class="body controls">
-        <label>
-          CSV (Date, Symbol, Open, Close):
+        <label>CSV (Date, Symbol, Open, Close):
           <input id="csvFile" type="file" accept=".csv" />
         </label>
 
         <div class="kv">
-          <div>Sequence length</div><div><input id="seqLen" type="number" value="12" min="6" max="60" style="width:64px"></div>
-          <div>Forecast horizon</div><div><input id="horizon" type="number" value="3" min="1" max="5" style="width:64px"></div>
-          <div>Epochs</div><div><input id="epochs" type="number" value="25" min="1" max="200" style="width:64px"></div>
-          <div>Batch size</div><div><input id="batch" type="number" value="32" min="4" max="256" style="width:64px"></div>
-          <div>Validation split</div><div><input id="valsplit" type="number" value="0.1" step="0.05" min="0" max="0.4" style="width:64px"></div>
-          <div>Learning rate</div><div><input id="lr" type="number" value="0.001" step="0.0005" min="0.0001" max="0.01" style="width:84px"></div>
-          <div>GRU Units</div><div><input id="units" type="text" value="64,32" style="width:92px"></div>
-          <div>Dropout</div><div><input id="dropout" type="number" value="0.2" step="0.05" min="0" max="0.8" style="width:64px"></div>
+          <div>Seq length (days)</div><div><input id="seqLen" type="number" value="12" min="6" max="60" style="width:72px"></div>
+          <div>Horizon (days)</div><div><input id="horizon" type="number" value="3" min="1" max="5" style="width:72px"></div>
+          <div>Epochs</div><div><input id="epochs" type="number" value="40" min="5" max="200" style="width:72px"></div>
+          <div>Batch size</div><div><input id="batch" type="number" value="32" min="8" max="256" style="width:72px"></div>
+          <div>Units (comma)</div><div><input id="units" type="text" value="96,64" style="width:96px"></div>
+          <div>Dropout</div><div><input id="dropout" type="number" value="0.25" step="0.05" min="0" max="0.8" style="width:72px"></div>
+          <div>LR</div><div><input id="lr" type="number" value="0.001" step="0.0005" min="0.0001" max="0.01" style="width:96px"></div>
           <div>Bidirectional</div><div><input id="bidi" type="checkbox" checked></div>
+          <div>Conv filters</div><div><input id="convFilters" type="number" value="32" min="8" max="128" style="width:72px"></div>
         </div>
 
-        <div class="hr"></div>
-
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button id="prepareBtn" class="btn">1) Load CSV & Prepare</button>
-          <button id="trainBtn" class="btn" disabled>2) Train</button>
-          <button id="predictBtn" class="btn" disabled>3) Evaluate</button>
-          <button id="runAllBtn" class="btn secondary" disabled>Run All</button>
-          <button id="saveBtn" class="btn secondary" disabled>Save Model</button>
-          <button id="loadBtn" class="btn secondary">Load Saved</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
+          <button id="trainBtn" class="btn" disabled>Train</button>
+          <button id="predictBtn" class="btn" disabled>Evaluate</button>
           <button id="resetBtn" class="btn secondary">Reset</button>
         </div>
 
-        <div class="status">
-          <progress id="prog" value="0" max="1"></progress>
-          <span id="status" class="small">Waiting for CSV…</span>
-        </div>
-        <div class="log" id="log"></div>
-
-        <div class="small" id="dataInfo"></div>
+        <div class="small" id="status">Upload CSV file to begin</div>
+        <progress id="trainingProgress" value="0" max="100"></progress>
       </div>
     </section>
 
     <section class="card">
       <h3>Results</h3>
-      <div class="body charts">
-        <div class="chartRow">
+      <div class="body">
+        <div class="charts">
           <div>
             <h4 style="margin:0 0 8px 0">Stock Accuracy Ranking</h4>
-            <canvas id="accChart" height="320"></canvas>
+            <canvas id="accuracyChart" height="300"></canvas>
           </div>
           <div>
-            <h4 style="margin:0 0 8px 0">Loss / Accuracy (Training)</h4>
-            <canvas id="trainChart" height="320"></canvas>
+            <h4 style="margin:0 0 8px 0">Training Curves</h4>
+            <canvas id="trainChart" height="300"></canvas>
           </div>
         </div>
 
-        <div>
-          <h4 style="margin:0 0 8px 0">Per‑Stock Prediction Timelines</h4>
-          <div class="legend">
-            <span><span class="dot" style="background:var(--ok)"></span>Correct</span>
-            <span><span class="dot" style="background:var(--bad)"></span>Wrong</span>
-          </div>
-          <div id="timeline" class="timeline"></div>
+        <div class="legend">
+          <span><span class="cell ok"></span> Correct</span>
+          <span><span class="cell bad"></span> Wrong</span>
         </div>
-
-        <div>
-          <h4 style="margin:0 0 8px 0">Confusion Matrices (per stock)</h4>
-          <div id="confusions" class="small"></div>
-        </div>
+        <div id="timelineContainer" class="timeline"></div>
       </div>
     </section>
   </main>
-
-  <footer>
-    Client‑side demo. Load your CSV (e.g., <em>sp500_top10_xcorr_recent3y.csv</em>) and train in‑browser. No data leaves your device.
-  </footer>
 
   <script type="module" src="./app.js"></script>
 </body>
