@@ -1,154 +1,171 @@
 // data-loader.js
-// Client-side CSV loader & time-series dataset builder for multi-stock GRU.
-// - Expects CSV columns: Date, Symbol, Open, Close
-// - Produces tensors:
-//   X_train [N_train, seqLen, 20], y_train [N_train, 30]
-//   X_test  [N_test,  seqLen, 20], y_test  [N_test,  30]
-// Notes: 10 symbols × 2 features = 20; 10 symbols × 3 horizons = 30.
-// Reference assignment: RNN tutorial / prompt PDF. :contentReference[oaicite:1]{index=1}
-
-export class DataLoader {
-  constructor({ seqLen = 12, horizon = 3, testSplit = 0.2 } = {}) {
-    this.seqLen = seqLen;
-    this.horizon = horizon;
-    this.testSplit = testSplit;
+// Default export to match the user's original import style. :contentReference[oaicite:2]{index=2}
+export default class DataLoader {
+  constructor() {
+    this.stocksData = null;     // {SYM: {date: {Open,Close}}}
     this.symbols = [];
-    this.norm = {}; // {SYM: {Open:{min,max}, Close:{min,max}}}
-    this._prepared = false;
+    this.dates = [];
+    this.alignedDates = [];
+
+    this.X_train = null; this.y_train = null;
+    this.X_val   = null; this.y_val   = null;
+    this.X_test  = null; this.y_test  = null;
+
+    this.testDates = [];
+    this.seqLen = 12;
+    this.horizon = 3;
   }
 
-  /** Parse CSV file using PapaParse; returns array of {Date,Symbol,Open,Close} */
-  async parseCSVFile(file) {
-    return new Promise((resolve, reject) => {
-      Papa.parse(file, {
-        header: true,
-        dynamicTyping: true,
-        skipEmptyLines: true,
-        complete: (res) => resolve(res.data),
-        error: (err) => reject(err),
-      });
-    });
+  async loadCSV(file) {
+    const text = await file.text();
+    this._parseCSV(text);
   }
 
-  /** Prepare tensors from a parsed CSV file object */
-  async loadFromFile(file, onInfo = () => {}) {
-    const rows = await this.parseCSVFile(file);
-    const clean = rows
-      .map(r => ({
-        Date: (r.Date ?? r.date ?? r.DATE ?? '').toString().slice(0, 10),
-        Symbol: (r.Symbol ?? r.symbol ?? r.SYMBOL ?? '').toString().trim(),
-        Open: Number(r.Open ?? r.open ?? r.OPEN),
-        Close: Number(r.Close ?? r.close ?? r.CLOSE),
-      }))
-      .filter(r => r.Date && r.Symbol && Number.isFinite(r.Open) && Number.isFinite(r.Close));
+  _parseCSV(csvText) {
+    const lines = csvText.trim().split(/\r?\n/);
+    const headers = lines[0].split(',').map(h => h.trim());
+    const colIdx = (name) => headers.findIndex(h => h.toLowerCase() === name.toLowerCase());
 
-    if (clean.length === 0) throw new Error('Parsed CSV is empty or columns are missing (need Date, Symbol, Open, Close).');
+    const iDate = colIdx('Date');
+    const iSym  = colIdx('Symbol');
+    const iOpen = colIdx('Open');
+    const iClose= colIdx('Close');
 
-    // Collect symbols and per-date grouping
-    const symbolSet = new Set();
-    const byDate = new Map(); // dateStr -> {SYM: {Open,Close}}
-    for (const r of clean) {
-      symbolSet.add(r.Symbol);
-      if (!byDate.has(r.Date)) byDate.set(r.Date, {});
-      byDate.get(r.Date)[r.Symbol] = { Open: r.Open, Close: r.Close };
+    if ([iDate,iSym,iOpen,iClose].some(i => i < 0)) {
+      throw new Error('CSV must include columns: Date, Symbol, Open, Close');
     }
 
-    this.symbols = Array.from(symbolSet).sort().slice(0, 10);
+    const data = {};
+    const symSet = new Set();
+    const dateSet = new Set();
+
+    for (let i = 1; i < lines.length; i++) {
+      const row = lines[i].split(',');
+      if (row.length < headers.length) continue;
+
+      const date = row[iDate]?.trim().slice(0,10);
+      const sym  = row[iSym]?.trim();
+      const open = Number(row[iOpen]);
+      const close= Number(row[iClose]);
+      if (!date || !sym || !Number.isFinite(open) || !Number.isFinite(close)) continue;
+
+      if (!data[sym]) data[sym] = {};
+      data[sym][date] = { Open: open, Close: close };
+      symSet.add(sym); dateSet.add(date);
+    }
+
+    // Keep exactly 10 symbols (alphabetical if more)
+    this.symbols = Array.from(symSet).sort().slice(0,10);
     if (this.symbols.length !== 10) {
-      throw new Error(`Expected 10 symbols; found ${this.symbols.length}. Symbols: ${this.symbols.join(', ')}`);
+      throw new Error(`Expected 10 symbols, found ${this.symbols.length}.`);
     }
 
-    // Only keep dates where all 10 symbols are present
-    const dates = Array.from(byDate.keys())
-      .filter(d => this.symbols.every(sym => byDate.get(d)[sym] != null))
-      .sort((a, b) => new Date(a) - new Date(b));
-
-    if (dates.length < this.seqLen + this.horizon + 5) {
-      throw new Error(`Not enough aligned dates across all 10 symbols. Need at least ${this.seqLen + this.horizon + 5}, got ${dates.length}.`);
+    // Keep only dates where all 10 symbols exist
+    const allDates = Array.from(dateSet).sort();
+    this.alignedDates = allDates.filter(d => this.symbols.every(s => data[s]?.[d]));
+    if (this.alignedDates.length < 40) {
+      throw new Error('Not enough aligned dates across all symbols.');
     }
 
-    // Compute min/max per symbol & feature for MinMax normalization
-    this.norm = {};
-    for (const sym of this.symbols) {
-      let oMin = +Infinity, oMax = -Infinity, cMin = +Infinity, cMax = -Infinity;
-      for (const d of dates) {
-        const { Open, Close } = byDate.get(d)[sym];
-        if (Open < oMin) oMin = Open; if (Open > oMax) oMax = Open;
-        if (Close < cMin) cMin = Close; if (Close > cMax) cMax = Close;
+    this.stocksData = data;
+    this.dates = this.alignedDates;
+  }
+
+  _minMaxPerSymbol() {
+    const mm = {};
+    for (const s of this.symbols) {
+      let omin=Infinity, omax=-Infinity, cmin=Infinity, cmax=-Infinity;
+      for (const d of this.dates) {
+        const {Open,Close} = this.stocksData[s][d];
+        omin=Math.min(omin,Open); omax=Math.max(omax,Open);
+        cmin=Math.min(cmin,Close); cmax=Math.max(cmax,Close);
       }
-      this.norm[sym] = { Open: { min: oMin, max: oMax }, Close: { min: cMin, max: cMax } };
+      mm[s]={Open:{min:omin,max:omax}, Close:{min:cmin,max:cmax}};
     }
-    const eps = 1e-8;
-    const normVal = (v, min, max) => (v - min) / Math.max(max - min, eps);
+    return mm;
+  }
 
-    // Build sliding windows
-    const featDim = this.symbols.length * 2; // 20
-    const outDim = this.symbols.length * this.horizon; // 30
-    const X = [];
-    const Y = [];
-    const sampleDates = []; // current day (D) for each sample
-    for (let i = this.seqLen - 1; i < dates.length - this.horizon; i++) {
-      // Input window: indices [i - seqLen + 1 .. i]
+  createSequences(sequenceLength = 12, predictionHorizon = 3, { testSplit = 0.2, valSplit = 0.1 } = {}) {
+    this.seqLen = sequenceLength;
+    this.horizon = predictionHorizon;
+
+    const mm = this._minMaxPerSymbol();
+    const eps = 1e-8;
+    const norm = (v, min, max) => (v - min) / Math.max(max - min, eps);
+
+    const sequences = [];
+    const targets = [];
+    const baseDates = [];
+
+    for (let i = sequenceLength - 1; i < this.dates.length - predictionHorizon; i++) {
       const window = [];
-      for (let t = i - this.seqLen + 1; t <= i; t++) {
+      let valid = true;
+
+      for (let t = i - sequenceLength + 1; t <= i; t++) {
         const feats = [];
-        const dateT = dates[t];
-        for (const sym of this.symbols) {
-          const { Open, Close } = byDate.get(dateT)[sym];
-          const nOpen = normVal(Open, this.norm[sym].Open.min, this.norm[sym].Open.max);
-          const nClose = normVal(Close, this.norm[sym].Close.min, this.norm[sym].Close.max);
-          feats.push(nOpen, nClose);
+        const dateT = this.dates[t];
+        for (const s of this.symbols) {
+          const {Open,Close} = this.stocksData[s][dateT];
+          feats.push(norm(Open, mm[s].Open.min, mm[s].Open.max));
+          feats.push(norm(Close, mm[s].Close.min, mm[s].Close.max));
         }
         window.push(feats);
       }
-      // Targets: for each sym, compare Close(D+offset) > Close(D)
+
       const y = [];
-      const baseDate = dates[i];
-      for (const sym of this.symbols) {
-        const baseClose = byDate.get(baseDate)[sym].Close;
-        for (let k = 1; k <= this.horizon; k++) {
-          const futureClose = byDate.get(dates[i + k])[sym].Close;
+      const baseDate = this.dates[i];
+      for (const s of this.symbols) {
+        const baseClose = this.stocksData[s][baseDate].Close;
+        for (let k = 1; k <= predictionHorizon; k++) {
+          const futureDate = this.dates[i + k];
+          if (!futureDate) { valid = false; break; }
+          const futureClose = this.stocksData[s][futureDate]?.Close;
+          if (!Number.isFinite(futureClose)) { valid = false; break; }
           y.push(futureClose > baseClose ? 1 : 0);
         }
       }
-      X.push(window);
-      Y.push(y);
-      sampleDates.push(baseDate);
+      if (!valid) continue;
+
+      sequences.push(window);
+      targets.push(y);
+      baseDates.push(baseDate);
     }
 
-    // Chronological split
-    const total = X.length;
-    const nTest = Math.max(1, Math.floor(total * this.testSplit));
-    const nTrain = total - nTest;
-    const X_train = tf.tensor3d(X.slice(0, nTrain));
-    const y_train = tf.tensor2d(Y.slice(0, nTrain));
-    const X_test = tf.tensor3d(X.slice(nTrain));
-    const y_test = tf.tensor2d(Y.slice(nTrain));
-    const trainDates = sampleDates.slice(0, nTrain);
-    const testDates = sampleDates.slice(nTrain);
+    const N = sequences.length;
+    const nTest = Math.max(1, Math.floor(N * testSplit));
+    const nVal  = Math.max(1, Math.floor((N - nTest) * valSplit));
+    const nTrain= N - nTest - nVal;
 
-    this._prepared = true;
+    const X = tf.tensor3d(sequences);
+    const Y = tf.tensor2d(targets);
 
-    onInfo({
-      samples: total,
-      train: nTrain,
-      test: nTest,
-      seqLen: this.seqLen,
-      featDim,
-      outDim,
-      start: dates[0],
-      end: dates[dates.length - 1],
-      symbols: this.symbols.slice(),
-    });
+    this.X_train = X.slice([0,0,0],[nTrain,sequenceLength,this.symbols.length*2]);
+    this.y_train = Y.slice([0,0],[nTrain,this.symbols.length*predictionHorizon]);
+
+    this.X_val   = X.slice([nTrain,0,0],[nVal,sequenceLength,this.symbols.length*2]);
+    this.y_val   = Y.slice([nTrain,0],[nVal,this.symbols.length*predictionHorizon]);
+
+    this.X_test  = X.slice([nTrain+nVal,0,0],[nTest,sequenceLength,this.symbols.length*2]);
+    this.y_test  = Y.slice([nTrain+nVal,0],[nTest,this.symbols.length*predictionHorizon]);
+
+    this.testDates = baseDates.slice(nTrain + nVal);
+
+    // Free big tensors we sliced from
+    X.dispose(); Y.dispose();
 
     return {
-      X_train, y_train, X_test, y_test,
-      symbols: this.symbols.slice(),
-      testDates,
-      seqLen: this.seqLen,
-      featDim,
-      outDim,
-      horizon: this.horizon,
+      X_train:this.X_train, y_train:this.y_train,
+      X_val:this.X_val, y_val:this.y_val,
+      X_test:this.X_test, y_test:this.y_test,
+      symbols:this.symbols, testDates:this.testDates,
+      seqLen:this.seqLen, horizon:this.horizon
     };
+  }
+
+  dispose() {
+    for (const k of ['X_train','y_train','X_val','y_val','X_test','y_test']) {
+      if (this[k]?.dispose) try { this[k].dispose(); } catch {}
+      this[k]=null;
+    }
   }
 }
