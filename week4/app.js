@@ -1,5 +1,11 @@
 // app.js
-// App glue: uses user's original UI flow but adds validation split + per-stock threshold tuning. :contentReference[oaicite:5]{index=5}
+// Drop-in replacement for your app controller.
+// Changes:
+//  - Uses new loader.featuresPerStock to set input size
+//  - Trains base model, then **fine-tunes DOV specialist**
+//  - Tunes per-output thresholds on validation and uses them in evaluation
+//  - Merges specialist predictions for DOV before scoring
+
 import DataLoader from './data-loader.js';
 import GRUModel from './gru.js';
 
@@ -7,237 +13,200 @@ class StockPredictionApp {
   constructor() {
     this.dataLoader = new DataLoader();
     this.model = null;
-    this.thresholds = null;
-
+    this.currentPredictions = null;
     this.accuracyChart = null;
-    this.trainChart = null;
-
     this.isTraining = false;
 
-    this.cache = { seqLen:12, horizon:3 };
+    this.horizons = 3;
+    this.targetTicker = 'DOV'; // specialist target
 
     this.init();
   }
 
-  init() {
+  init(){
     const fileInput = document.getElementById('csvFile');
-    const trainBtn = document.getElementById('trainBtn');
+    const trainBtn  = document.getElementById('trainBtn');
     const predictBtn = document.getElementById('predictBtn');
-    const resetBtn = document.getElementById('resetBtn');
 
-    fileInput.addEventListener('change', (e) => this.handleFileUpload(e));
-    trainBtn.addEventListener('click', () => this.trainModel());
-    predictBtn.addEventListener('click', () => this.runEvaluation());
-    resetBtn.addEventListener('click', () => this.reset());
-
-    this.setStatus('Upload CSV file to begin');
+    fileInput.addEventListener('change', (e)=>this.handleFileUpload(e));
+    trainBtn.addEventListener('click', ()=>this.trainModel());
+    predictBtn.addEventListener('click', ()=>this.runPrediction());
   }
 
-  setStatus(msg) {
-    const el = document.getElementById('status');
-    if (el) el.textContent = msg;
-  }
-
-  setProgress(v) {
-    const p = document.getElementById('trainingProgress');
-    if (p) p.value = v;
-  }
-
-  readNum(id, def) {
-    const el = document.getElementById(id);
-    const v = parseFloat(el?.value);
-    return Number.isFinite(v) ? v : def;
-  }
-
-  readUnits(id, def) {
-    const el = document.getElementById(id);
-    const arr = (el?.value||'').split(',').map(s=>parseInt(s.trim(),10)).filter(x=>Number.isFinite(x)&&x>0);
-    return arr.length?arr:def;
-  }
-
-  async handleFileUpload(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    try {
-      this.setStatus('Loading CSV...');
+  async handleFileUpload(e){
+    const file=e.target.files[0]; if(!file) return;
+    const status = document.getElementById('status');
+    try{
+      status.textContent='Loading CSV...';
       await this.dataLoader.loadCSV(file);
 
-      const seqLen = Math.max(6, Math.min(60, this.readNum('seqLen', 12)));
-      const horizon = Math.max(1, Math.min(5, this.readNum('horizon', 3)));
-      this.cache.seqLen = seqLen; this.cache.horizon = horizon;
+      status.textContent='Preparing sequences...';
+      const prepared = this.dataLoader.createSequences(12, this.horizons);
 
-      this.setStatus('Building sequences…');
-      this.dataLoader.createSequences(seqLen, horizon, { testSplit: 0.2, valSplit: 0.1 });
-
-      document.getElementById('trainBtn').disabled = false;
-      this.setStatus('Data ready. Click Train.');
-    } catch (err) {
+      document.getElementById('trainBtn').disabled=false;
+      status.textContent='Data ready. Click Train Model.';
+    }catch(err){
+      status.textContent=`Error: ${err.message}`;
       console.error(err);
-      this.setStatus('Error: ' + err.message);
     }
   }
 
-  async trainModel() {
+  async trainModel(){
     if (this.isTraining) return;
-    if (!this.dataLoader?.X_train) return alert('Load CSV first.');
+    this.isTraining=true;
+    document.getElementById('trainBtn').disabled=true;
+    document.getElementById('predictBtn').disabled=true;
 
-    this.isTraining = true;
-    document.getElementById('trainBtn').disabled = true;
-    document.getElementById('predictBtn').disabled = true;
+    const st=document.getElementById('status');
+    try{
+      const { X_train, y_train, X_test, y_test, symbols, featuresPerStock } = this.dataLoader;
 
-    const { X_train, y_train, X_val, y_val, symbols } = this.dataLoader;
-    const seqLen = this.cache.seqLen;
-    const featDim = symbols.length * 2;
-    const horizon = this.cache.horizon;
-    const outputSize = symbols.length * horizon;
+      // Chronological split: use part of X_test as validation (20% of whole time is already test)
+      // We'll carve 25% of train as val:
+      const nTrain = X_train.shape[0];
+      const nVal = Math.max(1, Math.floor(nTrain*0.2));
+      const nTr  = nTrain - nVal;
 
-    const units = this.readUnits('units', [96,64]);
-    const dropout = this.readNum('dropout', 0.25);
-    const lr = this.readNum('lr', 1e-3);
-    const bidi = document.getElementById('bidi')?.checked ?? true;
-    const convFilters = this.readNum('convFilters', 32);
-    const epochs = Math.max(5, this.readNum('epochs', 40));
-    const batch = Math.max(8, this.readNum('batch', 32));
+      const X_tr = X_train.slice([0,0,0],[nTr,-1,-1]);
+      const y_tr = y_train.slice([0,0],[nTr,-1]);
+      const X_val = X_train.slice([nTr,0,0],[nVal,-1,-1]);
+      const y_val = y_train.slice([nTr,0],[nVal,-1]);
 
-    this.model = new GRUModel([seqLen, featDim], outputSize, {
-      units, dropout, learningRate: lr, bidirectional: bidi, convFilters
-    });
+      const inputShape=[12, symbols.length*featuresPerStock];
+      this.model = new GRUModel(inputShape, symbols.length*this.horizons, this.horizons);
 
-    const lossSeries=[]; const accSeries=[];
-    this.setStatus('Training…');
-    this.setProgress(0);
+      st.textContent='Training base model...';
+      await this.model.train(X_tr, y_tr, X_val, y_val, 50, 32);
 
-    await this.model.train(X_train, y_train, X_val, y_val, epochs, batch, (epoch, logs) => {
-      const pct = ((epoch+1)/epochs)*100;
-      this.setProgress(pct);
-      this.setStatus(`Epoch ${epoch+1}/${epochs} — loss ${logs.loss.toFixed(4)} acc ${(logs.binaryAccuracy*100).toFixed(1)}% val_acc ${(logs.val_binaryAccuracy*100).toFixed(1)}%`);
-      lossSeries.push({e:epoch+1, loss:logs.loss, val_loss:logs.val_loss});
-      accSeries.push({e:epoch+1, acc:logs.binaryAccuracy, val_acc:logs.val_binaryAccuracy});
-      this.renderTrainChart(lossSeries, accSeries);
-    });
+      // Specialist for DOV (if present)
+      const dovIndex = symbols.indexOf(this.targetTicker);
+      if (dovIndex !== -1){
+        st.textContent='Fine-tuning DOV specialist...';
+        await this.model.trainSpecialist(X_tr, y_tr, X_val, y_val, dovIndex, 30, 32);
+        st.textContent='Specialist done.';
+      } else {
+        st.textContent='DOV not found — specialist skipped.';
+      }
 
-    // Threshold tuning on validation set
-    const valPred = await this.model.predict(X_val);
-    this.thresholds = this.model.tuneThresholds(y_val, valPred, symbols, horizon);
-    valPred.dispose();
+      // Threshold tuning (per-output) on validation
+      const baseVal = this.model.model.predict(X_val);
+      let mergedVal = baseVal;
+      if (this.model.specialist && dovIndex !== -1) {
+        mergedVal = await this.model.predictWithSpecialist(X_val, baseVal, dovIndex);
+      }
+      this.model.tunedThresholds = GRUModel.tuneThresholds(mergedVal, y_val, 0.30, 0.70, 0.01);
+      mergedVal.dispose?.();
 
-    document.getElementById('predictBtn').disabled = false;
-    this.setStatus('Training complete. Click Evaluate.');
-    this.isTraining = false;
+      document.getElementById('predictBtn').disabled=false;
+      st.textContent='Training complete. Run Prediction to evaluate.';
+
+      // Cleanup
+      X_tr.dispose(); y_tr.dispose(); X_val.dispose(); y_val.dispose();
+    }catch(err){
+      st.textContent=`Training error: ${err.message}`;
+      console.error(err);
+    }finally{
+      this.isTraining=false;
+    }
   }
 
-  async runEvaluation() {
-    if (!this.model) return alert('Train first.');
-    const { X_test, y_test, symbols, testDates } = this.dataLoader;
+  async runPrediction(){
+    if (!this.model){ alert('Train the model first'); return; }
+    const st=document.getElementById('status');
+    try{
+      st.textContent='Running predictions...';
+      const { X_test, y_test, symbols } = this.dataLoader;
 
-    this.setStatus('Predicting on test set…');
-    const preds = await this.model.predict(X_test);
+      const base = await this.model.predict(X_test);
+      const dovIdx = symbols.indexOf(this.targetTicker);
+      const merged = (this.model.specialist && dovIdx !== -1)
+        ? await this.model.predictWithSpecialist(X_test, base, dovIdx)
+        : base;
 
-    const evalRes = this.model.evaluatePerStock(y_test, preds, symbols, this.cache.horizon, this.thresholds);
+      const thresholds = this.model.tunedThresholds || 0.5;
 
-    preds.dispose();
+      // ---- per-stock accuracy using tuned thresholds ----
+      const stockAcc = GRUModel.perStockAccuracy(y_test, merged, symbols, this.horizons, thresholds);
 
-    // Accuracy chart
-    this.renderAccuracyChart(evalRes.stockAccuracies);
+      // Build stockPredictions timeline (correct/wrong) for charts
+      const arrY = y_test.arraySync();
+      const arrP = merged.arraySync();
+      const predictions = {};
+      symbols.forEach((sym, sIdx)=>{
+        const list=[];
+        for (let i=0;i<arrY.length;i++){
+          for (let h=0;h<this.horizons;h++){
+            const j=sIdx*this.horizons+h;
+            const ok = (arrY[i][j]>=0.5) === (arrP[i][j] >= (Array.isArray(thresholds)?thresholds[j]:thresholds));
+            list.push({ correct: ok, true: arrY[i][j], pred: arrP[i][j] });
+          }
+        }
+        predictions[sym]=list;
+      });
 
-    // Timelines for all symbols
-    this.renderTimelines(evalRes.stockPredictions, symbols, testDates);
+      this.visualizeResults(stockAcc, predictions);
 
-    this.setStatus('Evaluation complete.');
+      const overall = Object.values(stockAcc).reduce((a,b)=>a+b,0)/symbols.length;
+      const dov = stockAcc[this.targetTicker];
+      st.textContent = `Prediction complete. Overall ${(overall*100).toFixed(2)}% | DOV ${(dov*100||0).toFixed(2)}%`;
+
+      // Cleanup
+      merged.dispose?.(); base.dispose?.();
+    }catch(err){
+      st.textContent=`Prediction error: ${err.message}`;
+      console.error(err);
+    }
   }
 
-  renderAccuracyChart(accuracies) {
-    const ctx = document.getElementById('accuracyChart').getContext('2d');
+  // ---------- Charts (same as your original, minor tweaks) ----------
+  visualizeResults(accuracies, predictions){
+    this.createAccuracyChart(accuracies);
+    this.createTimelineCharts(predictions);
+  }
+
+  createAccuracyChart(accuracies){
+    const ctx=document.getElementById('accuracyChart').getContext('2d');
+
+    const pairs = Object.entries(accuracies).sort((a,b)=>b[1]-a[1]);
+    const labels=pairs.map(p=>p[0]);
+    const data  =pairs.map(p=>+(p[1]*100).toFixed(2));
+
     if (this.accuracyChart) this.accuracyChart.destroy();
 
-    const entries = Object.entries(accuracies).sort((a,b)=>b[1]-a[1]);
-    const labels = entries.map(([s])=>s);
-    const data = entries.map(([,a])=>+(a*100).toFixed(2));
-
-    this.accuracyChart = new Chart(ctx, {
+    this.accuracyChart = new Chart(ctx,{
       type:'bar',
-      data:{ labels, datasets:[{ label:'Accuracy (%)', data, borderWidth:1 }] },
-      options:{
-        indexAxis:'y',
-        scales:{ x:{ min:0, max:100, ticks:{ callback:v=>v+'%' } } },
-        plugins:{ legend:{display:false} }
-      }
+      data:{ labels, datasets:[{ label:'Accuracy (%)', data, backgroundColor: data.map(v=> v>=70?'rgba(34,197,94,.85)': v>=60?'rgba(59,130,246,.7)':'rgba(239,68,68,.7)') }] },
+      options:{ indexAxis:'y', scales:{ x:{ beginAtZero:true, max:100 } }, plugins:{ legend:{ display:false } } }
     });
   }
 
-  renderTrainChart(lossSeries, accSeries) {
-    const ctx = document.getElementById('trainChart').getContext('2d');
-    if (this.trainChart) this.trainChart.destroy();
-    this.trainChart = new Chart(ctx, {
-      type:'line',
-      data:{
-        labels: lossSeries.map(d=>d.e),
-        datasets:[
-          { label:'loss', data:lossSeries.map(d=>d.loss), yAxisID:'y' },
-          { label:'val_loss', data:lossSeries.map(d=>d.val_loss), yAxisID:'y' },
-          { label:'acc', data:accSeries.map(d=>d.acc), yAxisID:'y1' },
-          { label:'val_acc', data:accSeries.map(d=>d.val_acc), yAxisID:'y1' },
-        ]
-      },
-      options:{
-        interaction:{ mode:'index', intersect:false },
-        scales:{ y:{ position:'left' }, y1:{ position:'right', min:0, max:1, grid:{ drawOnChartArea:false } } },
-        plugins:{ legend:{ position:'bottom' } }
-      }
+  createTimelineCharts(predictions){
+    const container=document.getElementById('timelineContainer');
+    container.innerHTML='';
+
+    // Show DOV first if present
+    const ordered = Object.keys(predictions).sort((a,b)=> a==='DOV'?-1 : b==='DOV'?1 : 0).slice(0,3);
+
+    ordered.forEach(symbol=>{
+      const sample=predictions[symbol];
+      const div=document.createElement('div');
+      div.className='stock-chart';
+      div.innerHTML=`<h4>${symbol} Prediction Timeline</h4><canvas id="tl-${symbol}"></canvas>`;
+      container.appendChild(div);
+
+      const size=Math.min(50,sample.length);
+      const s=sample.slice(0,size);
+      const labels=s.map((_,i)=>`Pred ${i+1}`);
+      const correct=s.map(p=>p.correct?1:0);
+
+      new Chart(document.getElementById(`tl-${symbol}`).getContext('2d'),{
+        type:'line',
+        data:{ labels, datasets:[{ label:'Correct', data:correct, borderColor:'rgb(34,197,94)', backgroundColor:'rgba(34,197,94,.2)', fill:true, tension:.35 }] },
+        options:{ scales:{ y:{ min:0,max:1, ticks:{ callback:v=>v===1?'Correct':v===0?'Wrong':'' } } }, plugins:{ legend:{ display:false } } }
+      });
     });
-  }
-
-  renderTimelines(predictions, symbols, dates) {
-    const container = document.getElementById('timelineContainer');
-    container.innerHTML = '';
-    const horizon = this.cache.horizon;
-
-    symbols.forEach(sym => {
-      const card = document.createElement('div');
-      card.className = 'stock';
-      const title = document.createElement('h4');
-      title.textContent = sym;
-      card.appendChild(title);
-
-      for (let h=1; h<=horizon; h++) {
-        const row = document.createElement('div');
-        row.className = 'row';
-        const label = document.createElement('div');
-        label.className = 'label'; label.textContent = `D+${h}`;
-        row.appendChild(label);
-
-        const cells = document.createElement('div');
-        cells.className = 'cells';
-
-        const list = predictions[sym].filter(p=>p.horizon===h);
-        for (let i=0;i<list.length;i++) {
-          const cell=document.createElement('div');
-          cell.className = 'cell ' + (list[i].correct?'ok':'bad');
-          cell.title = `${sym} ${dates[i] ?? ''} D+${h} • ${list[i].correct?'Correct':'Wrong'}`;
-          cells.appendChild(cell);
-        }
-        row.appendChild(cells);
-        card.appendChild(row);
-      }
-      container.appendChild(card);
-    });
-  }
-
-  reset() {
-    try {
-      if (this.accuracyChart) this.accuracyChart.destroy();
-      if (this.trainChart) this.trainChart.destroy();
-      this.accuracyChart = null; this.trainChart = null;
-      if (this.model) this.model.dispose();
-      if (this.dataLoader) this.dataLoader.dispose();
-      this.model = null; this.thresholds = null;
-      document.getElementById('trainBtn').disabled = true;
-      document.getElementById('predictBtn').disabled = true;
-      document.getElementById('timelineContainer').innerHTML = '';
-      this.setProgress(0);
-      this.setStatus('Reset. Upload CSV to start again.');
-    } catch {}
   }
 }
 
+// Init
 document.addEventListener('DOMContentLoaded', ()=> new StockPredictionApp());
