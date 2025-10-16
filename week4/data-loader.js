@@ -1,154 +1,175 @@
 // data-loader.js
-// Rich features + chronological train/val/test split + train-only normalization.
-// CSV must contain (case-insensitive): Date, Symbol, Open, Close
-// Outputs:
-//   X_train [Ntr, seqLen, featureDim], y_train [Ntr, outDim]
-//   X_val, y_val, X_test, y_test with same shapes
-//   symbols, horizons, baseDatesTest, meta
+// Denoising-AE + GRU pipeline data prep (browser-only, TF.js).
+// CSV columns (case-insensitive): Date, Symbol, Open, High, Low, Close, Volume
+// Output tensors are chronologically split: train → val → test.
+// Features: per stock (12): O,H,L,C, Vol(log), Ret1, LogRet1, HL%Range, CO%Range, Mom5, Mom10, RSI14, BB%20, Vol10
+// (Vol10 is volatility of log returns). All normalized using train split only.
 
-export const DEFAULT_SEQ_LEN = 48;
-export const DEFAULT_HORIZONS = [1, 2, 3];
-export const FEATURES_PER_STOCK = 10; // Open, Close, OCret, Ret1, LogRet1, Mom5, Mom10, RSI14, BB%20, Vol10
-export const STOCK_COUNT_EXPECTED = 10;
-const INDICATOR_WARMUP = 20;
+export const DEFAULT_SEQ_LEN = 12;             // 12-day context (as required)
+export const DEFAULT_HORIZONS = [1, 2, 3];     // predict +1d, +2d, +3d
+export const MAX_STOCKS = 10;                  // keep 10 for browser memory
+export const FEATURES_PER_STOCK = 14;          // see above
+
+const INDICATOR_WARMUP = 20;                   // to compute 20-day indicators
 
 // ---------- CSV parsing ----------
 function detectDelimiter(firstLine) {
-  const comma = (firstLine.match(/,/g) || []).length;
-  const semi = (firstLine.match(/;/g) || []).length;
-  return semi > comma ? ';' : ',';
+  const c = (firstLine.match(/,/g) || []).length;
+  const s = (firstLine.match(/;/g) || []).length;
+  return s > c ? ';' : ',';
 }
-
 function parseCSV(text) {
   const raw = text.replace(/\uFEFF/g, '');
-  const hline = raw.slice(0, raw.indexOf('\n') === -1 ? undefined : raw.indexOf('\n'));
-  const delim = detectDelimiter(hline);
+  const headLine = raw.slice(0, raw.indexOf('\n') === -1 ? undefined : raw.indexOf('\n'));
+  const delim = detectDelimiter(headLine);
   const lines = raw.trim().split(/\r?\n/).filter(Boolean);
   if (lines.length < 2) throw new Error('CSV has no data rows.');
 
   const header = lines[0].split(delim).map(h => h.trim());
   const idx = {
-    Date: header.findIndex(h => /^date$/i.test(h)),
+    Date:   header.findIndex(h => /^date$/i.test(h)),
     Symbol: header.findIndex(h => /^symbol$/i.test(h)),
-    Open: header.findIndex(h => /^open$/i.test(h)),
-    Close: header.findIndex(h => /^close$/i.test(h)),
+    Open:   header.findIndex(h => /^open$/i.test(h)),
+    High:   header.findIndex(h => /^high$/i.test(h)),
+    Low:    header.findIndex(h => /^low$/i.test(h)),
+    Close:  header.findIndex(h => /^close$/i.test(h)),
+    Volume: header.findIndex(h => /^volume$/i.test(h)),
   };
-  for (const k of Object.keys(idx)) if (idx[k] === -1) throw new Error(`Missing "${k}" column.`);
+  for (const k of Object.keys(idx)) if (idx[k] === -1) throw new Error(`Missing column "${k}".`);
 
   const rows = [];
   for (let i = 1; i < lines.length; i++) {
     const cols = lines[i].split(delim).map(c => c.trim());
     const d = new Date(cols[idx.Date]); if (isNaN(+d)) continue;
-    const iso = d.toISOString().slice(0, 10);
+    const iso = d.toISOString().slice(0,10);
     const sym = cols[idx.Symbol];
     const o = parseFloat(cols[idx.Open]);
+    const h = parseFloat(cols[idx.High]);
+    const l = parseFloat(cols[idx.Low]);
     const c = parseFloat(cols[idx.Close]);
-    if (!sym || !Number.isFinite(o) || !Number.isFinite(c)) continue;
-    rows.push({ date: iso, symbol: sym, open: o, close: c });
+    const v = parseFloat(cols[idx.Volume]);
+    if (!sym || ![o,h,l,c,v].every(Number.isFinite)) continue;
+    rows.push({ date: iso, symbol: sym, open: o, high: h, low: l, close: c, volume: v });
   }
   if (!rows.length) throw new Error('No valid rows parsed.');
   return rows;
 }
 
-// ---------- Panel alignment ----------
-function pivotPanel(records) {
-  const symbolSet = new Set(records.map(r => r.symbol));
-  const symbols = Array.from(symbolSet).sort();
-
-  const byDate = new Map();
+// ---------- Panel alignment (pick first MAX_STOCKS symbols, alphabetical) ----------
+function alignPanel(records) {
+  const allSymbols = Array.from(new Set(records.map(r => r.symbol))).sort().slice(0, MAX_STOCKS);
+  const mapByDate = new Map();
   for (const r of records) {
-    if (!byDate.has(r.date)) byDate.set(r.date, {});
-    byDate.get(r.date)[r.symbol] = r;
+    if (!allSymbols.includes(r.symbol)) continue;
+    if (!mapByDate.has(r.date)) mapByDate.set(r.date, {});
+    mapByDate.get(r.date)[r.symbol] = r;
+  }
+  const allDates = Array.from(mapByDate.keys()).sort();
+  const dates = allDates.filter(d => {
+    const m = mapByDate.get(d);
+    return m && allSymbols.every(s => m[s]);
+  });
+
+  if (dates.length < INDICATOR_WARMUP + DEFAULT_SEQ_LEN + 4) {
+    throw new Error('Not enough complete days for selected symbols.');
   }
 
-  const allDates = Array.from(byDate.keys()).sort();
-  const dates = allDates.filter(d => {
-    const m = byDate.get(d);
-    return m && symbols.every(s => m[s] != null);
-  });
-  if (dates.length < INDICATOR_WARMUP + 5) throw new Error('Not enough complete days across all symbols.');
+  // Build raw series per symbol
+  const O = allSymbols.map(() => []);
+  const H = allSymbols.map(() => []);
+  const L = allSymbols.map(() => []);
+  const C = allSymbols.map(() => []);
+  const V = allSymbols.map(() => []);
 
-  const openSeries = symbols.map(() => []);
-  const closeSeries = symbols.map(() => []);
   for (const d of dates) {
-    const row = byDate.get(d);
-    for (let s = 0; s < symbols.length; s++) {
-      const sym = symbols[s];
-      openSeries[s].push(row[sym].open);
-      closeSeries[s].push(row[sym].close);
+    const row = mapByDate.get(d);
+    for (let s = 0; s < allSymbols.length; s++) {
+      const r = row[allSymbols[s]];
+      O[s].push(r.open);
+      H[s].push(r.high);
+      L[s].push(r.low);
+      C[s].push(r.close);
+      V[s].push(r.volume);
     }
   }
-  return { symbols, dates, openSeries, closeSeries };
+
+  return { symbols: allSymbols, dates, O, H, L, C, V };
 }
 
-// ---------- Math helpers ----------
-function mean(a, i0, i1) { let s=0, n=0; for (let i=i0;i<=i1;i++){ s+=a[i]; n++; } return s/Math.max(1,n); }
+// ---------- helpers ----------
+function mean(a, i0, i1) { let s=0,n=0; for (let i=i0;i<=i1;i++){ s+=a[i]; n++; } return s/Math.max(1,n); }
 function std(a, i0, i1) { const m=mean(a,i0,i1); let s2=0,n=0; for (let i=i0;i<=i1;i++){ const d=a[i]-m; s2+=d*d; n++; } return Math.sqrt(s2/Math.max(1,n)); }
-function div(a,b,fb=0){ return b===0?fb:a/b; }
+const div = (a,b,fb=0) => b===0?fb:a/b;
 
-// Wilder’s RSI(14), scaled to 0..1
+// Wilder’s RSI(14) scaled to [0,1]
 function rsi14(C) {
   const n=C.length, out=new Array(n).fill(NaN);
   if (n<15) return out;
   let g=0,l=0;
   for (let i=1;i<=14;i++){ const d=C[i]-C[i-1]; if(d>0) g+=d; else l-=d; }
   let avgG=g/14, avgL=l/14;
-  out[14] = avgL===0 ? 1 : 1 - 1/(1+avgG/avgL);
+  out[14] = avgL===0 ? 1 : 1 - 1/(1 + avgG/avgL);
   for (let i=15;i<n;i++){
     const d=C[i]-C[i-1], G=d>0?d:0, L=d<0?-d:0;
     avgG=(avgG*13+G)/14; avgL=(avgL*13+L)/14;
-    const rs=avgL===0?1e6:avgG/avgL;
-    out[i]=1-1/(1+rs);
+    const rs = avgL===0?1e6:avgG/avgL;
+    out[i] = 1 - 1/(1 + rs);
   }
   return out;
 }
 
-// ---------- Feature engineering ----------
-function buildFeatureRows(symbols, openSeries, closeSeries) {
-  const n = closeSeries[0].length;
-  const features = symbols.map((_, s) => {
-    const O=openSeries[s], C=closeSeries[s];
-    const ocRet=new Array(n).fill(NaN);
-    const ret1=new Array(n).fill(NaN);
-    const logR=new Array(n).fill(NaN);
-    const mom5=new Array(n).fill(NaN);
-    const mom10=new Array(n).fill(NaN);
-    const rsi=rsi14(C);
-    const bbp=new Array(n).fill(NaN);
-    const vol10=new Array(n).fill(NaN);
+// Build per-day feature rows [stocks*FEATURES_PER_STOCK]
+function buildFeatureRows(symbols, O, H, L, C, V) {
+  const n = C[0].length;
+  const per = symbols.map((_, s) => {
+    const o=O[s], h=H[s], l=L[s], c=C[s], v=V[s];
+    const ret1 = new Array(n).fill(NaN);
+    const logr = new Array(n).fill(NaN);
+    const hlp  = new Array(n).fill(NaN);
+    const cop  = new Array(n).fill(NaN);
+    const mom5 = new Array(n).fill(NaN);
+    const mom10= new Array(n).fill(NaN);
+    const rs   = rsi14(c);
+    const bbp  = new Array(n).fill(NaN);
+    const vol10= new Array(n).fill(NaN);
     const logArr=new Array(n).fill(NaN);
 
     for (let t=0;t<n;t++){
-      ocRet[t]=div(C[t],O[t],1)-1;
       if (t>0){
-        const r=div(C[t],C[t-1],1);
+        const r=div(c[t],c[t-1],1);
         ret1[t]=r-1;
-        logR[t]=Math.log(Math.max(1e-8,r));
-        logArr[t]=logR[t];
+        logr[t]=Math.log(Math.max(1e-8,r));
+        logArr[t]=logr[t];
       }
-      if (t>=4){ const ma5=mean(C,t-4,t);   mom5[t]=div(C[t],ma5,1)-1; }
-      if (t>=9){ const ma10=mean(C,t-9,t);  mom10[t]=div(C[t],ma10,1)-1; }
-      if (t>=19){ const ma20=mean(C,t-19,t); const sd20=std(C,t-19,t)||1; bbp[t]=0.5+(C[t]-ma20)/(2*sd20); }
-      if (t>=9){ vol10[t]=std(logArr,t-9,t)||0; }
+      hlp[t]=div(h[t]-l[t], c[t]||1, 0);            // high-low % of close
+      cop[t]=div(c[t]-o[t], o[t]||1, 0);            // close-open % of open
+      if (t>=4) { const ma5=mean(c,t-4,t);  mom5[t] = div(c[t],ma5,1)-1; }
+      if (t>=9) { const ma10=mean(c,t-9,t); mom10[t]= div(c[t],ma10,1)-1; }
+      if (t>=19){ const ma20=mean(c,t-19,t); const sd20=std(c,t-19,t)||1; bbp[t] = 0.5 + (c[t]-ma20)/(2*sd20); }
+      if (t>=9) { vol10[t]= std(logArr,t-9,t)||0; }
     }
-    return {O,C,ocRet,ret1,logR,mom5,mom10,rsi,bbp,vol10};
+    // log volume to compress heavy tails
+    const vLog = v.map(x => Math.log(1 + Math.max(0,x)));
+    return { o,h,l,c, vLog, ret1, logr, hlp, cop, mom5, mom10, rs, bbp, vol10 };
   });
 
   const rows=[];
   for (let t=0;t<n;t++){
     const row=[];
     for (let s=0;s<symbols.length;s++){
-      const f=features[s];
+      const f=per[s];
       row.push(
-        f.O[t], f.C[t],
-        f.ocRet[t] ?? 0,
-        f.ret1[t]  ?? 0,
-        f.logR[t]  ?? 0,
-        f.mom5[t]  ?? 0,
-        f.mom10[t] ?? 0,
-        f.rsi[t]   ?? 0.5,
-        f.bbp[t]   ?? 0.5,
-        f.vol10[t] ?? 0
+        f.o[t], f.h[t], f.l[t], f.c[t],
+        f.vLog[t] ?? 0,
+        f.ret1[t] ?? 0,
+        f.logr[t] ?? 0,
+        f.hlp[t]  ?? 0,
+        f.cop[t]  ?? 0,
+        f.mom5[t] ?? 0,
+        f.mom10[t]?? 0,
+        f.rs[t]   ?? 0.5,
+        f.bbp[t]  ?? 0.5,
+        f.vol10[t]?? 0
       );
     }
     rows.push(row);
@@ -156,17 +177,17 @@ function buildFeatureRows(symbols, openSeries, closeSeries) {
   return rows;
 }
 
-// ---------- Normalization ----------
+// Per-stock, per-feature train-only min-max
 function computeMinMax(featureRows, symbols, F, lastTrainDay) {
-  const mins=symbols.map(()=>new Array(F).fill(Number.POSITIVE_INFINITY));
-  const maxs=symbols.map(()=>new Array(F).fill(Number.NEGATIVE_INFINITY));
+  const mins = symbols.map(()=> new Array(F).fill(Number.POSITIVE_INFINITY));
+  const maxs = symbols.map(()=> new Array(F).fill(Number.NEGATIVE_INFINITY));
   for (let t=0;t<=lastTrainDay;t++){
-    const r=featureRows[t];
+    const r = featureRows[t];
     for (let s=0;s<symbols.length;s++){
       for (let f=0;f<F;f++){
-        const v=r[s*F+f];
-        if (v<mins[s][f]) mins[s][f]=v;
-        if (v>maxs[s][f]) maxs[s][f]=v;
+        const v = r[s*F + f];
+        if (v < mins[s][f]) mins[s][f]=v;
+        if (v > maxs[s][f]) maxs[s][f]=v;
       }
     }
   }
@@ -186,17 +207,15 @@ export async function prepareDatasetFromFile(file, options = {}) {
     seqLen = DEFAULT_SEQ_LEN,
     horizons = DEFAULT_HORIZONS,
     testSplit = 0.2,
-    valSplitWithinTrain = 0.12,
-    expectStocks = STOCK_COUNT_EXPECTED,
+    valSplitWithinTrain = 0.12
   } = options;
 
   const text = await file.text();
   const recs = parseCSV(text);
-  const { symbols, dates, openSeries, closeSeries } = pivotPanel(recs);
-  if (expectStocks && symbols.length !== expectStocks) console.warn(`Expected ${expectStocks} symbols, found ${symbols.length}.`);
+  const { symbols, dates, O, H, L, C, V } = alignPanel(recs);
 
   const F = FEATURES_PER_STOCK;
-  const featureRows = buildFeatureRows(symbols, openSeries, closeSeries);
+  const featureRows = buildFeatureRows(symbols, O, H, L, C, V);
 
   const maxH = Math.max(...horizons);
   const earliestBase = Math.max(seqLen - 1, INDICATOR_WARMUP);
@@ -212,40 +231,36 @@ export async function prepareDatasetFromFile(file, options = {}) {
   const trainCount = trainValCount - valCount;
 
   const trainBase = baseIdx.slice(0, trainCount);
-  const valBase   = baseIdx.slice(trainCount, trainCount + valCount);
-  const testBase  = baseIdx.slice(trainCount + valCount);
+  const valBase   = baseIdx.slice(trainCount, trainCount+valCount);
+  const testBase  = baseIdx.slice(trainCount+valCount);
 
-  const { mins, maxs } = computeMinMax(featureRows, symbols, F, trainBase[trainBase.length - 1]);
+  const { mins, maxs } = computeMinMax(featureRows, symbols, F, trainBase[trainBase.length-1]);
 
-  const build = (bases) => {
+  function build(bases){
     const X=[], Y=[], baseDates=[];
     for (const base of bases){
       const seq=[];
-      for (let t=base-seqLen+1; t<=base; t++){
-        const raw=featureRows[t];
-        const row=[];
+      for (let t=base-seqLen+1;t<=base;t++){
+        const raw = featureRows[t];
+        const row = [];
         for (let s=0;s<symbols.length;s++){
           for (let f=0;f<F;f++){
-            row.push(mm(raw[s*F+f], mins[s][f], maxs[s][f]));
+            row.push( mm(raw[s*F+f], mins[s][f], maxs[s][f]) );
           }
         }
         seq.push(row);
       }
       X.push(seq);
-
       const lab=[];
       for (let s=0;s<symbols.length;s++){
-        const baseC=closeSeries[s][base];
-        for (const h of horizons){
-          const fut=closeSeries[s][base+h];
-          lab.push(fut>baseC?1:0);
-        }
+        const baseClose = C[s][base];
+        for (const h of horizons) lab.push( C[s][base+h] > baseClose ? 1 : 0 );
       }
       Y.push(lab);
       baseDates.push(dates[base]);
     }
     return { X, Y, baseDates };
-  };
+  }
 
   const tr = build(trainBase);
   const va = build(valBase);
@@ -265,6 +280,6 @@ export async function prepareDatasetFromFile(file, options = {}) {
     X_train, y_train, X_val, y_val, X_test, y_test,
     symbols, horizons,
     baseDatesTest: te.baseDates,
-    meta: { seqLen, featuresPerStock: F, featureDim, totalSamples: total, numTrain: trainCount, numVal: valCount, numTest: testCount }
+    meta: { seqLen, featureDim, featuresPerStock: F, totalSamples: total, numTrain: trainCount, numVal: valCount, numTest: testCount }
   };
 }
