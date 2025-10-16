@@ -1,0 +1,94 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>TF.js Multi-Stock GRU Demo (GitHub Pages Ready)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- TensorFlow.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+  <!-- Chart.js CDN (for accuracy bar chart) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; color: #222; }
+    h1 { margin: 0 0 6px; font-size: 20px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); background: #fff; }
+    #log { width: 100%; height: 140px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; overflow: auto; background: #fafafa; }
+    #accChart { width: 100%; max-width: 900px; height: 420px; }
+    .timeline-block { margin: 16px 0 24px; }
+    .timeline-title { font-weight: 600; margin-bottom: 6px; }
+    .legend { font-size: 12px; color: #555; margin-top: 4px; }
+    .legend .greenBox, .legend .redBox { display: inline-block; width: 12px; height: 12px; margin-right: 4px; vertical-align: middle; }
+    .legend .greenBox { background: #2ecc71; }
+    .legend .redBox { background: #e74c3c; }
+    .cm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+    .cm-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px; }
+    .cm-title { font-weight: 600; margin-bottom: 6px; }
+    .cm-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .cm-table th, .cm-table td { border: 1px solid #e5e7eb; padding: 4px 6px; text-align: center; }
+    .muted { color: #666; font-size: 13px; }
+    .spacer { height: 8px; }
+    .controls label { font-weight: 600; margin-right: 6px; }
+    .controls input[type="number"] { width: 70px; }
+  </style>
+</head>
+<body>
+  <h1>Browser-based Multi-Stock GRU (TensorFlow.js)</h1>
+  <div class="muted">Upload CSV (<code>Date,Symbol,Open,Close</code>) for 10 S&amp;P500 stocks, train client-side, and visualize multi-output 3-day-ahead up/down classification.</div>
+
+  <div class="spacer"></div>
+
+  <div class="card">
+    <div class="row controls">
+      <div>
+        <label for="csvFile">CSV:</label>
+        <input type="file" id="csvFile" accept=".csv" />
+      </div>
+      <button id="btnLoad">Load &amp; Prepare</button>
+      <div>
+        <label for="epochs">Epochs</label>
+        <input type="number" id="epochs" min="1" value="25" />
+      </div>
+      <div>
+        <label for="batch">Batch</label>
+        <input type="number" id="batch" min="1" value="32" />
+      </div>
+      <button id="btnTrain" disabled>Train &amp; Evaluate</button>
+      <button id="btnSave" disabled>Save Weights</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="muted">Shapes: <span id="shapes">—</span></div>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Logs</div>
+    <pre id="log"></pre>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Per-Stock Accuracy (sorted)</div>
+    <canvas id="accChart"></canvas>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Per-Stock Prediction Timelines</div>
+    <div id="timelineContainer"></div>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">Per-Stock Confusion Matrices (optional)</div>
+    <div id="confusionContainer"></div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
