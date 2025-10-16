@@ -1,21 +1,20 @@
 // gru.js
-// Enhanced architecture for higher accuracy:
-// Conv1D feature extractor -> Bidirectional GRU -> GRU -> Dense head.
-// Loss: binaryCrossentropy; metrics: binaryAccuracy.
+// Conv1D + BiGRU + GRU + Attention + Dense head (sigmoid).
+// Early stopping supported.
 
 export class GRUClassifier {
-  constructor(config = {}) {
+  constructor(cfg = {}) {
     const {
-      seqLen = 24,
-      featureDim = 100,            // 10 stocks × 10 features (auto from data)
+      seqLen = 48,
+      featureDim = 100,
       numStocks = 10,
-      horizons = [1, 2, 3],
+      horizons = [1,2,3],
       convFilters = 64,
-      gruUnits = 64,
-      denseUnits = 128,
-      learningRate = 8e-4,
+      gruUnits = 96,
+      denseUnits = 192,
+      learningRate = 5e-4,
       dropout = 0.25
-    } = config;
+    } = cfg;
 
     this.seqLen = seqLen;
     this.featureDim = featureDim;
@@ -26,59 +25,43 @@ export class GRUClassifier {
     this.model = this._build({ convFilters, gruUnits, denseUnits, learningRate, dropout });
   }
 
+  _attentionOverTime(seqTensor) {
+    // seqTensor: [B, T, F]
+    const T = this.seqLen;
+    // score_t = tanh(W*h_t + b) -> [B,T,1]
+    let scores = tf.layers.dense({ units: 1, activation: 'tanh' }).apply(seqTensor);
+    // -> [B, T]
+    scores = tf.layers.reshape({ targetShape: [T] }).apply(scores);
+    // softmax over time -> [B, T]
+    const weights = tf.layers.activation({ activation: 'softmax' }).apply(scores);
+    // context = weights · seqTensor over time axis -> [B, F]
+    const context = tf.layers.dot({ axes: [1, 1] }).apply([weights, seqTensor]);
+    return context; // [B, F]
+  }
+
   _build({ convFilters, gruUnits, denseUnits, learningRate, dropout }) {
     const input = tf.input({ shape: [this.seqLen, this.featureDim] });
 
-    // Temporal feature extractor
-    let x = tf.layers.conv1d({
-      filters: convFilters,
-      kernelSize: 3,
-      strides: 1,
-      padding: 'same',
-      activation: 'relu',
-      kernelInitializer: 'glorotUniform'
-    }).apply(input);
+    let x = tf.layers.conv1d({ filters: convFilters, kernelSize: 5, padding: 'same', activation: 'relu' }).apply(input);
+    x = tf.layers.conv1d({ filters: convFilters, kernelSize: 3, padding: 'same', activation: 'relu' }).apply(x);
 
-    x = tf.layers.conv1d({
-      filters: convFilters,
-      kernelSize: 3,
-      strides: 1,
-      padding: 'same',
-      activation: 'relu',
-      kernelInitializer: 'glorotUniform'
-    }).apply(x);
-
-    // Sequence modeling
     x = tf.layers.bidirectional({
-      layer: tf.layers.gru({
-        units: gruUnits,
-        returnSequences: true,
-        dropout: 0.15,
-        recurrentDropout: 0.0,
-        kernelInitializer: 'glorotUniform'
-      }),
+      layer: tf.layers.gru({ units: gruUnits, returnSequences: true, dropout: 0.15 }),
       mergeMode: 'concat'
     }).apply(x);
 
-    x = tf.layers.gru({
-      units: gruUnits,
-      returnSequences: false,
-      dropout: 0.15,
-      recurrentDropout: 0.0,
-      kernelInitializer: 'glorotUniform'
-    }).apply(x);
+    // second GRU (sequence)
+    x = tf.layers.gru({ units: gruUnits, returnSequences: true, dropout: 0.15 }).apply(x);
 
-    // Dense head
-    x = tf.layers.dense({ units: denseUnits, activation: 'relu' }).apply(x);
-    x = tf.layers.dropout({ rate: dropout }).apply(x);
+    // attention over time -> fixed length
+    const ctx = this._attentionOverTime(x);
 
-    const output = tf.layers.dense({
-      units: this.outputDim,
-      activation: 'sigmoid',
-      kernelInitializer: 'glorotUniform'
-    }).apply(x);
+    // dense head
+    let out = tf.layers.dense({ units: denseUnits, activation: 'relu' }).apply(ctx);
+    out = tf.layers.dropout({ rate: dropout }).apply(out);
+    out = tf.layers.dense({ units: this.outputDim, activation: 'sigmoid' }).apply(out);
 
-    const model = tf.model({ inputs: input, outputs: output });
+    const model = tf.model({ inputs: input, outputs: out });
     model.compile({
       optimizer: tf.train.adam(learningRate),
       loss: 'binaryCrossentropy',
@@ -87,34 +70,33 @@ export class GRUClassifier {
     return model;
   }
 
-  async fit(X_train, y_train, options = {}, onEpochEnd) {
+  async fit(X_train, y_train, X_val, y_val, trainOpts = {}, onEpochEnd) {
     const {
-      epochs = 35,
+      epochs = 40,
       batchSize = 32,
-      validationSplit = 0.12,
-      shuffle = false
-    } = options;
+      shuffle = false,
+      patience = 6
+    } = trainOpts;
+
+    const cbs = [
+      tf.callbacks.earlyStopping({ monitor: 'val_loss', patience, verbose: 0 })
+    ];
+    if (onEpochEnd) {
+      cbs.push({ onEpochEnd: async (epoch, logs) => { onEpochEnd(epoch, logs); await tf.nextFrame(); } });
+    }
 
     return await this.model.fit(X_train, y_train, {
-      epochs, batchSize, validationSplit, shuffle,
-      callbacks: {
-        onEpochEnd: async (epoch, logs) => {
-          if (onEpochEnd) onEpochEnd(epoch, logs);
-          await tf.nextFrame();
-        }
-      }
+      epochs,
+      batchSize,
+      shuffle,
+      validationData: [X_val, y_val],
+      callbacks: cbs
     });
   }
 
-  predict(X) {
-    return this.model.predict(X);
-  }
+  predict(X) { return this.model.predict(X); }
 
-  async save(name = 'tfjs_gru_stock_demo') {
-    await this.model.save(`downloads://${name}`);
-  }
+  dispose() { this.model?.dispose(); }
 
-  dispose() {
-    if (this.model) this.model.dispose();
-  }
+  async save(name = 'tfjs_gru_stock_demo') { await this.model.save(`downloads://${name}`); }
 }
