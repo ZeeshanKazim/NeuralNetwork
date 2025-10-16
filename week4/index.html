@@ -5,31 +5,29 @@
   <meta charset="UTF-8" />
   <title>Multi-Stock GRU Prediction Demo (TensorFlow.js)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <!-- TensorFlow.js -->
+  <!-- TF.js + Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
-  <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root { --border:#e5e7eb; --muted:#6b7280; --bg:#fafafa; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; color:#1f2937; background: var(--bg); }
-    h1 { margin: 0 0 4px; font-size: 22px; }
-    .muted { color: var(--muted); font-size: 13px; }
-    .card { border: 1px solid var(--border); background:#fff; border-radius: 12px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.04); margin-bottom: 14px; }
-    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .controls label { font-weight: 600; margin-right: 6px; }
-    .controls input[type="number"] { width: 80px; }
-    .controls input[type="range"] { width: 160px; }
-    button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: #0ea5e9; color:#fff; cursor: pointer; }
-    button[disabled] { background: #cbd5e1; cursor: not-allowed; }
-    #log { height: 150px; background:#f9fafb; border:1px solid var(--border); border-radius:8px; padding:8px; overflow:auto; white-space:pre-wrap; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:18px; color:#1f2937; background:var(--bg); }
+    h1 { margin:0 0 6px; font-size:22px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .card { border:1px solid var(--border); background:#fff; border-radius:12px; padding:14px; box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:14px; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .controls label { font-weight:600; margin-right:6px; }
+    .controls input[type="number"] { width:80px; }
+    button { padding:8px 12px; border:1px solid var(--border); border-radius:8px; background:#0ea5e9; color:#fff; cursor:pointer; }
+    button[disabled] { background:#cbd5e1; cursor:not-allowed; }
+    #log { height:150px; background:#f9fafb; border:1px solid var(--border); border-radius:8px; padding:8px; overflow:auto; white-space:pre-wrap; }
     .progress { display:flex; align-items:center; gap:8px; }
-    .progress-wrap { position:relative; height:16px; background:#f3f4f6; border:1px solid var(--border); border-radius:8px; overflow:hidden; flex: 1; }
-    .progress-bar { position:absolute; inset:0 auto 0 0; width:0%; background:#2563eb; transition: width .2s ease; }
+    .progress-wrap { position:relative; height:16px; background:#f3f4f6; border:1px solid var(--border); border-radius:8px; overflow:hidden; flex:1; }
+    .progress-bar { position:absolute; inset:0 auto 0 0; width:0%; background:#2563eb; transition:width .2s ease; }
     .progress-text { font-size:12px; color:var(--muted); min-width:160px; }
     #accChart { width:100%; max-width:960px; height:420px; }
-    .timeline { margin: 12px 0 18px; }
+    .timeline { margin:12px 0 18px; }
     .timeline-title { font-weight:600; margin-bottom:6px; }
-    .legend { font-size:12px; color:var(--muted); margin-top:4px; }
+    .legend { font-size:12px; color:#6b7280; margin-top:4px; }
     .legend .ok, .legend .bad { display:inline-block; width:12px; height:12px; vertical-align:middle; margin-right:4px; }
     .legend .ok { background:#27ae60; } .legend .bad { background:#e74c3c; }
     .cm-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap:12px; }
@@ -42,7 +40,7 @@
 </head>
 <body>
   <h1>Multi-Stock GRU Prediction Demo</h1>
-  <div class="muted">Upload CSV (<code>Date, Symbol, Open, Close</code>) for 10 S&amp;P 500 stocks. This app engineers indicators in-browser, trains a Conv1D+GRU model with TensorFlow.js, and visualizes 3-day-ahead up/down predictions.</div>
+  <div class="muted">Upload CSV (<code>Date, Symbol, Open, Close</code>) for 10 stocks. The app engineers indicators, trains a Conv1D+BiGRU+Attention model entirely in your browser, tunes the decision threshold on a validation slice, and evaluates on a held‑out test segment.</div>
 
   <div class="card">
     <div class="row controls">
@@ -53,20 +51,15 @@
       </div>
       <div>
         <label for="seqLen">SeqLen</label>
-        <input type="number" id="seqLen" min="8" value="24" />
+        <input type="number" id="seqLen" min="16" value="48" />
       </div>
       <div>
         <label for="epochs">Epochs</label>
-        <input type="number" id="epochs" min="1" value="35" />
+        <input type="number" id="epochs" min="1" value="40" />
       </div>
       <div>
         <label for="batch">Batch</label>
         <input type="number" id="batch" min="1" value="32" />
-      </div>
-      <div>
-        <label for="threshold">Threshold</label>
-        <input type="range" id="threshold" min="0.30" max="0.70" step="0.01" value="0.50" />
-        <span class="muted" id="thresholdVal">0.50</span>
       </div>
       <button id="btnLoad">Load &amp; Prepare</button>
       <button id="btnTrain" disabled>Train Model</button>
@@ -76,14 +69,11 @@
 
     <div class="row" style="margin-top:10px;">
       <div class="progress" style="width:100%;">
-        <div class="progress-wrap">
-          <div id="progressBar" class="progress-bar"></div>
-        </div>
+        <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
         <div id="progressText" class="progress-text">—</div>
       </div>
     </div>
-
-    <div class="muted" style="margin-top:8px;">Shapes: <span id="shapes">—</span></div>
+    <div class="muted" style="margin-top:8px;">Shapes: <span id="shapes">—</span> &nbsp; | &nbsp; Tuned: <span id="tunedThreshold">—</span></div>
   </div>
 
   <div class="card">
@@ -92,17 +82,17 @@
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">Per-Stock Accuracy (sorted)</div>
+    <div class="muted" style="margin-bottom:6px;">Per‑Stock Accuracy (sorted)</div>
     <canvas id="accChart"></canvas>
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">Per-Stock Prediction Timelines</div>
+    <div class="muted" style="margin-bottom:6px;">Per‑Stock Prediction Timelines</div>
     <div id="timelineContainer"></div>
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">Per-Stock Confusion Matrices (optional)</div>
+    <div class="muted" style="margin-bottom:6px;">Per‑Stock Confusion Matrices</div>
     <div id="confusionContainer"></div>
   </div>
 
