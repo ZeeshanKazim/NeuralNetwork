@@ -1,18 +1,20 @@
 // gru.js
-// Conv1D feature extractor + BiGRU + GRU + Dense head (sigmoid).
-// Manual early stopping implemented via a CustomCallback to avoid callback API issues.
+// Denoising Autoencoder (DAE) + GRU classifier (browser, TF.js).
+// No unsupported callbacks -> avoids "setParams is not a function" error.
+// Uses tf.CustomCallback for logging, and manual early-stopping with best-weight restore.
 
-export class GRUClassifier {
+export class GRUDAEClassifier {
   constructor(cfg = {}) {
     const {
-      seqLen = 48,
-      featureDim = 100,
+      seqLen = 12,
+      featureDim = 140,           // MAX_STOCKS(10) × FEATURES_PER_STOCK(14)
       numStocks = 10,
       horizons = [1,2,3],
-      convFilters = 64,
-      gruUnits = 96,
-      denseUnits = 192,
-      learningRate = 5e-4,
+      latentDim = 128,
+      encoderGRU = 96,
+      denseHead = 192,
+      aeLR = 1e-3,
+      clsLR = 7e-4,
       dropout = 0.25
     } = cfg;
 
@@ -20,98 +22,144 @@ export class GRUClassifier {
     this.featureDim = featureDim;
     this.numStocks = numStocks;
     this.horizons = horizons;
-    this.outputDim = numStocks * horizons.length;
+    this.outDim = numStocks * horizons.length;
 
-    this.model = this._build({ convFilters, gruUnits, denseUnits, learningRate, dropout });
+    this.latentDim = latentDim;
+    this.encoderGRU = encoderGRU;
+    this.denseHead = denseHead;
+    this.aeLR = aeLR;
+    this.clsLR = clsLR;
+    this.dropout = dropout;
+
+    this.ae = null;
+    this.encoder = null;
+    this.classifier = null;
   }
 
-  _build({ convFilters, gruUnits, denseUnits, learningRate, dropout }) {
-    const input = tf.input({ shape: [this.seqLen, this.featureDim] });
+  // ---------- Build models ----------
+  _buildAE() {
+    const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
+    // Encoder
+    let x = tf.layers.conv1d({ filters: 64, kernelSize: 3, padding: 'same', activation: 'relu' }).apply(inp);
+    x = tf.layers.gru({ units: this.encoderGRU, returnSequences: false, dropout: 0.1 }).apply(x);
+    const code = tf.layers.dense({ units: this.latentDim, activation: 'relu' }).apply(x);
 
-    let x = tf.layers.conv1d({ filters: convFilters, kernelSize: 5, padding: 'same', activation: 'relu' }).apply(input);
-    x = tf.layers.conv1d({ filters: convFilters, kernelSize: 3, padding: 'same', activation: 'relu' }).apply(x);
+    // Decoder
+    let z = tf.layers.dense({ units: this.seqLen * this.encoderGRU, activation: 'relu' }).apply(code);
+    z = tf.layers.reshape({ targetShape: [this.seqLen, this.encoderGRU] }).apply(z);
+    z = tf.layers.gru({ units: this.encoderGRU, returnSequences: true, dropout: 0.1 }).apply(z);
+    const recon = tf.layers.dense({ units: this.featureDim, activation: 'sigmoid' }).apply(z);
 
-    x = tf.layers.bidirectional({
-      layer: tf.layers.gru({ units: gruUnits, returnSequences: true, dropout: 0.15 }),
-      mergeMode: 'concat'
-    }).apply(x);
+    this.ae = tf.model({ inputs: inp, outputs: recon });
+    this.ae.compile({ optimizer: tf.train.adam(this.aeLR), loss: 'meanSquaredError' });
 
-    x = tf.layers.gru({ units: gruUnits, returnSequences: false, dropout: 0.15 }).apply(x);
+    // Separate encoder model (inp -> code)
+    this.encoder = tf.model({ inputs: inp, outputs: code });
+  }
 
-    x = tf.layers.dense({ units: denseUnits, activation: 'relu' }).apply(x);
-    x = tf.layers.dropout({ rate: dropout }).apply(x);
+  _buildClassifier(freezeEncoder = true, lr = this.clsLR) {
+    if (!this.encoder) throw new Error('Encoder not built. Call pretrainAE first.');
+    const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
 
-    const output = tf.layers.dense({ units: this.outputDim, activation: 'sigmoid' }).apply(x);
+    // Reuse encoder layers (by calling encoder on input)
+    let x = this.encoder.apply(inp);
+    // Optionally freeze encoder by marking its layers non-trainable
+    this.encoder.layers.forEach(ly => ly.trainable = !freezeEncoder);
 
-    const model = tf.model({ inputs: input, outputs: output });
-    model.compile({
-      optimizer: tf.train.adam(learningRate),
+    // Head
+    x = tf.layers.dropout({ rate: this.dropout }).apply(x);
+    x = tf.layers.dense({ units: this.denseHead, activation: 'relu' }).apply(x);
+    x = tf.layers.dropout({ rate: this.dropout }).apply(x);
+    const out = tf.layers.dense({ units: this.outDim, activation: 'sigmoid' }).apply(x);
+
+    this.classifier = tf.model({ inputs: inp, outputs: out });
+    this.classifier.compile({
+      optimizer: tf.train.adam(lr),
       loss: 'binaryCrossentropy',
       metrics: ['binaryAccuracy']
     });
-    return model;
   }
 
-  async fit(X_train, y_train, X_val, y_val, opts = {}, onEpochEnd) {
-    const {
-      epochs = 40,
-      batchSize = 32,
-      shuffle = false,
-      patience = 6,
-      minDelta = 1e-4
-    } = opts;
+  // ---------- Training ----------
+  async pretrainAE(X_train, { epochs = 25, batchSize = 32, noiseStd = 0.08 }, onEpochEnd) {
+    if (!this.ae) this._buildAE();
+
+    // Manual per-epoch noise injection to avoid requiring special layers
+    for (let e = 0; e < epochs; e++) {
+      const noise = tf.randomNormal(X_train.shape, 0, noiseStd);
+      const noisy = tf.clipByValue(tf.add(X_train, noise), 0, 1);
+      const cb = new tf.CustomCallback({
+        onEpochEnd: async (_epoch, logs) => {
+          if (onEpochEnd) onEpochEnd(e, logs, 'AE');
+          await tf.nextFrame();
+        }
+      });
+      await this.ae.fit(noisy, X_train, { epochs: 1, batchSize, shuffle: false, callbacks: [cb] });
+      noise.dispose(); noisy.dispose();
+      await tf.nextFrame();
+    }
+  }
+
+  async fitClassifier(X_train, y_train, X_val, y_val, { epochs = 40, batchSize = 32, freezeEncoder = true, patience = 6, minDelta = 1e-4 }, onEpochEnd) {
+    if (!this.classifier) this._buildClassifier(freezeEncoder, this.clsLR);
 
     let bestVal = Number.POSITIVE_INFINITY;
     let bestWeights = null;
     let wait = 0;
-    const self = this;
 
-    const history = await this.model.fit(X_train, y_train, {
-      epochs,
-      batchSize,
-      shuffle,
-      validationData: [X_val, y_val],
-      callbacks: {
-        onEpochEnd: async function(epoch, logs) {
-          if (onEpochEnd) onEpochEnd(epoch, logs);
-
-          const v = logs.val_loss;
-          if (Number.isFinite(v) && v < bestVal - minDelta) {
-            bestVal = v;
-            wait = 0;
-            if (bestWeights) bestWeights.forEach(w => w.dispose());
-            bestWeights = self.model.getWeights().map(w => w.clone());
-          } else {
-            wait++;
-            if (wait >= patience) {
-              self.model.stopTraining = true;
-              if (bestWeights) {
-                const cloned = bestWeights.map(w => w.clone());
-                self.model.setWeights(cloned);
-                bestWeights.forEach(w => w.dispose());
-                bestWeights = null;
-              }
-            }
+    const cb = new tf.CustomCallback({
+      onEpochEnd: async (epoch, logs) => {
+        if (onEpochEnd) onEpochEnd(epoch, logs, 'CLS');
+        const v = logs.val_loss;
+        if (Number.isFinite(v) && v < bestVal - minDelta) {
+          bestVal = v; wait = 0;
+          if (bestWeights) bestWeights.forEach(w => w.dispose());
+          bestWeights = this.classifier.getWeights().map(w => w.clone());
+        } else {
+          wait++;
+          if (wait >= patience) {
+            this.classifier.stopTraining = true;
           }
-          await tf.nextFrame();
         }
+        await tf.nextFrame();
       }
     });
 
-    // Ensure best weights restored at the end if training didn't early-stop.
+    await this.classifier.fit(X_train, y_train, {
+      epochs, batchSize, shuffle: false, validationData: [X_val, y_val], callbacks: [cb]
+    });
+
+    // Restore best weights
     if (bestWeights) {
       const cloned = bestWeights.map(w => w.clone());
-      this.model.setWeights(cloned);
+      this.classifier.setWeights(cloned);
       bestWeights.forEach(w => w.dispose());
-      bestWeights = null;
     }
 
-    return history;
+    // Optional fine-tune: unfreeze encoder and run a few small-LR epochs
+    this._buildClassifier(false, this.clsLR * 0.5); // unfreeze + lower LR, reuse same encoder graph
+    await this.classifier.fit(X_train, y_train, {
+      epochs: Math.max(4, Math.floor(epochs * 0.25)),
+      batchSize,
+      shuffle: false,
+      validationData: [X_val, y_val],
+      callbacks: [new tf.CustomCallback({ onEpochEnd: async (e, logs) => { if (onEpochEnd) onEpochEnd(e, logs, 'FT'); await tf.nextFrame(); } })]
+    });
   }
 
-  predict(X) { return this.model.predict(X); }
+  predict(X) {
+    if (!this.classifier) throw new Error('Classifier is not built.');
+    return this.classifier.predict(X);
+  }
 
-  async save(name = 'tfjs_gru_stock_demo') { await this.model.save(`downloads://${name}`); }
+  async save(prefix='tfjs_gru_ae') {
+    if (this.classifier) await this.classifier.save(`downloads://${prefix}_classifier`);
+    if (this.ae)         await this.ae.save(`downloads://${prefix}_ae`);
+  }
 
-  dispose() { if (this.model) this.model.dispose(); }
+  dispose() {
+    this.classifier?.dispose();
+    this.encoder?.dispose();
+    this.ae?.dispose();
+  }
 }
