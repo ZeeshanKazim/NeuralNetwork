@@ -1,232 +1,174 @@
-// gru.js — Denoising AE + GRU classifier + **per-stock specialist head**
-// Keeps the clean callback usage (tf.CustomCallback), avoids setParams issues.
+// gru.js
+// TensorFlow.js GRU model for multi-output (10 stocks × 3-day horizon) binary classification.
 
-export class GRUDAEClassifier {
-  constructor(cfg = {}) {
-    const {
-      seqLen = 12,
-      featureDim = 140,           // 10 stocks × 14 features
-      numStocks = 10,
-      horizons = [1,2,3],
-      latentDim = 128,
-      encoderGRU = 96,
-      denseHead = 192,
-      aeLR = 1e-3,
-      clsLR = 7e-4,
-      dropout = 0.25
-    } = cfg;
-
+export class GRUStockModel {
+  constructor({
+    seqLen = 12,
+    featDim = 20,
+    horizon = 3,
+    numStocks = 10,
+    units = [64, 32],
+    dropout = 0.2,
+    learningRate = 1e-3,
+    bidirectional = true,
+  } = {}) {
     this.seqLen = seqLen;
-    this.featureDim = featureDim;
+    this.featDim = featDim;
+    this.horizon = horizon;
     this.numStocks = numStocks;
-    this.horizons = horizons;
-    this.outDim = numStocks * horizons.length;
-
-    this.latentDim = latentDim;
-    this.encoderGRU = encoderGRU;
-    this.denseHead = denseHead;
-    this.aeLR = aeLR;
-    this.clsLR = clsLR;
+    this.outDim = numStocks * horizon;
+    this.units = units;
     this.dropout = dropout;
-
-    this.ae = null;
-    this.encoder = null;     // inp -> latent
-    this.classifier = null;  // inp -> outDim
-    this.stockHead = null;   // specialist head (inp -> H) for one stock
-    this.stockIndex = null;  // which stock the specialist targets
+    this.learningRate = learningRate;
+    this.bidirectional = bidirectional;
+    this.model = this._build();
   }
 
-  // ---------- Build models ----------
-  _buildAE() {
-    const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
-    // Encoder
-    let x = tf.layers.conv1d({ filters: 64, kernelSize: 3, padding: 'same', activation: 'relu' }).apply(inp);
-    x = tf.layers.gru({ units: this.encoderGRU, returnSequences: false, dropout: 0.1 }).apply(x);
-    const code = tf.layers.dense({ units: this.latentDim, activation: 'relu' }).apply(x);
-
-    // Decoder
-    let z = tf.layers.dense({ units: this.seqLen * this.encoderGRU, activation: 'relu' }).apply(code);
-    z = tf.layers.reshape({ targetShape: [this.seqLen, this.encoderGRU] }).apply(z);
-    z = tf.layers.gru({ units: this.encoderGRU, returnSequences: true, dropout: 0.1 }).apply(z);
-    const recon = tf.layers.dense({ units: this.featureDim, activation: 'sigmoid' }).apply(z);
-
-    this.ae = tf.model({ inputs: inp, outputs: recon });
-    this.ae.compile({ optimizer: tf.train.adam(this.aeLR), loss: 'meanSquaredError' });
-
-    // Separate encoder model (inp -> code)
-    this.encoder = tf.model({ inputs: inp, outputs: code });
+  _maybeBi(layer) {
+    return this.bidirectional ? tf.layers.bidirectional({ layer, mergeMode: 'concat' }) : layer;
   }
 
-  _buildClassifier(freezeEncoder = true, lr = this.clsLR) {
-    if (!this.encoder) throw new Error('Encoder not built. Call pretrainAE first.');
-    const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
+  _build() {
+    const inputs = tf.input({ shape: [this.seqLen, this.featDim] });
 
-    let x = this.encoder.apply(inp);
-    this.encoder.layers.forEach(ly => ly.trainable = !freezeEncoder);
+    // Stacked GRU (optionally bidirectional)
+    const gru1 = this._maybeBi(tf.layers.gru({
+      units: this.units[0],
+      returnSequences: true,
+      dropout: this.dropout,
+      recurrentDropout: 0,
+    })).apply(inputs);
 
-    x = tf.layers.dropout({ rate: this.dropout }).apply(x);
-    x = tf.layers.dense({ units: this.denseHead, activation: 'relu' }).apply(x);
-    x = tf.layers.dropout({ rate: this.dropout }).apply(x);
-    const out = tf.layers.dense({ units: this.outDim, activation: 'sigmoid' }).apply(x);
+    const gru2 = tf.layers.gru({
+      units: this.units[1],
+      returnSequences: false,
+      dropout: this.dropout * 0.5,
+      recurrentDropout: 0,
+    }).apply(gru1);
 
-    this.classifier = tf.model({ inputs: inp, outputs: out });
-    this.classifier.compile({
-      optimizer: tf.train.adam(lr),
+    const dense1 = tf.layers.dense({ units: 64, activation: 'relu' }).apply(gru2);
+    const drop1 = tf.layers.dropout({ rate: Math.min(this.dropout, 0.5) }).apply(dense1);
+
+    const outputs = tf.layers.dense({
+      units: this.outDim,
+      activation: 'sigmoid', // multi-label binary
+    }).apply(drop1);
+
+    const model = tf.model({ inputs, outputs });
+    model.compile({
+      optimizer: tf.train.adam(this.learningRate),
       loss: 'binaryCrossentropy',
-      metrics: ['binaryAccuracy']
+      metrics: ['binaryAccuracy'],
     });
+    return model;
   }
 
-  // ---------- AE pretraining with noise ----------
-  async pretrainAE(X_train, { epochs = 25, batchSize = 32, noiseStd = 0.08 }, onEpochEnd) {
-    if (!this.ae) this._buildAE();
-    for (let e = 0; e < epochs; e++) {
-      const noise = tf.randomNormal(X_train.shape, 0, noiseStd);
-      const noisy = tf.clipByValue(tf.add(X_train, noise), 0, 1);
-      const cb = new tf.CustomCallback({
-        onEpochEnd: async (_epoch, logs) => {
-          if (onEpochEnd) onEpochEnd(e, logs, 'AE');
-          await tf.nextFrame();
-        }
-      });
-      await this.ae.fit(noisy, X_train, { epochs: 1, batchSize, shuffle: false, callbacks: [cb] });
-      noise.dispose(); noisy.dispose();
-      await tf.nextFrame();
-    }
+  summary() {
+    this.model.summary();
   }
 
-  // ---------- Classifier training (freeze → unfreeze) ----------
-  async fitClassifier(X_train, y_train, X_val, y_val, { epochs = 40, batchSize = 32, freezeEncoder = true, patience = 6, minDelta = 1e-4 }, onEpochEnd) {
-    if (!this.classifier) this._buildClassifier(freezeEncoder, this.clsLR);
-
-    let bestVal = Number.POSITIVE_INFINITY;
-    let bestWeights = null;
-    let wait = 0;
-
-    const cb = new tf.CustomCallback({
-      onEpochEnd: async (epoch, logs) => {
-        if (onEpochEnd) onEpochEnd(epoch, logs, 'CLS');
-        const v = logs.val_loss;
-        if (Number.isFinite(v) && v < bestVal - minDelta) {
-          bestVal = v; wait = 0;
-          if (bestWeights) bestWeights.forEach(w => w.dispose());
-          bestWeights = this.classifier.getWeights().map(w => w.clone());
-        } else {
-          wait++;
-          if (wait >= patience) this.classifier.stopTraining = true;
-        }
-        await tf.nextFrame();
-      }
+  async fit(X_train, y_train, {
+    epochs = 25,
+    batchSize = 32,
+    validationSplit = 0.1,
+    onEpoch = () => {},
+  } = {}) {
+    const es = tf.callbacks.earlyStopping({
+      monitor: 'val_loss',
+      patience: Math.max(2, Math.floor(epochs * 0.2)),
+      restoreBestWeight: true,
     });
 
-    await this.classifier.fit(X_train, y_train, {
-      epochs, batchSize, shuffle: false, validationData: [X_val, y_val], callbacks: [cb]
-    });
-
-    if (bestWeights) {
-      const cloned = bestWeights.map(w => w.clone());
-      this.classifier.setWeights(cloned);
-      bestWeights.forEach(w => w.dispose());
-    }
-
-    // light fine-tune (unfreeze)
-    this._buildClassifier(false, this.clsLR * 0.5);
-    await this.classifier.fit(X_train, y_train, {
-      epochs: Math.max(4, Math.floor(epochs * 0.25)),
+    const history = await this.model.fit(X_train, y_train, {
+      epochs,
       batchSize,
-      shuffle: false,
-      validationData: [X_val, y_val],
-      callbacks: [new tf.CustomCallback({ onEpochEnd: async (e, logs) => { if (onEpochEnd) onEpochEnd(e, logs, 'FT'); await tf.nextFrame(); } })]
+      validationSplit,
+      shuffle: false, // respect chronology
+      callbacks: [
+        {
+          onEpochEnd: async (epoch, logs) => {
+            onEpoch(epoch, logs);
+            await tf.nextFrame();
+          },
+        },
+        es,
+      ],
     });
+    return history;
   }
 
-  // ---------- NEW: per-stock specialist head (e.g., DOV) ----------
-  async fitStockHead(X_train, y_train, X_val, y_val, stockIndex, {
-    epochs = 28, batchSize = 32, lr = 1e-3, hidden = 128, patience = 5, minDelta = 1e-4
-  } = {}, onEpochEnd) {
-    if (!this.encoder) throw new Error('Encoder not ready.');
-    this.stockIndex = stockIndex;
+  async predict(X) {
+    return this.model.predict(X);
+  }
 
-    // Build specialist head on top of the shared encoder (frozen)
-    const inp = tf.input({ shape: [this.seqLen, this.featureDim] });
-    const latent = this.encoder.apply(inp);
-    this.encoder.layers.forEach(ly => ly.trainable = false);
+  async evaluate(X_test, y_test) {
+    const [loss, acc] = await this.model.evaluate(X_test, y_test, { batchSize: 64, verbose: 0 });
+    const scalars = await Promise.all([loss.data(), acc.data()]);
+    return { loss: scalars[0][0], acc: scalars[1][0] };
+  }
 
-    let h = tf.layers.dropout({ rate: this.dropout }).apply(latent);
-    h = tf.layers.dense({ units: hidden, activation: 'relu' }).apply(h);
-    h = tf.layers.dropout({ rate: this.dropout }).apply(h);
+  async save(name = 'multi_stock_gru') {
+    await this.model.save(`localstorage://${name}`);
+  }
 
-    const H = this.horizons.length;
-    const out = tf.layers.dense({ units: H, activation: 'sigmoid' }).apply(h);
-
-    this.stockHead = tf.model({ inputs: inp, outputs: out });
-    this.stockHead.compile({ optimizer: tf.train.adam(lr), loss: 'binaryCrossentropy', metrics: ['binaryAccuracy'] });
-
-    // Slice y for the target stock (columns s*H .. s*H+H-1)
-    const start = stockIndex * H;
-    const yTr = y_train.slice([0, start], [-1, H]);
-    const yVa = y_val.slice([0, start], [-1, H]);
-
-    let bestVal = Number.POSITIVE_INFINITY;
-    let bestW = null, wait = 0;
-
-    const cb = new tf.CustomCallback({
-      onEpochEnd: async (epoch, logs) => {
-        if (onEpochEnd) onEpochEnd(epoch, logs, 'SPC');
-        const v = logs.val_loss;
-        if (Number.isFinite(v) && v < bestVal - minDelta) {
-          bestVal = v; wait = 0;
-          if (bestW) bestW.forEach(w => w.dispose());
-          bestW = this.stockHead.getWeights().map(w => w.clone());
-        } else {
-          wait++;
-          if (wait >= patience) this.stockHead.stopTraining = true;
-        }
-        await tf.nextFrame();
-      }
-    });
-
-    await this.stockHead.fit(X_train, yTr, {
-      epochs, batchSize, shuffle: false, validationData: [X_val, yVa], callbacks: [cb]
-    });
-
-    if (bestW) {
-      const cloned = bestW.map(w => w.clone());
-      this.stockHead.setWeights(cloned);
-      bestW.forEach(w => w.dispose());
+  static async load(name = 'multi_stock_gru') {
+    const model = await tf.loadLayersModel(`localstorage://${name}`);
+    const m = new GRUStockModel();
+    m.model = model;
+    // Try to infer shapes from loaded model if possible
+    const inShape = model.inputs?.[0]?.shape;
+    const outUnits = model.outputs?.[0]?.shape?.[1];
+    if (Array.isArray(inShape)) {
+      m.seqLen = inShape[1] ?? m.seqLen;
+      m.featDim = inShape[2] ?? m.featDim;
     }
+    if (typeof outUnits === 'number') {
+      m.outDim = outUnits;
+      m.numStocks = 10;
+      m.horizon = outUnits / m.numStocks;
+    }
+    return m;
+  }
+}
 
-    yTr.dispose(); yVa.dispose();
+/** Utility: compute per-stock metrics and timelines (on arrays, not tensors) */
+export function computePerStockMetrics({
+  yTrue, // Array [N][numStocks*horizon]
+  yPred, // Array [N][numStocks*horizon] values 0..1
+  symbols,
+  horizon = 3,
+  threshold = 0.5,
+}) {
+  const numStocks = symbols.length;
+  const N = yTrue.length;
+  const correctCounts = new Array(numStocks).fill(0);
+  const totalCounts = new Array(numStocks).fill(0);
+  const confusions = {}; // {SYM: {TP,FP,TN,FN}}
+  const timelines = {};  // {SYM: [ [bool*N] * horizon ]}
+
+  for (let s = 0; s < numStocks; s++) {
+    confusions[symbols[s]] = { TP: 0, FP: 0, TN: 0, FN: 0 };
+    timelines[symbols[s]] = Array.from({ length: horizon }, () => new Array(N).fill(false));
   }
 
-  // Predict with optional specialist override (replaces that stock’s 3 columns)
-  predict(X) {
-    const base = this.classifier.predict(X);                  // [N, outDim]
-    if (!this.stockHead || this.stockIndex == null) return base;
+  for (let i = 0; i < N; i++) {
+    for (let s = 0; s < numStocks; s++) {
+      for (let h = 0; h < horizon; h++) {
+        const idx = s * horizon + h;
+        const gt = yTrue[i][idx] > 0.5 ? 1 : 0;
+        const pr = yPred[i][idx] >= threshold ? 1 : 0;
+        timelines[symbols[s]][h][i] = (gt === pr);
+        correctCounts[s] += (gt === pr) ? 1 : 0;
+        totalCounts[s] += 1;
 
-    const N = base.shape[0];
-    const H = this.horizons.length;
-    const start = this.stockIndex * H;
-
-    const left  = start > 0 ? base.slice([0,0],[N,start]) : null;
-    const rightLen = this.outDim - (start + H);
-    const right = rightLen > 0 ? base.slice([0,start+H],[N,rightLen]) : null;
-    const mid   = this.stockHead.predict(X);                  // [N, H]
-
-    const parts = [];
-    if (left)  parts.push(left);
-    parts.push(mid);
-    if (right) parts.push(right);
-
-    const out = tf.concat(parts, 1);
-    base.dispose();
-    if (left) left.dispose();
-    if (right) right.dispose();
-    // mid is kept till concat copies; safe to let GC reclaim after return or explicitly dispose here:
-    // (do not dispose mid before concat)
-    return out;
+        if (gt === 1 && pr === 1) confusions[symbols[s]].TP++;
+        else if (gt === 0 && pr === 1) confusions[symbols[s]].FP++;
+        else if (gt === 0 && pr === 0) confusions[symbols[s]].TN++;
+        else if (gt === 1 && pr === 0) confusions[symbols[s]].FN++;
+      }
+    }
   }
 
-  async save(prefix='tfjs_gru_ae'){ if (this.classifier) await this.classifier.save(`downloads://${prefix}_classifier`); if (this.ae) await this.ae.save(`downloads://${prefix}_ae`); if (this.stockHead) await this.stockHead.save(`downloads://${prefix}_specialist`); }
-  dispose(){ this.classifier?.dispose(); this.encoder?.dispose(); this.ae?.dispose(); this.stockHead?.dispose(); }
+  const accuracies = correctCounts.map((c, s) => c / Math.max(1, totalCounts[s]));
+  return { accuracies, confusions, timelines };
 }
