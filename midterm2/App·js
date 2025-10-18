@@ -1,578 +1,470 @@
-// Airline Passenger Satisfaction — Wide & Deep (TF.js)
-// Adds: (1) toggle to exclude all service ratings (strict pre-flight),
-//       (2) side-by-side AUCs via a quick comparison trainer.
+/*
+  Airline Passenger Satisfaction — Wide & Deep in TF.js
+  - Very fast training path (subset, bigger batch, fewer epochs, mixed precision)
+  - Toggle to drop all service rating columns (pre‑flight‑only)
+  - One‑click quick comparison (pre vs post) shows AUCs side‑by‑side
+  - Robust CSV parsing for Kaggle defaults (comma + double‑quote)
+*/
 
-/* ===================== DOM ===================== */
-const els = {
-  trainFile: document.getElementById('trainFile'),
-  testFile: document.getElementById('testFile'),
-  btnLoad: document.getElementById('btnLoad'),
-  shapeBadge: document.getElementById('shapeBadge'),
-  previewTable: document.getElementById('previewTable'),
-
-  useCase: document.getElementById('useCase'),
-  chkCross: document.getElementById('chkCross'),
-  chkTotalDelay: document.getElementById('chkTotalDelay'),
-  chkNoRatings: document.getElementById('chkNoRatings'),
-  btnPrep: document.getElementById('btnPrep'),
-  prepInfo: document.getElementById('prepInfo'),
-
-  btnBuild: document.getElementById('btnBuild'),
-  btnSummary: document.getElementById('btnSummary'),
-  modelSummary: document.getElementById('modelSummary'),
-
-  btnTrain: document.getElementById('btnTrain'),
-  btnEarly: document.getElementById('btnEarly'),
-  trainStatus: document.getElementById('trainStatus'),
-  trainLog: document.getElementById('trainLog'),
-
-  thSlider: document.getElementById('thSlider'),
-  thVal: document.getElementById('thVal'),
-  rocCanvas: document.getElementById('rocCanvas'),
-  aucPrimary: document.getElementById('aucPrimary'),
-  aucStrict: document.getElementById('aucStrict'),
-  prec: document.getElementById('prec'),
-  rec: document.getElementById('rec'),
-  f1: document.getElementById('f1'),
-  cmLeft: document.getElementById('cmLeft'),
-  cmRight: document.getElementById('cmRight'),
-  btnCompare: document.getElementById('btnCompare'),
-
-  btnPredict: document.getElementById('btnPredict'),
-  btnSub: document.getElementById('btnSub'),
-  btnProbs: document.getElementById('btnProbs'),
-  btnSave: document.getElementById('btnSave'),
-  predictInfo: document.getElementById('predictInfo'),
-};
-
-/* ===================== State ===================== */
+// ---------- Globals ----------
 const state = {
-  rawTrain: [], // rows
-  rawTest: [],
-  headers: [],
-
-  featureConfig: null, // filled after preprocessing
-  tensors: null, // {train: {wide, deep, y}, val: {...}}
+  rawTrain: [], rawTest: [],
+  schema: null,
+  prepped: null,
   model: null,
-  stop: false,
-  isTraining: false,
-  lastValProbs: null, // Float32Array
-  lastValY: null, // Int32Array 0/1
-  lastAUC: null,
-  strictAUC: null,
-  testProbs: null,
-  passengerCol: null,
+  training: false,
+  lastAUC: null, // previous run's AUC
+  roc: null, // {fpr:[], tpr:[], auc:number}
+  valProbs: null, valY: null,
+  fast: true,
 };
 
-/* ===================== Utils ===================== */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const clamp01 = (x)=> Math.max(0, Math.min(1, x));
-const pad = (n, w=5)=> String(n).padStart(w,' ');
+// TF backend & speed knobs
+(async () => {
+  try {
+    await tf.setBackend('webgl');
+    // Lighter textures = faster on many GPUs
+    if (tf.env().get('WEBGL_VERSION') > 0) {
+      tf.env().set('WEBGL_PACK', true);
+      // Force 16‑bit where possible
+      tf.env().set('WEBGL_FORCE_F16_TEXTURES', true);
+    }
+  } catch {}
+  document.getElementById('backendPill').textContent = `backend: ${tf.getBackend()}`;
+})();
 
-function normalizeHeader(s){
-  return String(s).replace(/[^a-zA-Z0-9]+/g,'').toLowerCase();
-}
+// ---------- DOM refs ----------
+const el = (id)=>document.getElementById(id);
+const d = {
+  trainFile: el('trainFile'), testFile: el('testFile'), btnLoad: el('btnLoad'),
+  loadStatus: el('loadStatus'), kTrain: el('kTrain'), kTest: el('kTest'), kMiss: el('kMiss'), kRep: el('kRep'), preview: el('preview'),
+  useCase: el('useCase'), featCross: el('featCross'), featTotalDelay: el('featTotalDelay'), dropRatings: el('dropRatings'), fastMode: el('fastMode'), btnPrep: el('btnPrep'), prepInfo: el('prepInfo'),
+  btnBuild: el('btnBuild'), btnSummary: el('btnSummary'), modelSummary: el('modelSummary'),
+  btnTrain: el('btnTrain'), btnEarly: el('btnEarly'), trainStatus: el('trainStatus'), log: el('log'), btnCompare: el('btnCompare'),
+  thr: el('thr'), aucNow: el('aucNow'), aucPrev: el('aucPrev'), aucPre: el('aucPre'), aucPost: el('aucPost'), roc: el('roc'),
+  tp: el('tp'), fp: el('fp'), tn: el('tn'), fn: el('fn'), prec: el('prec'), rec: el('rec'), f1: el('f1'),
+  btnPredict: el('btnPredict'), btnSub: el('btnSub'), btnProb: el('btnProb'), btnSave: el('btnSave'), predInfo: el('predInfo')
+};
 
-function median(arr){
-  const a = arr.filter(v=>Number.isFinite(v)).sort((x,y)=>x-y);
-  if(!a.length) return null;
-  const m = Math.floor(a.length/2);
-  return a.length%2? a[m] : (a[m-1]+a[m])/2;
-}
+// ---------- Utilities ----------
+const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
+const pct = (x)=> Math.round(x*1000)/10;
+const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
+const sum = (a)=> a.reduce((s,v)=>s+v,0);
+const mean = (a)=> a.length? sum(a)/a.length : 0;
+const median = (a)=>{ const b=a.filter(v=>v!=null&&!Number.isNaN(v)).sort((x,y)=>x-y); if(!b.length) return null; const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; };
+function downloadCsv(name, rows){ if(!rows.length) return; const cols=Object.keys(rows[0]); const esc=v=>{ if(v==null) return ''; const s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; }; const csv=[cols.join(',')].concat(rows.map(r=>cols.map(c=>esc(r[c])).join(','))).join('\n'); const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url); }
 
-function mode(arr){
-  const c = new Map();
-  for(const v of arr){ if(v==null) continue; c.set(v,(c.get(v)||0)+1); }
-  let best=null, cnt=-1; for(const [k,v] of c){ if(v>cnt){cnt=v; best=k;} }
-  return best;
-}
+// Robust header canonicalizer (lowercase, strip non‑alnum)
+const canon = (s)=> String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'').trim();
 
-function zscore(col){
-  const xs = col.filter(v=>Number.isFinite(v));
-  const mu = xs.reduce((a,b)=>a+b,0)/Math.max(1,xs.length);
-  const sd = Math.sqrt(xs.reduce((s,v)=>s+(v-mu)**2,0)/Math.max(1,xs.length));
-  return {mu, sd: sd||1};
-}
-
-function oneHotFit(values){
-  const uniq = Array.from(new Set(values.filter(v=>v!=null))).sort();
-  const index = new Map(uniq.map((v,i)=>[v,i]));
-  return {classes: uniq, index, dim: uniq.length};
-}
-
-function oneHotTransform(fit, v){
-  const arr = new Array(fit.dim).fill(0);
-  const i = fit.index.get(v);
-  if(i!=null) arr[i]=1; return arr;
-}
-
-function stratifiedSplit(rows, yKey, testFrac=0.2, seed=42){
-  // deterministic split per label
-  const g = {0:[],1:[]};
-  for(let i=0;i<rows.length;i++){
-    const y = Number(rows[i][yKey]===1 ? 1 : 0);
-    g[y].push(i);
-  }
-  function shuffle(a){
-    let x = seed;
-    function rnd(){ x = (1103515245*x + 12345) % 2**31; return x/2**31; }
-    for(let i=a.length-1;i>0;i--){ const j=Math.floor(rnd()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
-    return a;
-  }
-  shuffle(g[0]); shuffle(g[1]);
-  const valIdx = new Set();
-  for(const k of [0,1]){
-    const n = Math.floor(g[k].length*testFrac);
-    for(let i=0;i<n;i++) valIdx.add(g[k][i]);
-  }
-  const trainIdx=[], valIdxArr=[];
-  for(let i=0;i<rows.length;i++) (valIdx.has(i)? valIdxArr:trainIdx).push(i);
-  return {trainIdx, valIdx: valIdxArr};
-}
-
-function aucRoc(yTrue, yScore){
-  // compute AUC using trapezoidal rule
-  const pairs = []; for(let i=0;i<yTrue.length;i++) pairs.push([yScore[i], yTrue[i]]);
-  pairs.sort((a,b)=>b[0]-a[0]);
-  let tp=0, fp=0; const P = yTrue.reduce((s,v)=>s+(v===1?1:0),0); const N = yTrue.length-P;
-  let prevScore = +Infinity, auc = 0, prevFPR=0, prevTPR=0;
-  for(const [s, y] of pairs){ if(s!==prevScore){ auc += ( (fp/N - prevFPR) * (tp/P + prevTPR) )/2; prevFPR=fp/N; prevTPR=tp/P; prevScore=s; }
-    if(y===1) tp++; else fp++; }
-  auc += (1 - prevFPR)*(1 + prevTPR)/2; // finalize to (1,1)
-  return auc;
-}
-
-function confusion(yTrue, yProb, thr){
-  let tp=0, tn=0, fp=0, fn=0;
-  for(let i=0;i<yTrue.length;i++){
-    const y = yTrue[i]; const p = yProb[i]>=thr?1:0;
-    if(y===1 && p===1) tp++; else if(y===0 && p===0) tn++; else if(y===0 && p===1) fp++; else fn++;
-  }
-  const prec = tp+fp? tp/(tp+fp) : 0;
-  const rec = tp+fn? tp/(tp+fn) : 0;
-  const f1 = prec+rec? 2*prec*rec/(prec+rec) : 0;
-  return {tp,tn,fp,fn,prec,rec,f1};
-}
-
-function renderTable(el, matrix, headers){
-  const h = headers||['','Pred 1','Pred 0'];
-  el.innerHTML = `<thead><tr>${h.map(x=>`<th>${x}</th>`).join('')}</tr></thead>` +
-    `<tbody>${matrix.map(row=>`<tr>${row.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</tbody>`;
-}
-
-function drawRoc(el, points){
-  // simple canvas ROC
-  el.innerHTML = '';
-  const c = document.createElement('canvas'); c.width = el.clientWidth; c.height = el.clientHeight; el.appendChild(c);
-  const ctx = c.getContext('2d');
-  // axes
-  ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-  ctx.strokeRect(40,10,c.width-60,c.height-60);
-  // diagonal
-  ctx.beginPath(); ctx.moveTo(40,c.height-50); ctx.lineTo(c.width-20,20); ctx.stroke();
-  // curve
-  ctx.beginPath();
-  for(let i=0;i<points.length;i++){
-    const x = 40 + (c.width-60)*points[i][0];
-    const y = c.height-50 - (c.height-60)*points[i][1];
-    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-  }
-  ctx.lineWidth = 2; ctx.strokeStyle = '#9db3ff'; ctx.stroke();
-}
-
-/* ===================== Load CSVs ===================== */
-function normalizeRow(row){
-  const r={}; for(const [k,v] of Object.entries(row)){
-    const key = normalizeHeader(k);
-    let val = v; if(val==='') val = null; // keep nulls
-    r[key]=val;
-  } return r;
-}
-
-async function parseCSVFromInput(file){
+// Kaggle‑style CSV parser (comma + double‑quote)
+function parseWithPapa(file){
   return new Promise((resolve,reject)=>{
-    Papa.parse(file, {header:true, dynamicTyping:true, skipEmptyLines:'greedy',
-      delimiter: ',', quoteChar: '"',
-      complete: res => resolve(res.data.map(normalizeRow)), error: reject});
+    Papa.parse(file, { header:true, skipEmptyLines:'greedy', dynamicTyping:true, quoteChar:'"', delimiter:',', complete:r=>resolve(r.data), error:reject });
   });
 }
 
-function preview(rows, limit=6){
-  if(!rows.length){ els.previewTable.innerHTML=''; return; }
-  const cols = Object.keys(rows[0]);
-  const head = '<thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead>';
-  const body = '<tbody>'+rows.slice(0,limit).map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')+'</tbody>';
-  els.previewTable.innerHTML = head+body;
+function normalizeRow(row){
+  const out={};
+  for(const [k,v] of Object.entries(row)){
+    const key = canon(k);
+    let val = (v===''||v===undefined)? null : v;
+    // Map satisfaction words to 0/1
+    if(key==='satisfaction'){
+      const s = String(val).toLowerCase();
+      out[key] = (s.includes('satisfied') && !s.includes('neutral')) ? 1 : 0; // "neutral or dissatisfied" -> 0
+      continue;
+    }
+    out[key]=val;
+  }
+  return out;
 }
 
-els.btnLoad.onclick = async () => {
-  try{
-    const fT = els.trainFile.files[0];
-    if(!fT) return alert('Please choose train.csv');
-    const trainRows = await parseCSVFromInput(fT);
-    state.rawTrain = trainRows;
-    const fX = els.testFile.files[0];
-    if(fX){ state.rawTest = await parseCSVFromInput(fX); } else { state.rawTest=[]; }
-
-    state.headers = Object.keys(state.rawTrain[0]||{});
-    preview(state.rawTrain);
-
-    // rough missing %
-    const n = state.rawTrain.length; let miss=0, cells=0;
-    for(const r of state.rawTrain){ for(const k of Object.keys(r)){ cells++; if(r[k]==null) miss++; } }
-    els.shapeBadge.textContent = `Train rows: ${n.toLocaleString()} • Test rows: ${state.rawTest.length.toLocaleString()} • Missing%: ${(miss/Math.max(1,cells)*100).toFixed(1)}% • Repairs: —`;
-  }catch(e){ console.error(e); alert('Load failed.'); }
-};
-
-/* ===================== Preprocessing ===================== */
-const SERVICE_KEYS = [
+// feature sets
+const SERVICE_KEYS = new Set([
   'inflightwifiservice','departurearrivaltimeconvenient','easeofonlinebooking','gatelocation','foodanddrink','onlineboarding','seatcomfort','inflightentertainment','onboardservice','legroomservice','baggagehandling','checkinservice','cleanliness'
-];
+]);
 
-function buildFeatureConfig(rows, opts){
-  // Identify columns (robust to different capitalizations)
-  const col = (name, alt=[])=>{
-    const want = [name, ...alt].map(normalizeHeader);
-    for(const k of Object.keys(rows[0])){ if(want.includes(k)) return k; }
-    return null;
-  };
-  const cfg = {
-    target: col('satisfaction'),
-    id: col('id') || col('passengerid') || col('userid'),
-    num: [], cat: [],
-    ratings: SERVICE_KEYS.filter(k=>rows[0][k]!==undefined),
-    useCase: opts.useCase, excludeRatings: opts.excludeRatings,
-    addTotalDelay: opts.addTotalDelay,
-    cross: opts.cross
-  };
-  // Map target values -> 0/1 ("satisfied"|"neutral or dissatisfied")
-  // We'll convert later; keep column name here.
-
-  // Numeric base
-  const age = col('age'); if(age) cfg.num.push(age);
-  const flightDistance = col('flightdistance'); if(flightDistance) cfg.num.push(flightDistance);
-  const depDelay = col('departuredelayinminutes'); if(depDelay && opts.useCase!=='pre') cfg.num.push(depDelay);
-  const arrDelay = col('arrivaldelayinminutes'); if(arrDelay && opts.useCase!=='pre') cfg.num.push(arrDelay);
-
-  // Add TotalDelay if wanted and delays exist
-  if(opts.addTotalDelay && depDelay && arrDelay && opts.useCase!=='pre') cfg.num.push('TOTAL_DELAY');
-
-  // Ratings (0..5). Include unless excluded.
-  if(!opts.excludeRatings){ for(const k of cfg.ratings) cfg.num.push(k); }
-
-  // Categoricals (for wide)
-  const gender = col('gender'); if(gender) cfg.cat.push(gender);
-  const ctype = col('customertype'); if(ctype) cfg.cat.push(ctype);
-  const travel = col('typeoftravel'); if(travel) cfg.cat.push(travel);
-  const klass = col('class'); if(klass) cfg.cat.push(klass);
-
-  // Cross feature
-  cfg.crossPair = null;
-  if(opts.cross && travel && klass) cfg.crossPair = [travel, klass];
-
-  // One-hot fits
-  const catFits = {}; for(const c of cfg.cat){ catFits[c] = oneHotFit(rows.map(r=>r[c])); }
-  if(cfg.crossPair){
-    const key = 'CROSS';
-    const vals = rows.map(r=> `${r[cfg.crossPair[0]]}×${r[cfg.crossPair[1]]}`);
-    catFits[key] = oneHotFit(vals); cfg.crossKey = key;
-  }
-
-  cfg.catFits = catFits;
-
-  // Return and also compute deep/wide dims
-  cfg.deepDim = cfg.num.length; // numeric/rating features
-  let wideDim = 0; for(const c of Object.keys(catFits)) wideDim += catFits[c].dim;
-  cfg.wideDim = wideDim;
-  cfg.colName = {age, flightDistance, depDelay, arrDelay};
-  cfg.targetIsString = true;
-  cfg.idCol = cfg.id;
-  return cfg;
-}
-
-function prepareTensors(rows, cfg){
-  // Impute numerics and build arrays
-  const n = rows.length;
-  // Compute TOTAL_DELAY if needed
-  if(cfg.num.includes('TOTAL_DELAY')){
-    const dep = cfg.colName.depDelay; const arr = cfg.colName.arrDelay;
-    for(const r of rows){ const d = Number(r[dep]||0), a=Number(r[arr]||0); r.TOTAL_DELAY = Number.isFinite(d)&&Number.isFinite(a)? d+a : null; }
-  }
-
-  // Medians/modes for imputations
-  const med = {}; for(const k of cfg.num){ if(k==='TOTAL_DELAY'){
-      const col = rows.map(r=>r.TOTAL_DELAY==null? null : +r.TOTAL_DELAY);
-      med[k] = median(col) ?? 0;
-    } else {
-      const col = rows.map(r=> r[k]==null? null : +r[k]); med[k] = median(col) ?? 0;
-    }
-  }
-  const modes = {}; for(const c of cfg.cat){ modes[c] = mode(rows.map(r=> r[c])); }
-
-  // Z-score only for continuous (age, flightdistance, delays, total)
-  const contKeys = [];
-  for(const k of cfg.num){ if(SERVICE_KEYS.includes(k)) continue; contKeys.push(k); }
-  const stats = {}; for(const k of contKeys){ const col = rows.map(r=> (k==='TOTAL_DELAY'? r.TOTAL_DELAY : r[k])); stats[k] = zscore(col.map(v=> Number.isFinite(+v)? +v : null)); }
-
-  const wide = new Float32Array(n * cfg.wideDim);
-  const deep = new Float32Array(n * cfg.deepDim);
-  const y = new Int32Array(n);
-  const idArr = new Array(n);
-
-  const catKeys = Object.keys(cfg.catFits);
-  const offsets = {}; let off=0; for(const k of catKeys){ offsets[k]=off; off+=cfg.catFits[k].dim; }
-
-  for(let i=0;i<n;i++){
-    const r = rows[i];
-    // y
-    let yv = r[cfg.target];
-    if(typeof yv === 'string'){ const s = yv.toLowerCase(); yv = (s.indexOf('satisfied')!==-1)? 1 : 0; }
-    y[i] = Number(yv);
-    idArr[i] = r[cfg.idCol];
-
-    // wide
-    let wOff = i*cfg.wideDim;
-    for(const c of cfg.cat){
-      const fit = cfg.catFits[c]; const vec = oneHotTransform(fit, r[c] ?? modes[c]);
-      for(let j=0;j<vec.length;j++) wide[wOff + offsets[c] + j] = vec[j];
-    }
-    if(cfg.crossPair){
-      const fit = cfg.catFits[cfg.crossKey];
-      const val = `${r[cfg.crossPair[0]]??modes[cfg.crossPair[0]]}×${r[cfg.crossPair[1]]??modes[cfg.crossPair[1]]}`;
-      const vec = oneHotTransform(fit, val);
-      for(let j=0;j<vec.length;j++) wide[wOff + offsets[cfg.crossKey] + j] = vec[j];
-    }
-
-    // deep
-    let dOff = i*cfg.deepDim; let kidx=0;
-    for(const k of cfg.num){ let v;
-      if(k==='TOTAL_DELAY') v = r.TOTAL_DELAY; else v = r[k];
-      if(v==null || !Number.isFinite(+v)) v = med[k];
-      if(!SERVICE_KEYS.includes(k)){
-        const st = stats[k]; v = (v - st.mu) / (st.sd||1);
-      }
-      deep[dOff + (kidx++)] = +v;
-    }
-  }
-
-  return {wide, deep, y, ids: idArr, stats, offsets};
-}
-
-function preprocessMain(rows, opts){
-  const cfg = buildFeatureConfig(rows, opts);
-  const {trainIdx, valIdx} = stratifiedSplit(rows, cfg.target);
-  const trainRows = trainIdx.map(i=>rows[i]);
-  const valRows = valIdx.map(i=>rows[i]);
-  const tTrain = prepareTensors(trainRows, cfg);
-  const tVal = prepareTensors(valRows, cfg);
-  return {cfg, split: {trainIdx, valIdx}, tensors: {train:tTrain, val:tVal}};
-}
-
-els.btnPrep.onclick = () => {
-  if(!state.rawTrain.length) return alert('Load CSVs first');
-  const opts = {
-    useCase: els.useCase.value, cross: els.chkCross.checked,
-    addTotalDelay: els.chkTotalDelay.checked, excludeRatings: els.chkNoRatings.checked
-  };
-  const P = preprocessMain(state.rawTrain, opts);
-  state.featureConfig = P.cfg; state.tensors = P.tensors; state.passengerCol = P.cfg.idCol;
-  els.prepInfo.textContent = `Use case: ${opts.useCase==='pre'?'Pre-flight':'Post-flight'}\n`+
-    `Deep dim: ${P.cfg.deepDim} | Wide dim: ${P.cfg.wideDim}\n`+
-    `Train: wide ${P.tensors.train.wide.length/P.cfg.wideDim},${P.cfg.wideDim} / deep ${P.tensors.train.deep.length/P.cfg.deepDim},${P.cfg.deepDim}\n`+
-    `Val:   wide ${P.tensors.val.wide.length/P.cfg.wideDim},${P.cfg.wideDim} / deep ${P.tensors.val.deep.length/P.cfg.deepDim},${P.cfg.deepDim}\n`+
-    `Impute: medians (numeric), modes (categorical)\nRatings included: ${opts.excludeRatings? 'NO (strict pre-flight)': 'YES'}`;
+// Some datasets include delay cols with spacing variants
+const DELAY_KEYS = {
+  dep: new Set(['departuredelayinminutes','departuredelay','departuredelaymin','departuredelaymins']),
+  arr: new Set(['arrivaldelayinminutes','arrivaldelay','arrivaldelaymin','arrivaldelaymins'])
 };
 
-/* ===================== Model ===================== */
-function buildWideDeep(cfg){
-  const wideIn = tf.input({shape:[cfg.wideDim], name:'wide'});
-  const deepIn = tf.input({shape:[cfg.deepDim], name:'deep'});
+// Show preview table (first 5 rows)
+function renderPreview(rows){
+  if(!rows.length){ d.preview.innerHTML=''; return; }
+  const cols = Object.keys(rows[0]);
+  const head = '<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
+  const body = rows.slice(0,8).map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('');
+  d.preview.innerHTML = `<div style="overflow:auto"><table>${head}${body}</table></div>`;
+}
 
-  const d1 = tf.layers.dense({units:32, activation:'relu'}).apply(deepIn);
-  const do1 = tf.layers.dropout({rate:0.15}).apply(d1);
-  const d2 = tf.layers.dense({units:8, activation:'relu'}).apply(do1);
-  const deepLogit = tf.layers.dense({units:1, activation:'linear'}).apply(d2);
+// ---------- Load CSVs ----------
+async function loadFiles(){
+  d.loadStatus.innerHTML = '<span class="dot busy"></span> Loading…';
+  try{
+    const tfile = d.trainFile.files[0];
+    if(!tfile) { alert('Please choose train.csv'); return; }
+    state.rawTrain = (await parseWithPapa(tfile)).map(normalizeRow);
+    if(d.testFile.files[0]) state.rawTest = (await parseWithPapa(d.testFile.files[0])).map(normalizeRow); else state.rawTest=[];
 
-  const wideLogit = tf.layers.dense({units:1, activation:'linear'}).apply(wideIn);
-  const add = tf.layers.add().apply([deepLogit, wideLogit]);
+    // simple missingness
+    const n=state.rawTrain.length, cols=Object.keys(state.rawTrain[0]||{});
+    const missPct = cols.length? mean(cols.map(c=> state.rawTrain.reduce((m,r)=>m+((r[c]==null)?1:0),0)/n )) : 0;
+
+    d.kTrain.textContent=String(n);
+    d.kTest.textContent=String(state.rawTest.length);
+    d.kMiss.textContent=pct(missPct)+'%';
+    d.kRep.textContent='—';
+
+    // show preview with original headers for sanity
+    const rawPreview = (await new Promise((resolve)=>{
+      Papa.parse(tfile, {header:true, preview:8, complete:r=>resolve(r.data)});
+    }));
+    renderPreview(rawPreview);
+
+    d.loadStatus.innerHTML = '<span class="dot ok"></span> Loaded';
+  }catch(err){
+    console.error(err); alert('Load failed: '+err);
+    d.loadStatus.innerHTML = '<span class="dot idle"></span> Idle';
+  }
+}
+
+// ---------- Preprocess ----------
+function buildSchema(rows){
+  const cols=Object.keys(rows[0]||{});
+  const S={ cols, cats:[], nums:[], ratings:[], depDelay:null, arrDelay:null,
+    has:k=>cols.includes(k)
+  };
+  for(const c of cols){
+    if(SERVICE_KEYS.has(c)) { S.ratings.push(c); continue; }
+    if(DELAY_KEYS.dep.has(c)) S.depDelay=c; else if(DELAY_KEYS.arr.has(c)) S.arrDelay=c; else {
+      // simple heuristic: numeric if value looks number-ish
+      const v = rows.find(r=>r[c]!=null)?.[c];
+      const isNum = typeof v==='number' || /^\d+(\.\d+)?$/.test(String(v||''));
+      // label column
+      if(c==='satisfaction') continue;
+      // id column
+      if(['id','passengerid','index'].includes(c)) continue;
+      // key categoricals
+      if(['gender','customertype','typeoftravel','class'].includes(c)) S.cats.push(c);
+      else if(isNum) S.nums.push(c); else S.cats.push(c);
+    }
+  }
+  return S;
+}
+
+function imputeAndEncode(trainRows, testRows, opts){
+  // opts: {useCase:'pre'|'post', cross:boolean, totalDelay:boolean, dropRatings:boolean, fast:boolean}
+  const S = buildSchema(trainRows);
+  const dropRatings = !!opts.dropRatings;
+  const usePre = opts.useCase==='pre';
+
+  // Choose feature lists
+  const cats = [...S.cats];
+  const ratings = dropRatings? [] : [...S.ratings];
+  const nums = [...S.nums];
+  // Manage delays
+  const dep = S.depDelay; const arr = usePre? null : S.arrDelay; // exclude arrival delay for pre‑flight
+  if(dep && !nums.includes(dep)) nums.push(dep);
+  if(arr && !nums.includes(arr)) nums.push(arr);
+
+  // Engineered features
+  const engineered = [];
+  const haveDep = !!dep, haveArr = !!arr;
+  if(opts.totalDelay && haveDep){ engineered.push('totaldelay'); }
+  if(opts.cross){ engineered.push('cross_classtype'); }
+
+  // Impute medians for numerics
+  const med = {};
+  const trainNums = trainRows.map(r=>({ ...r, totaldelay: (haveDep? +r[dep]||0:0) + (haveArr? +r[arr]||0:0) }));
+  for(const c of nums){ const arrv = trainRows.map(r=> r[c]!=null? +r[c] : null).filter(v=>v!=null); med[c] = median(arrv) ?? 0; }
+  if(opts.totalDelay && haveDep){ const arrv = trainNums.map(r=> +r.totaldelay ); med['totaldelay']=median(arrv)??0; }
+
+  // Mode for categoricals (including ratings – they are ordinal 0..5 but treat as num later)
+  const mode = {};
+  for(const c of cats){ const counts={}; for(const r of trainRows){ const v=r[c]; if(v==null) continue; counts[v]=(counts[v]||0)+1; } mode[c]=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? null; }
+  for(const c of ratings){ const counts={}; for(const r of trainRows){ const v=r[c]; if(v==null) continue; counts[v]=(counts[v]||0)+1; } mode[c]=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? 3; }
+
+  // Vocab for categoricals (fit on train)
+  const voc = {}; for(const c of cats){ voc[c] = Array.from(new Set(trainRows.map(r=>r[c]).filter(v=>v!=null))).slice(0,50); }
+  if(opts.cross){
+    voc['cross_classtype'] = Array.from(new Set(trainRows.map(r=> `${r['class']||'?' }__${r['typeoftravel']||'?'}` )));
+  }
+
+  const allNum = [...nums, ...(opts.totalDelay && haveDep? ['totaldelay']:[]) , ...ratings ];
+
+  // Standardize numerics on train
+  const mu={}, sigma={};
+  for(const c of allNum){ const xs=trainRows.map(r=> (c==='totaldelay'? ((+r[dep]||0)+(+r[arr]||0)) : (+r[c] ?? NaN)) ).filter(v=>!Number.isNaN(v)); const m=mean(xs); const s=Math.sqrt(mean(xs.map(v=>(v-m)*(v-m)))||1e-8) || 1; mu[c]=m; sigma[c]=s; }
+
+  // Row -> feature vectors
+  function rowToFeatures(r){
+    // numeric part (deep)
+    const deep = [];
+    for(const c of allNum){
+      let v; if(c==='totaldelay'){ v=(+r[dep]||0)+(+r[arr]||0); if(!haveArr) v=(+r[dep]||0); }
+      else { v = r[c]; if(v==null) v = med[c]; }
+      if(v==null) v = med[c]??0;
+      const z = ( ( +v ) - mu[c]) / (sigma[c]||1);
+      deep.push( Number.isFinite(z)? z : 0 );
+    }
+    // categorical one‑hots (wide)
+    const wide = [];
+    for(const c of cats){ const vocab=voc[c]; const v=r[c]??mode[c]; for(const t of vocab){ wide.push( v===t ? 1:0 ); } }
+    if(opts.cross){ const v = `${r['class']||'?' }__${r['typeoftravel']||'?'}`; const vocab=voc['cross_classtype']; for(const t of vocab){ wide.push(v===t?1:0); } }
+    return {deep, wide};
+  }
+
+  // Assemble X/Y for train, plus a stratified split
+  const labeled = trainRows.map(r=> ({ y:+r['satisfaction'], ...rowToFeatures(r) }));
+  // shuffle but preserve class balance
+  const pos = labeled.filter(x=>x.y===1), neg=labeled.filter(x=>x.y===0);
+  const rate = 0.2; // 80/20 split
+  const valP = Math.floor(pos.length*rate), valN=Math.floor(neg.length*rate);
+  const trainArr = pos.slice(valP).concat(neg.slice(valN));
+  const valArr = pos.slice(0,valP).concat(neg.slice(0,valN));
+
+  // Optional FAST subset for speed
+  if(state.fast){
+    const capTrain = 60000; const capVal = 20000;
+    shuffleInPlace(trainArr); shuffleInPlace(valArr);
+    trainArr.splice(capTrain);
+    valArr.splice(capVal);
+  }
+
+  const Xw = tf.tensor2d(trainArr.flatMap(o=>o.wide), [trainArr.length, trainArr[0].wide.length], 'float32');
+  const Xd = tf.tensor2d(trainArr.flatMap(o=>o.deep), [trainArr.length, trainArr[0].deep.length], 'float32');
+  const Y  = tf.tensor2d(trainArr.map(o=>[o.y]), [trainArr.length,1], 'float32');
+
+  const XwV = tf.tensor2d(valArr.flatMap(o=>o.wide), [valArr.length, valArr[0].wide.length], 'float32');
+  const XdV = tf.tensor2d(valArr.flatMap(o=>o.deep), [valArr.length, valArr[0].deep.length], 'float32');
+  const YV  = tf.tensor2d(valArr.map(o=>[o.y]), [valArr.length,1], 'float32');
+
+  const test = (state.rawTest.length? state.rawTest : []).map(r=>rowToFeatures(r));
+  const XtW = test.length? tf.tensor2d(test.flatMap(o=>o.wide), [test.length, test[0].wide.length], 'float32') : null;
+  const XtD = test.length? tf.tensor2d(test.flatMap(o=>o.deep), [test.length, test[0].deep.length], 'float32') : null;
+
+  return {
+    info: {
+      wideLen: trainArr[0].wide.length, deepLen: trainArr[0].deep.length,
+      wideTrain: [trainArr.length, trainArr[0].wide.length], deepTrain: [trainArr.length, trainArr[0].deep.length],
+      wideVal: [valArr.length, valArr[0].wide.length], deepVal: [valArr.length, valArr[0].deep.length],
+      engineered, ratings: ratings.slice(), dropRatings, usePre, dep, arr
+    },
+    tensors: { Xw, Xd, Y, XwV, XdV, YV, XtW, XtD },
+    helpers: { rowToFeatures }
+  };
+}
+
+function shuffleInPlace(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } }
+
+// ---------- Model ----------
+function buildModel(info){
+  const deepIn = tf.input({shape:[info.deepLen], name:'deep'});
+  let x = tf.layers.dense({units:32, activation:'relu'}).apply(deepIn);
+  x = tf.layers.dropout({rate:0.1}).apply(x);
+  x = tf.layers.dense({units:8, activation:'relu'}).apply(x);
+
+  const wideIn = tf.input({shape:[info.wideLen], name:'wide'});
+  const wideLogit = tf.layers.dense({units:1, useBias:true}).apply(wideIn);
+  const deepLogit = tf.layers.dense({units:1, useBias:true}).apply(x);
+  const add = tf.layers.add().apply([wideLogit, deepLogit]);
   const out = tf.layers.activation({activation:'sigmoid', name:'out'}).apply(add);
+  const model = tf.model({inputs:[deepIn, wideIn], outputs:out});
 
-  const model = tf.model({inputs:[wideIn, deepIn], outputs: out});
-  model.compile({optimizer: tf.train.adam(0.001), loss:'binaryCrossentropy', metrics:['accuracy']});
+  const lr = state.fast? 0.004 : 0.001;
+  model.compile({optimizer: tf.train.adam(lr), loss:'binaryCrossentropy', metrics:['accuracy']});
   return model;
 }
 
-els.btnBuild.onclick = () => {
-  if(!state.tensors) return alert('Run preprocessing first');
-  if(state.model) state.model.dispose();
-  state.model = buildWideDeep(state.featureConfig);
-  els.modelSummary.textContent = 'Model built.';
-};
-
-els.btnSummary.onclick = () => {
-  if(!state.model) return alert('Build the model first');
-  let txt = '';
-  state.model.summary(80, undefined, (line)=>{ txt += line + '\n'; });
-  els.modelSummary.textContent = txt;
-};
-
-/* ===================== Train ===================== */
-function makeDataset(t){
-  const train = { wide: tf.tensor2d(t.train.wide, [t.train.wide.length/state.featureConfig.wideDim, state.featureConfig.wideDim]),
-                  deep: tf.tensor2d(t.train.deep, [t.train.deep.length/state.featureConfig.deepDim, state.featureConfig.deepDim]),
-                  y: tf.tensor2d(Array.from(t.train.y), [t.train.y.length,1]) };
-  const val = { wide: tf.tensor2d(t.val.wide, [t.val.wide.length/state.featureConfig.wideDim, state.featureConfig.wideDim]),
-                deep: tf.tensor2d(t.val.deep, [t.val.deep.length/state.featureConfig.deepDim, state.featureConfig.deepDim]),
-                y: tf.tensor2d(Array.from(t.val.y), [t.val.y.length,1]) };
-  return {train,val};
+function modelSummaryText(model){
+  let txt=''; model.summary(80, undefined, x=>txt+=x+'\n'); return txt;
 }
 
-async function trainOnce(epochs=25, batch=256){
-  if(!state.model || !state.tensors) return alert('Build model and preprocess first');
-  if(state.isTraining) return alert('Another training is running');
-  const {train,val} = makeDataset(state.tensors);
-  state.isTraining=true; state.stop=false; els.trainStatus.textContent='● Training…'; els.trainLog.textContent='';
-  const cb = new tf.CustomCallback({
-    onEpochEnd: async (epoch, logs)=>{
-      els.trainLog.textContent += `epoch ${pad(epoch)}: loss=${logs.loss.toFixed(4)} val_loss=${logs.val_loss.toFixed(4)} acc=${(logs.acc??logs.accuracy??0).toFixed(4)}
-`;
-      await tf.nextFrame();
-    }
-  });
+// ---------- Training & Metrics ----------
+function aucRoc(yTrue, yProb){
+  // yTrue: Float32Array(0/1), yProb: Float32Array
+  const pairs = Array.from(yProb).map((p,i)=>({p,y:+yTrue[i]}));
+  pairs.sort((a,b)=> b.p-a.p );
+  let tp=0, fp=0; const P=sum(pairs.map(o=>o.y)), N=pairs.length-P;
+  const tpr=[0], fpr=[0]; let lastP=Infinity;
+  for(const o of pairs){ if(o.p!==lastP){ tpr.push(tp/P); fpr.push(fp/N); lastP=o.p; } if(o.y===1) tp++; else fp++; }
+  tpr.push(1); fpr.push(1);
+  // trapezoidal AUC
+  let auc=0; for(let i=1;i<fpr.length;i++){ const dx=fpr[i]-fpr[i-1]; const y=(tpr[i]+tpr[i-1])/2; auc+=dx*y; }
+  return {tpr, fpr, auc};
+}
+
+function drawRoc(canvas, roc){
+  const ctx = canvas.getContext('2d'); const w=canvas.width, h=canvas.height; ctx.clearRect(0,0,w,h);
+  ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.fillRect(0,0,w,h);
+  // axes
+  ctx.strokeStyle='rgba(200,200,220,.5)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(40,h-30); ctx.lineTo(w-20,h-30); ctx.lineTo(w-20,20); ctx.stroke();
+  // diagonal
+  ctx.strokeStyle='rgba(200,200,220,.35)'; ctx.beginPath(); ctx.moveTo(40,h-30); ctx.lineTo(w-20,20); ctx.stroke();
+  if(!roc) return;
+  ctx.strokeStyle='rgba(138,163,255,1)'; ctx.lineWidth=2; ctx.beginPath();
+  for(let i=0;i<roc.fpr.length;i++){
+    const x=40 + (w-60)*roc.fpr[i]; const y=h-30 - (h-50)*roc.tpr[i]; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+}
+
+function confusionMetrics(yTrue, yProb, thr){
+  let tp=0,fp=0,tn=0,fn=0; for(let i=0;i<yProb.length;i++){ const p=yProb[i]; const y=+yTrue[i]; const pred=p>=thr?1:0; if(pred===1&&y===1) tp++; else if(pred===1&&y===0) fp++; else if(pred===0&&y===0) tn++; else fn++; }
+  const prec = tp+fp ? tp/(tp+fp):0, rec = tp+fn? tp/(tp+fn):0; const f1 = (prec+rec)? 2*prec*rec/(prec+rec):0;
+  return {tp,fp,tn,fn,prec,rec,f1};
+}
+
+async function trainOnce(prepped, {epochs, batchSize}){
+  state.training=true; d.trainStatus.innerHTML='<span class="dot busy"></span> Training…';
+  const {Xw, Xd, Y, XwV, XdV, YV} = prepped.tensors;
+  const model = buildModel(prepped.info);
+  const es = tf.callbacks.earlyStopping({monitor:'val_loss', patience: state.fast? 2:3, restoreBestWeights:true});
+  const history = await model.fit([Xd, Xw], Y, {
+    epochs, batchSize, shuffle:true, validationData:[[XdV,XwV], YV], callbacks:[es, {
+      onEpochEnd: async (e, logs)=>{ d.log.textContent += `epoch ${e+1}: loss=${logs.loss.toFixed(4)} val_loss=${logs.val_loss.toFixed(4)} acc=${logs.acc?.toFixed(4)}\n`; await sleep(0); }
+    }] });
+
+  // validation probs for ROC
+  const valProbsT = model.predict([XdV, XwV]);
+  const valProbs = (await valProbsT.data()).slice(); valProbsT.dispose();
+  const yv = (await YV.data()).slice();
+  const roc = aucRoc(yv, valProbs);
+  return {model, roc, valProbs, valY: yv};
+}
+
+function updateMetricsView(){
+  if(!state.roc) return;
+  drawRoc(d.roc, state.roc);
+  d.aucNow.textContent = state.roc? state.roc.auc.toFixed(4) : '—';
+  d.aucPrev.textContent = (state.lastAUC!=null)? state.lastAUC.toFixed(4) : '—';
+  const thr = +d.thr.value; const m = confusionMetrics(state.valY, state.valProbs, thr);
+  d.tp.textContent=m.tp; d.fp.textContent=m.fp; d.tn.textContent=m.tn; d.fn.textContent=m.fn;
+  d.prec.textContent=(pct(m.prec)+'%'); d.rec.textContent=(pct(m.rec)+'%'); d.f1.textContent=m.f1.toFixed(3);
+}
+
+// ---------- Events ----------
+
+d.btnLoad.onclick = loadFiles;
+
+d.btnPrep.onclick = async ()=>{
   try{
-    await state.model.fit([train.wide, train.deep], train.y, {
-      epochs, batchSize: batch, validationData: [[val.wide, val.deep], val.y], callbacks:[cb]
-    });
-  }finally{
-    train.wide.dispose(); train.deep.dispose(); train.y.dispose(); val.wide.dispose(); val.deep.dispose(); val.y.dispose();
-    state.isTraining=false; els.trainStatus.textContent='● Idle';
-  }
-  await evaluateCurrent();
-}
+    if(!state.rawTrain.length) return alert('Load CSVs first');
+    state.fast = d.fastMode.checked;
+    const opts = { useCase: d.useCase.value, cross:d.featCross.checked, totalDelay:d.featTotalDelay.checked, dropRatings:d.dropRatings.checked };
+    d.prepInfo.textContent = 'Running…';
+    state.prepped = imputeAndEncode(state.rawTrain, state.rawTest, opts);
+    const inf=state.prepped.info; const lines=[
+      `Use case: ${opts.useCase==='pre'?'Pre-flight (ArrivalDelay excluded)':'Post-flight (ArrivalDelay included)'}`,
+      `Wide len: ${inf.wideLen} | Deep len: ${inf.deepLen}`,
+      `Train: wide ${inf.wideTrain.join(',')} / deep ${inf.deepTrain.join(',')} | Val: wide ${inf.wideVal.join(',')} / deep ${inf.deepVal.join(',')}`,
+      `Impute: medians for numerics; modes for categoricals`,
+      `Engineered: Cross=${d.featCross.checked}, TotalDelay=${d.featTotalDelay.checked}`,
+      `Ratings dropped: ${inf.dropRatings}`
+    ];
+    d.prepInfo.textContent = lines.join('\n');
+  }catch(e){ console.error(e); alert('Preprocessing failed: '+e.message); }
+};
 
-els.btnTrain.onclick = ()=> trainOnce(25, 512);
-els.btnEarly.onclick = ()=>{ state.stop=true; };
 
-/* ===================== Metrics + ROC ===================== */
-function rocPoints(yTrue, yScore){
-  // compute ROC points across thresholds
-  const pairs = []; for(let i=0;i<yTrue.length;i++) pairs.push([yScore[i], yTrue[i]]);
-  pairs.sort((a,b)=>b[0]-a[0]);
-  let tp=0, fp=0; const P = yTrue.reduce((s,v)=>s+(v===1?1:0),0); const N = yTrue.length-P;
-  const pts=[[0,0]]; let last=-Infinity;
-  for(const [s,y] of pairs){ if(s!==last){ pts.push([fp/N, tp/P]); last=s; } if(y===1) tp++; else fp++; }
-  pts.push([1,1]);
-  return pts;
-}
+d.btnBuild.onclick = ()=>{
+  if(!state.prepped) return alert('Run preprocessing first');
+  if(state.model) { state.model.dispose(); state.model=null; }
+  state.model = buildModel(state.prepped.info);
+  d.modelSummary.textContent = 'Model built.';
+};
 
-function updateThreshold(th){
-  if(!state.lastValProbs) return; const thr = clamp01(th);
-  els.thVal.textContent = thr.toFixed(2);
-  const M = confusion(state.lastValY, state.lastValProbs, thr);
-  els.prec.textContent = (M.prec*100).toFixed(2)+'%';
-  els.rec.textContent = (M.rec*100).toFixed(2)+'%';
-  els.f1.textContent = M.f1.toFixed(3);
-  renderTable(els.cmLeft, [[M.tp, M.fn],[M.fp, M.tn]], ['','Pred 1','Pred 0']);
-}
+d.btnSummary.onclick = ()=>{
+  if(!state.model) return alert('Build model first');
+  d.modelSummary.textContent = modelSummaryText(state.model);
+};
 
-async function evaluateCurrent(){
-  // create tensors for val only and get probs
-  const t = state.tensors.val; const cfg=state.featureConfig;
-  const Xw = tf.tensor2d(t.wide, [t.wide.length/cfg.wideDim, cfg.wideDim]);
-  const Xd = tf.tensor2d(t.deep, [t.deep.length/cfg.deepDim, cfg.deepDim]);
-  const probs = await state.model.predict([Xw,Xd]).data();
-  Xw.dispose(); Xd.dispose();
-  state.lastValProbs = Float32Array.from(probs);
-  state.lastValY = Int32Array.from(t.y);
-  const auc = aucRoc(state.lastValY, state.lastValProbs);
-  state.lastAUC = auc; els.aucPrimary.textContent = auc.toFixed(4);
-  drawRoc(els.rocCanvas, rocPoints(state.lastValY, state.lastValProbs));
-  updateThreshold(parseFloat(els.thSlider.value||'0.5'));
-}
+let stopFlag=false; d.btnEarly.onclick = ()=>{ stopFlag=true; };
 
-els.thSlider.oninput = (e)=> updateThreshold(parseFloat(e.target.value));
+d.btnTrain.onclick = async ()=>{
+  try{
+    if(state.training) return alert('A training run is already in progress.');
+    if(!state.prepped) return alert('Preprocess first');
+    if(!state.model) state.model = buildModel(state.prepped.info);
+    d.log.textContent=''; stopFlag=false; state.fast=d.fastMode.checked;
+    const epochs = state.fast? 12: 25; const batchSize = state.fast? 128: 64;
+    const {model, roc, valProbs, valY} = await trainOnce(state.prepped, {epochs, batchSize});
+    if(state.model) state.model.dispose(); state.model=model;
+    state.lastAUC = state.roc?.auc ?? null;
+    state.roc=roc; state.valProbs=valProbs; state.valY=valY; updateMetricsView();
+    d.trainStatus.innerHTML = '<span class="dot ok"></span> Done';
+    state.training=false;
+  }catch(e){ console.error(e); state.training=false; d.trainStatus.innerHTML='<span class="dot idle"></span> Idle'; alert('Training failed: '+e.message); }
+};
 
-/* ===================== Compare AUCs (strict pre-flight) ===================== */
-async function compareStrictAUC(){
-  if(!state.rawTrain.length) return alert('Load CSVs first');
-  els.aucStrict.textContent = '…';
-  // Preprocess with strict options
-  const opts = {useCase: 'pre', cross: els.chkCross.checked, addTotalDelay: false, excludeRatings: true};
-  const P = preprocessMain(state.rawTrain, opts);
+d.thr.oninput = ()=> updateMetricsView();
 
-  // Quick small model and brief training
-  const model = buildWideDeep(P.cfg);
-  const train = { wide: tf.tensor2d(P.tensors.train.wide, [P.tensors.train.wide.length/P.cfg.wideDim, P.cfg.wideDim]),
-                  deep: tf.tensor2d(P.tensors.train.deep, [P.tensors.train.deep.length/P.cfg.deepDim, P.cfg.deepDim]),
-                  y: tf.tensor2d(Array.from(P.tensors.train.y), [P.tensors.train.y.length,1]) };
-  const val = { wide: tf.tensor2d(P.tensors.val.wide, [P.tensors.val.wide.length/P.cfg.wideDim, P.cfg.wideDim]),
-                deep: tf.tensor2d(P.tensors.val.deep, [P.tensors.val.deep.length/P.cfg.deepDim, P.cfg.deepDim]),
-                y: tf.tensor2d(Array.from(P.tensors.val.y), [P.tensors.val.y.length,1]) };
-  await model.fit([train.wide, train.deep], train.y, {epochs: 10, batchSize: 512, validationData: [[val.wide,val.deep], val.y], verbose:0});
-  const probs = await model.predict([val.wide, val.deep]).data();
-  const auc = aucRoc(Array.from(P.tensors.val.y), Array.from(probs));
-  els.aucStrict.textContent = auc.toFixed(4);
-  model.dispose(); train.wide.dispose(); train.deep.dispose(); train.y.dispose(); val.wide.dispose(); val.deep.dispose(); val.y.dispose();
-}
+// Quick compare: tiny fast models for pre vs post, show both AUCs side‑by‑side
 
-els.btnCompare.onclick = ()=> compareStrictAUC();
+d.btnCompare.onclick = async ()=>{
+  try{
+    if(state.training) return alert('Wait for current training to finish.');
+    if(!state.rawTrain.length) return alert('Load CSVs first');
+    d.aucPre.textContent='…'; d.aucPost.textContent='…';
+    const base = { cross:d.featCross.checked, totalDelay:d.featTotalDelay.checked, dropRatings:d.dropRatings.checked };
+    state.fast=true; // force fast
+    const tiny = {epochs:6, batchSize:128};
 
-/* ===================== Predict & Export ===================== */
-async function predictTest(){
-  if(!state.model) return alert('Train a model first');
-  if(!state.rawTest.length) return alert('Load test.csv');
-  // Build features for test using current cfg
-  const cfg = state.featureConfig; const rows = state.rawTest.map(r=>({...r}));
-  // we only have features; no target in test; we mirror prepareTensors (val path) but without y
-  if(cfg.num.includes('TOTAL_DELAY')){
-    const dep = cfg.colName.depDelay; const arr = cfg.colName.arrDelay;
-    for(const r of rows){ const d=Number(r[dep]||0), a=Number(r[arr]||0); r.TOTAL_DELAY = Number.isFinite(d)&&Number.isFinite(a)? d+a : null; }
-  }
-  // Imputations
-  // compute medians/modes from TRAIN tensors not stored; recompute on full rawTrain for simplicity
-  const med = {}; for(const k of cfg.num){ const col = state.rawTrain.map(rr=> (k==='TOTAL_DELAY'? ( (rr[cfg.colName.depDelay]||0) + (rr[cfg.colName.arrDelay]||0) ) : rr[k] )); med[k]=median(col.map(v=>Number.isFinite(+v)?+v:null)) ?? 0; }
-  const modes = {}; for(const c of cfg.cat){ modes[c]=mode(state.rawTrain.map(rr=> rr[c])); }
-  const cont = cfg.num.filter(k=> !SERVICE_KEYS.includes(k));
-  const stats = {}; for(const k of cont){ const col = state.rawTrain.map(rr=> (k==='TOTAL_DELAY'? ((rr[cfg.colName.depDelay]||0)+(rr[cfg.colName.arrDelay]||0)) : rr[k] )); const xs=col.map(v=>Number.isFinite(+v)?+v:null); const st=zscore(xs); stats[k]=st; }
+    // POST
+    const post = imputeAndEncode(state.rawTrain, state.rawTest, {...base, useCase:'post'});
+    const rPost = await trainOnce(post, tiny); rPost.model.dispose();
+    d.aucPost.textContent = rPost.roc.auc.toFixed(4);
 
-  const n = rows.length; const wide = new Float32Array(n*cfg.wideDim); const deep = new Float32Array(n*cfg.deepDim); const ids=new Array(n);
-  const offsets={}; let off=0; for(const k of Object.keys(cfg.catFits)){ offsets[k]=off; off+=cfg.catFits[k].dim; }
-  for(let i=0;i<n;i++){
-    const r=rows[i]; ids[i]=r[cfg.idCol]; let wOff=i*cfg.wideDim; let dOff=i*cfg.deepDim; let kidx=0;
-    for(const c of cfg.cat){ const vec=oneHotTransform(cfg.catFits[c], r[c]??modes[c]); for(let j=0;j<vec.length;j++) wide[wOff + offsets[c] + j] = vec[j]; }
-    if(cfg.crossPair){ const val=`${r[cfg.crossPair[0]]??modes[cfg.crossPair[0]]}×${r[cfg.crossPair[1]]??modes[cfg.crossPair[1]]}`; const vec=oneHotTransform(cfg.catFits[cfg.crossKey], val); for(let j=0;j<vec.length;j++) wide[wOff + offsets[cfg.crossKey] + j] = vec[j]; }
-    for(const k of cfg.num){ let v = (k==='TOTAL_DELAY'? ( (r[cfg.colName.depDelay]||0)+(r[cfg.colName.arrDelay]||0) ): r[k]); if(v==null||!Number.isFinite(+v)) v=med[k]; if(!SERVICE_KEYS.includes(k)){ const st=stats[k]; v=(v-st.mu)/(st.sd||1);} deep[dOff+(kidx++)]=+v; }
-  }
-  const Xw=tf.tensor2d(wide,[n,cfg.wideDim]); const Xd=tf.tensor2d(deep,[n,cfg.deepDim]); const probs=await state.model.predict([Xw,Xd]).data(); Xw.dispose(); Xd.dispose();
-  state.testProbs = Array.from(probs); state.testIds = ids;
-  els.predictInfo.textContent = `Predicted probabilities for ${n.toLocaleString()} rows.`;
-}
+    // PRE (arrival delay excluded + optional ratings dropped)
+    const pre = imputeAndEncode(state.rawTrain, state.rawTest, {...base, useCase:'pre'});
+    const rPre = await trainOnce(pre, tiny); rPre.model.dispose();
+    d.aucPre.textContent = rPre.roc.auc.toFixed(4);
 
-function downloadCsv(name, rows){
-  if(!rows.length) return;
-  const cols = Object.keys(rows[0]);
-  const esc = v=>{ if(v==null) return ''; const s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; };
-  const csv = [cols.join(',')].concat(rows.map(r=> cols.map(c=>esc(r[c])).join(','))).join('\n');
-  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
-}
+    // restore fast toggle
+    state.fast = d.fastMode.checked;
+  }catch(e){ console.error(e); alert('Quick compare failed: '+e.message); }
+};
 
-els.btnPredict.onclick = ()=> predictTest();
-els.btnSub.onclick = ()=>{
-  if(!state.testProbs) return alert('Run Predict first');
-  const thr = parseFloat(els.thSlider.value||'0.5');
-  const rows = state.testIds.map((id,i)=> ({PassengerId: id, satisfaction: state.testProbs[i]>=thr?1:0}));
+// ---------- Predict & Export ----------
+
+d.btnPredict.onclick = async ()=>{
+  try{
+    if(!state.model || !state.prepped) return alert('Train a model first');
+    const {XtD, XtW} = state.prepped.tensors; if(!XtD || !XtW){ d.predInfo.textContent='No test.csv loaded.'; return; }
+    const probsT = state.model.predict([XtD, XtW]);
+    const probs = Array.from(await probsT.data()); probsT.dispose();
+    state.testProbs = probs; d.predInfo.textContent = `Predicted ${probs.length} rows.`;
+  }catch(e){ console.error(e); alert('Predict failed: '+e.message); }
+};
+
+function requireProbs(){ if(!state.testProbs){ alert('Run Predict first'); return false;} return true; }
+
+d.btnSub.onclick = ()=>{
+  if(!requireProbs()) return;
+  // Find a passenger id like column in test
+  const keys = Object.keys(state.rawTest[0]||{});
+  const pid = keys.find(k=> ['id','passengerid','index'].includes(k) ) || keys[0];
+  const thr = +d.thr.value; const rows = state.rawTest.map((r,i)=> ({ PassengerId: r[pid], satisfaction: (state.testProbs[i]>=thr?1:0) }));
   downloadCsv('submission.csv', rows);
 };
-els.btnProbs.onclick = ()=>{
-  if(!state.testProbs) return alert('Run Predict first');
-  const rows = state.testIds.map((id,i)=> ({PassengerId: id, probability: state.testProbs[i]}));
+
+d.btnProb.onclick = ()=>{
+  if(!requireProbs()) return;
+  const keys = Object.keys(state.rawTest[0]||{}); const pid = keys.find(k=> ['id','passengerid','index'].includes(k) ) || keys[0];
+  const rows = state.rawTest.map((r,i)=> ({ PassengerId: r[pid], prob: state.testProbs[i] }));
   downloadCsv('probabilities.csv', rows);
 };
-els.btnSave.onclick = async ()=>{
-  if(!state.model) return alert('No model');
-  await state.model.save('downloads://airline-wide-deep');
+
+d.btnSave.onclick = async ()=>{
+  try{
+    if(!state.model) return alert('Train a model first');
+    await state.model.save('downloads://airline-wide-deep-tfjs');
+  }catch(e){ alert('Save failed: '+e.message); }
 };
 
-// Init
-els.thSlider.value = 0.5; els.thVal.textContent = '0.50';
+// helpers for status pill
+function setTrainStatus(kind){ d.trainStatus.innerHTML = kind==='ok'? '<span class="dot ok"></span> Done' : kind==='busy'? '<span class="dot busy"></span> Working…' : '<span class="dot idle"></span> Idle'; }
