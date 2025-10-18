@@ -7,6 +7,10 @@
   <link rel="preconnect" href="https://cdn.jsdelivr.net"/>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4"></script>
+  <script>
+    // lock to CPU backend to avoid mobile GPU hangs
+    (async()=>{ try{ await tf.setBackend('cpu'); }catch(e){} await tf.ready(); })();
+  </script>
   <style>
     :root{ --bg:#0b0f17; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3; --border:rgba(255,255,255,.12); --glass:rgba(255,255,255,.06); }
     *{box-sizing:border-box}
