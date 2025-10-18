@@ -1,7 +1,9 @@
 /* =========================================================================
    Airline Passenger Satisfaction — Wide & Deep (TF.js)
-   Final build: adds hard concurrency guard, button disabling, clear status,
-   safe stop, and always re-enables the UI after training completes or fails.
+   Final fix:
+   - Always pass inputs as arrays: [wide, deep] for fit/val/predict
+   - Sanity checks for tensors & shapes before fit()
+   - Concurrency guard, clean stop, UI status
    ========================================================================= */
 
 const S = {
@@ -17,7 +19,7 @@ const S = {
 
 const $ = id => document.getElementById(id);
 
-/* ----------------- Small UI helpers (disable/enable) ------------------ */
+/* ---------------- UI helpers ---------------- */
 const TRAIN_BTNS = ['btnLoad','btnPre','btnBuild','btnSummary','btnTrain','btnStop','btnPredict','btnSub','btnProb','btnSaveModel'];
 function setBusy(on){
   S.isTraining = !!on;
@@ -38,7 +40,7 @@ function appendLog(id, line){
   el.scrollTop = el.scrollHeight;
 }
 
-/* -------------------------- CSV parsing (Kaggle) ---------------------- */
+/* --------------- CSV parsing (Kaggle) --------------- */
 async function parseWithPapa(file, delimiter=',', quoteChar='"'){
   const text = (await file.text()).replace(/^\uFEFF/, '');
   return new Promise((resolve, reject)=>{
@@ -75,7 +77,7 @@ function previewTable(rows, limit=8){
   $('previewTable').innerHTML = `<table>${head}${body}</table>`;
 }
 
-/* ----------------------- Column resolver & schema --------------------- */
+/* --------------- Column resolver --------------- */
 const norm = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
 const ALIAS = new Map(Object.entries({
   gender:'gender', sex:'gender',
@@ -119,7 +121,7 @@ function unifyRow(row){
   return u;
 }
 
-/* ------------------------------ Stats -------------------------------- */
+/* --------------- Stats --------------- */
 const median = a => { const b=a.filter(x=>x!=null&&!Number.isNaN(+x)).map(Number).sort((x,y)=>x-y);
   if(!b.length) return null; const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; };
 const mode = a => { const m=new Map(); let best=null, c=0; for(const v of a){ if(v==null) continue; const k=String(v); const n=(m.get(k)||0)+1; m.set(k,n); if(n>c){c=n; best=k;} } return best; };
@@ -127,9 +129,9 @@ const mean = a => { const b=a.filter(Number.isFinite); return b.length? b.reduce
 const sd   = a => { const b=a.filter(Number.isFinite); if(b.length<2) return 0; const mu=mean(b); return Math.sqrt(b.reduce((s,x)=>s+(x-mu)**2,0)/(b.length-1)); };
 const finite = (x, d=0)=> Number.isFinite(+x) ? +x : d;
 
-/* -------------------------- Preprocess mapping ------------------------ */
+/* --------------- Preprocess mapping --------------- */
 function buildMapping(trainRows){
-  const useCase = $('useCase').value;         // 'pre' or 'post'
+  const useCase = $('useCase').value;
   const useCross = $('featCross').checked;
   const useTot   = $('featDelay').checked;
 
@@ -154,8 +156,10 @@ function buildMapping(trainRows){
   const catVals = {};
   for(const k of CAT_KEYS){
     const m = mode(T.map(r=> r[k]==null? null : String(r[k])));
-    const uniq = Array.from(new Set(T.map(r=> r[k]==null ? m : String(r[k]))));
-    catVals[k] = Array.from(new Set([...uniq, 'UNK']));
+    const uniq = Array.from(new Set(T.map(r=> r[k]==null ? m : String(r[k]))))
+                      .map(v=> v==null?'UNK':String(v));
+    const set = new Set(uniq.concat(['UNK']));
+    catVals[k] = Array.from(set);
   }
 
   let crossVals = [];
@@ -232,13 +236,13 @@ function imputeAndVec(rows, M){
 
     Xw.push(w); Xd.push(d);
     if('satisfaction' in rc) Y.push(+rc.satisfaction);
-    const id = (M.idKey in r0) ? r0[M.idKey] : (('id' in r0)? r0['id'] : (i+1));
+    const id = ('id' in r0) ? r0['id'] : (i+1);
     IDS.push(id);
   }
   return { Xwide:Xw, Xdeep:Xd, y: Y.length? Y : null, ids: IDS };
 }
 
-/* -------------------------- Train/Val split --------------------------- */
+/* --------------- Split --------------- */
 function stratifiedSplitRows(rows, rate=0.2){
   const U = rows.map(unifyRow).map((r,idx)=>({...rows[idx], __y: +r.satisfaction}));
   const z = U.filter(r=>r.__y===0), o=U.filter(r=>r.__y===1);
@@ -252,7 +256,7 @@ function stratifiedSplitRows(rows, rate=0.2){
   return { train, val };
 }
 
-/* -------------------------------- Model -------------------------------- */
+/* --------------- Model --------------- */
 function buildWideDeep(wideLen, deepLen){
   const wideIn = tf.input({shape:[wideLen], name:'wide'});
   const deepIn = tf.input({shape:[deepLen], name:'deep'});
@@ -275,7 +279,7 @@ function modelSummaryText(m){
   const lines=[]; m.summary(undefined, undefined, s=>lines.push(s)); return lines.join('\n');
 }
 
-/* ----------------------------- Metrics -------------------------------- */
+/* --------------- Metrics --------------- */
 function rocPoints(yTrue, yProb, steps=200){
   const T=[]; for(let i=0;i<=steps;i++) T.push(i/steps);
   const pts=T.map(th=>{
@@ -311,7 +315,7 @@ function confusionStats(yTrue, yProb, th){
   return {TP,FP,TN,FN,prec,rec,f1};
 }
 
-/* ------------------------ Early Stop (restore) ------------------------ */
+/* --------------- Early stop --------------- */
 let stopFlag=false;
 function earlyStopWithRestore(patience=6, monitor='val_loss'){
   let best=Infinity, wait=0, snap=null;
@@ -335,7 +339,25 @@ function earlyStopWithRestore(patience=6, monitor='val_loss'){
   });
 }
 
-/* ------------------------------- Handlers ----------------------------- */
+/* --------------- Sanity checks --------------- */
+function ensureReadyForTraining(){
+  if(!(S.xsWTr && S.xsDTr && S.ysTr && S.xsWVa && S.xsDVa && S.ysVa)) {
+    throw new Error('Tensors not built. Run “Run Preprocessing” again.');
+  }
+  const nTr = S.xsWTr.shape[0];
+  if(nTr===0) throw new Error('No training rows after preprocessing.');
+  if(S.xsWTr.shape[0]!==S.xsDTr.shape[0] || S.xsWTr.shape[0]!==S.ysTr.shape[0]) {
+    throw new Error(`Train shape mismatch: wide=${S.xsWTr.shape} deep=${S.xsDTr.shape} y=${S.ysTr.shape}`);
+  }
+  if(S.xsWVa.shape[0]!==S.xsDVa.shape[0] || S.xsWVa.shape[0]!==S.ysVa.shape[0]) {
+    throw new Error(`Val shape mismatch: wide=${S.xsWVa.shape} deep=${S.xsDVa.shape} y=${S.ysVa.shape}`);
+  }
+  if(S.xsWTr.shape[1]===0 || S.xsDTr.shape[1]===0){
+    throw new Error('Feature vectors are empty (0 columns). Check categorical mapping.');
+  }
+}
+
+/* --------------- Handlers --------------- */
 async function onLoad(){
   try{
     const fT = $('trainFile')?.files?.[0];
@@ -345,17 +367,14 @@ async function onLoad(){
     const rawTrain = (await parseWithPapa(fT, ',', '"')).map(normalizeRow);
     const rawTest  = fX ? (await parseWithPapa(fX, ',', '"')).map(normalizeRow) : [];
 
-    S.rawTrain = rawTrain;
-    S.rawTest  = rawTest;
+    S.rawTrain = rawTrain; S.rawTest = rawTest;
 
     $('kTrain').textContent = rawTrain.length;
     $('kTest').textContent  = rawTest.length || '—';
     $('kMiss').textContent  = missingPct(rawTrain) + '%';
     $('fixNote').textContent= '—';
     previewTable(rawTrain);
-  }catch(e){
-    console.error(e); alert('Load failed: '+(e?.message||e));
-  }
+  }catch(e){ console.error(e); alert('Load failed: '+(e?.message||e)); }
 }
 function onPreprocess(){
   try{
@@ -402,16 +421,19 @@ async function onTrain(){
     if(!S.model){ alert('Build the model first'); return; }
     if(S.isTraining){ alert('Training is already running. Please wait or click Early Stop.'); return; }
 
-    setBusy(true);
-    stopFlag=false;
+    ensureReadyForTraining();
+    setBusy(true); stopFlag=false;
     $('trainLog').textContent = 'epoch 0: starting…\n';
+    appendLog('trainLog', `Train shapes: wide ${S.xsWTr.shape}, deep ${S.xsDTr.shape}, y ${S.ysTr.shape}\n`);
+    appendLog('trainLog', `Val shapes:   wide ${S.xsWVa.shape}, deep ${S.xsDVa.shape}, y ${S.ysVa.shape}\n`);
 
     const cb = earlyStopWithRestore(6,'val_loss');
     await S.model.fit(
-      {wide:S.xsWTr, deep:S.xsDTr}, S.ysTr,
+      /* x */ [S.xsWTr, S.xsDTr],
+      /* y */ S.ysTr,
       {
         epochs: 50, batchSize: 32,
-        validationData: [{wide:S.xsWVa, deep:S.xsDVa}, S.ysVa],
+        validationData: [[S.xsWVa, S.xsDVa], S.ysVa],
         callbacks: [{
           onEpochEnd: async (ep, logs)=>{
             appendLog('trainLog', `epoch ${ep+1}: loss=${logs.loss.toFixed(4)} val_loss=${logs.val_loss.toFixed(4)} acc=${(logs.acc??logs.accuracy??0).toFixed(4)}\n`);
@@ -422,8 +444,8 @@ async function onTrain(){
       }
     );
 
-    // validate → ROC/AUC
-    const valProbs = tf.tidy(()=> S.model.predict({wide:S.xsWVa, deep:S.xsDVa}).dataSync());
+    // Validate → ROC/AUC
+    const valProbs = tf.tidy(()=> S.model.predict([S.xsWVa, S.xsDVa]).dataSync());
     S.valProbs = Float32Array.from(valProbs);
     const yTrue = Array.from(S.ysVa.dataSync()).map(v=>+v);
     const {points, auc} = rocPoints(yTrue, S.valProbs, 200);
@@ -439,16 +461,7 @@ async function onTrain(){
 }
 function onStop(){ if(S.isTraining){ stopFlag=true; appendLog('trainLog', 'Early stop requested…\n'); } }
 
-/* -------------------------- Threshold & Metrics ----------------------- */
-function confusionStats(yTrue, yProb, th){
-  let TP=0,FP=0,TN=0,FN=0;
-  for(let i=0;i<yTrue.length;i++){
-    const y=yTrue[i], p=yProb[i]>=th?1:0;
-    if(y===1&&p===1)TP++; else if(y===0&&p===1)FP++; else if(y===0&&p===0)TN++; else FN++;
-  }
-  const prec=TP/(TP+FP||1), rec=TP/(TP+FN||1), f1=(2*prec*rec)/((prec+rec)||1);
-  return {TP,FP,TN,FN,prec,rec,f1};
-}
+/* --------------- Threshold --------------- */
 function updateThreshold(th){
   $('thVal').textContent=(+th).toFixed(2);
   if(S.valProbs==null) return;
@@ -460,7 +473,7 @@ function updateThreshold(th){
   S.thresh=+th;
 }
 
-/* -------------------------- Predict & Export -------------------------- */
+/* --------------- Predict & Export --------------- */
 function onPredict(){
   try{
     if(!S.model){ alert('Train the model first'); return; }
@@ -469,7 +482,7 @@ function onPredict(){
     const V = imputeAndVec(S.rawTest, S.map);
     const xsW = tf.tensor2d(V.Xwide, [V.Xwide.length, V.Xwide[0].length], 'float32');
     const xsD = tf.tensor2d(V.Xdeep, [V.Xdeep.length, V.Xdeep[0].length], 'float32');
-    const probs = tf.tidy(()=> S.model.predict({wide:xsW, deep:xsD}).dataSync());
+    const probs = tf.tidy(()=> S.model.predict([xsW, xsD]).dataSync());
     xsW.dispose(); xsD.dispose();
 
     S.testProbs = Float32Array.from(probs);
@@ -477,7 +490,6 @@ function onPredict(){
     $('predInfo').textContent = `Predicted ${S.testProbs.length} rows. Ready to download.`;
   }catch(e){ console.error(e); alert('Prediction failed: '+(e?.message||e)); }
 }
-
 function downloadCSV(name, rows){
   if(!rows.length) return;
   const cols=Object.keys(rows[0]);
@@ -507,7 +519,7 @@ async function onSaveModel(){
   }catch(e){ console.error(e); alert('Save failed: '+(e?.message||e)); }
 }
 
-/* --------------------------------- Wire-up ---------------------------- */
+/* --------------- Wire-up --------------- */
 window.addEventListener('DOMContentLoaded', ()=>{
   $('btnLoad').addEventListener('click', onLoad);
   $('btnPre').addEventListener('click', onPreprocess);
