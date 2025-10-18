@@ -1,0 +1,9 @@
+# data & artifacts
+data/*.csv
+outputs/
+models/
+*.png
+*.joblib
+*.cbm
+.ipynb_checkpoints/
+__pycache__/
