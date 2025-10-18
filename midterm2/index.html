@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Airline Passenger Satisfaction — Wide & Deep (TF.js)</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <style>
+    :root{
+      --bg:#0b0f17; --bg2:#0e1320; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3;
+      --brand:#7ee787; --brand2:#8aa3ff; --glass:rgba(255,255,255,.06); --border:rgba(255,255,255,.12);
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{min-height:100vh;color:var(--ink);background:
+      radial-gradient(1200px 700px at 10% -10%, #1a2b47 0%, var(--bg) 60%),
+      radial-gradient(800px 500px at 120% 10%, #222a44 0%, var(--bg2) 60%),
+      linear-gradient(180deg,#090f1a, var(--bg2));
+      padding:26px; font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif}
+    .wrap{max-width:1280px;margin:0 auto}
+    .pill{display:inline-block;background:rgba(255,255,255,.08);border:1px solid var(--border);padding:6px 10px;border-radius:999px;font-size:.9rem;color:var(--muted)}
+    .panel{background:linear-gradient(180deg, var(--panel), #0b1222);border:1px solid var(--border);border-radius:22px;padding:18px;box-shadow:0 20px 45px rgba(0,0,0,.35);margin-bottom:16px}
+    .grid{display:grid;gap:14px}
+    .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    @media(max-width:980px){.cols-2{grid-template-columns:1fr}}
+    .btn{background:var(--glass);border:1px solid var(--border);color:var(--ink);padding:8px 12px;border-radius:12px;cursor:pointer}
+    input[type="file"], select{background:var(--glass);border:1px solid var(--border);color:var(--ink);padding:8px 12px;border-radius:12px}
+    table{width:100%;border-collapse:collapse;margin-top:10px}
+    th,td{border:1px solid rgba(255,255,255,.08);padding:6px 8px;text-align:left;white-space:nowrap}
+    .badge{display:inline-block;background:rgba(138,163,255,.12);border:1px solid rgba(138,163,255,.28);padding:6px 10px;border-radius:8px;font-size:.9rem}
+    .chart{width:100%;height:280px;border-radius:12px;border:1px dashed rgba(255,255,255,.12)}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .muted{color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 style="margin-bottom:6px">Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
+    <div class="pill" id="backendPill">GPU/WebGL backend • smaller deep model • fewer epochs • bigger batch. Upload CSVs → Preprocess → Build → Train → ROC → Predict/Export.</div>
+
+    <!-- Data Load -->
+    <div class="panel">
+      <h2>Data Load</h2>
+      <div class="row" style="margin:10px 0">
+        <div>train.csv <input type="file" id="trainFile" accept=".csv" /></div>
+        <div>test.csv <input type="file" id="testFile" accept=".csv" /></div>
+        <button class="btn" id="btnLoad">Load Files</button>
+        <div class="badge" id="shapeBadge">Train rows: — • Test rows: — • Missing%: — • Repairs: —</div>
+      </div>
+      <div style="overflow:auto;max-height:320px;border:1px solid rgba(255,255,255,.08);border-radius:12px">
+        <table id="previewTable"></table>
+      </div>
+    </div>
+
+    <!-- Preprocessing -->
+    <div class="panel">
+      <h2>Preprocessing</h2>
+      <div class="row" style="margin:10px 0">
+        <label>Use case
+          <select id="useCase">
+            <option value="post" selected>Post-flight recovery (allow ArrivalDelay)</option>
+            <option value="pre">Pre-flight (exclude ArrivalDelay)</option>
+          </select>
+        </label>
+        <label class="row"><input type="checkbox" id="chkCross" checked /> Cross: Class×TypeOfTravel</label>
+        <label class="row"><input type="checkbox" id="chkTotalDelay" checked /> Feature: TotalDelay</label>
+        <label class="row" title="Removes all service rating columns (wifi, comfort, food, boarding, entertainment, check-in, cleanliness, etc.) for a strict pre-flight feature set."><input type="checkbox" id="chkNoRatings" /> Exclude service ratings (strict pre‑flight)</label>
+        <button class="btn" id="btnPrep">Run Preprocessing</button>
+      </div>
+      <pre id="prepInfo" class="muted" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <!-- Model -->
+    <div class="panel">
+      <h2>Model (Wide & Deep)</h2>
+      <div class="row" style="margin:10px 0">
+        <button class="btn" id="btnBuild">Build Model</button>
+        <button class="btn" id="btnSummary">Show Summary</button>
+      </div>
+      <pre id="modelSummary" class="muted" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <!-- Training -->
+    <div class="panel">
+      <h2>Training</h2>
+      <div class="row" style="margin:10px 0">
+        <button class="btn" id="btnTrain">Train (25 epochs)</button>
+        <button class="btn" id="btnEarly">Early Stop</button>
+        <span class="badge" id="trainStatus">● Idle</span>
+      </div>
+      <pre id="trainLog" class="muted" style="white-space:pre-wrap;max-height:420px;overflow:auto"></pre>
+    </div>
+
+    <!-- Metrics -->
+    <div class="panel">
+      <h2>Metrics</h2>
+      <div class="row" style="margin:8px 0">
+        <label>Threshold: <span id="thVal">0.50</span>
+          <input type="range" id="thSlider" min="0" max="1" step="0.01" style="width:240px" />
+        </label>
+        <div class="badge">AUC (current): <b id="aucPrimary">—</b></div>
+        <div class="badge">AUC (strict pre‑flight): <b id="aucStrict">—</b></div>
+        <button class="btn" id="btnCompare">Compare AUCs (train quick strict model)</button>
+      </div>
+      <div id="rocCanvas" class="chart"></div>
+      <div class="row" style="margin-top:10px">
+        <div class="badge">Precision: <b id="prec">—</b></div>
+        <div class="badge">Recall: <b id="rec">—</b></div>
+        <div class="badge">F1: <b id="f1">—</b></div>
+      </div>
+      <div class="grid cols-2" style="margin-top:10px">
+        <div class="panel" style="margin:0"><table id="cmLeft"></table></div>
+        <div class="panel" style="margin:0"><table id="cmRight"></table></div>
+      </div>
+    </div>
+
+    <!-- Predict / Export -->
+    <div class="panel">
+      <h2>Predict & Export</h2>
+      <div class="row" style="margin:10px 0">
+        <button class="btn" id="btnPredict">Predict test.csv</button>
+        <button class="btn" id="btnSub">Download submission.csv</button>
+        <button class="btn" id="btnProbs">Download probabilities.csv</button>
+        <button class="btn" id="btnSave">Save model</button>
+      </div>
+      <pre id="predictInfo" class="muted" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <div class="muted" style="text-align:center;margin-top:10px">© 2025 • Wide&Deep TF.js • Works on GitHub Pages. No server.</div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
