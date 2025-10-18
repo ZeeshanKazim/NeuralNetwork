@@ -5,130 +5,155 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Airline Passenger Satisfaction — Wide & Deep (TF.js)</title>
   <link rel="preconnect" href="https://cdn.jsdelivr.net" />
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-vis@1.7.0/dist/tfjs-vis.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <style>
     :root{
-      --bg:#0b0f17; --bg2:#0e1320; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3;
-      --brand:#7ee787; --brand2:#8aa3ff; --glass:rgba(255,255,255,.06); --border:rgba(255,255,255,.12);
+      --bg:#0c111a; --panel:#121826; --ink:#e6edf3; --muted:#9aa4b2; --border:#1f2a3a; --glass:rgba(255,255,255,.06);
+      --ok:#88f; --hi:#7ee787; --warn:#ffb454; --accent:#8aa3ff;
     }
     *{box-sizing:border-box;margin:0;padding:0}
-    body{min-height:100vh;color:var(--ink);background:
-      radial-gradient(1200px 700px at 10% -10%, #1a2b47 0%, var(--bg) 60%),
-      radial-gradient(800px 500px at 120% 10%, #222a44 0%, var(--bg2) 60%),
-      linear-gradient(180deg,#090f1a, var(--bg2));
-      padding:26px; font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif}
-    .wrap{max-width:1280px;margin:0 auto}
-    .pill{display:inline-block;background:rgba(255,255,255,.08);border:1px solid var(--border);padding:6px 10px;border-radius:999px;font-size:.9rem;color:var(--muted)}
-    .panel{background:linear-gradient(180deg, var(--panel), #0b1222);border:1px solid var(--border);border-radius:22px;padding:18px;box-shadow:0 20px 45px rgba(0,0,0,.35);margin-bottom:16px}
-    .grid{display:grid;gap:14px}
-    .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
-    @media(max-width:980px){.cols-2{grid-template-columns:1fr}}
-    .btn{background:var(--glass);border:1px solid var(--border);color:var(--ink);padding:8px 12px;border-radius:12px;cursor:pointer}
-    input[type="file"], select{background:var(--glass);border:1px solid var(--border);color:var(--ink);padding:8px 12px;border-radius:12px}
-    table{width:100%;border-collapse:collapse;margin-top:10px}
-    th,td{border:1px solid rgba(255,255,255,.08);padding:6px 8px;text-align:left;white-space:nowrap}
-    .badge{display:inline-block;background:rgba(138,163,255,.12);border:1px solid rgba(138,163,255,.28);padding:6px 10px;border-radius:8px;font-size:.9rem}
-    .chart{width:100%;height:280px;border-radius:12px;border:1px dashed rgba(255,255,255,.12)}
+    body{background:linear-gradient(180deg,#0b1220,#0c111a);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,sans-serif;min-height:100vh;padding:22px}
+    .wrap{max-width:1200px;margin:0 auto}
+    h1{font-size:clamp(1.6rem,2.8vw,2.2rem);margin-bottom:10px}
+    .sub{color:var(--muted);font-size:.95rem;margin-bottom:14px}
+    .pill{display:inline-block;background:var(--glass);border:1px solid var(--border);padding:6px 10px;border-radius:999px;color:#bcd}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:14px;margin-top:14px}
     .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-    .muted{color:var(--muted)}
+    label{display:flex;gap:8px;align-items:center;background:var(--glass);border:1px solid var(--border);padding:8px 10px;border-radius:10px}
+    input[type="file"],select,button{color:var(--ink)}
+    button{background:var(--glass);border:1px solid var(--border);padding:9px 12px;border-radius:10px;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid var(--border);padding:8px 10px;text-align:left;white-space:nowrap}
+    .grid{display:grid;gap:12px}
+    .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    @media(max-width:900px){.cols-2{grid-template-columns:1fr}}
+    .status{font-weight:700;padding:4px 8px;border-radius:8px;border:1px solid var(--border);display:inline-flex;align-items:center;gap:8px}
+    .dot{width:8px;height:8px;border-radius:50%}
+    .dot.ok{background:#4ade80}.dot.busy{background:#f59e0b}.dot.idle{background:#60a5fa}
+    .mini{font-size:.9rem;color:var(--muted)}
+    .kpis{display:flex;gap:12px;flex-wrap:wrap}
+    .kpi{background:var(--glass);border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+    canvas{width:100%;height:220px;border-radius:10px;background:rgba(255,255,255,.03)}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1 style="margin-bottom:6px">Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
-    <div class="pill" id="backendPill">GPU/WebGL backend • smaller deep model • fewer epochs • bigger batch. Upload CSVs → Preprocess → Build → Train → ROC → Predict/Export.</div>
+    <h1>Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
+    <div class="sub">GPU/WebGL preferred • compact deep model • fast mode (subset + fewer epochs) • Upload CSVs → Preprocess → Build → Train → ROC → Predict/Export.</div>
+    <div class="pill" id="backendPill">backend: —</div>
 
     <!-- Data Load -->
     <div class="panel">
       <h2>Data Load</h2>
-      <div class="row" style="margin:10px 0">
-        <div>train.csv <input type="file" id="trainFile" accept=".csv" /></div>
-        <div>test.csv <input type="file" id="testFile" accept=".csv" /></div>
-        <button class="btn" id="btnLoad">Load Files</button>
-        <div class="badge" id="shapeBadge">Train rows: — • Test rows: — • Missing%: — • Repairs: —</div>
+      <div class="row" style="margin:8px 0 10px">
+        <label>train.csv <input type="file" id="trainFile" accept=".csv" /></label>
+        <label>test.csv <input type="file" id="testFile" accept=".csv" /></label>
+        <button id="btnLoad">Load Files</button>
+        <span class="status" id="loadStatus"><span class="dot idle"></span> Idle</span>
       </div>
-      <div style="overflow:auto;max-height:320px;border:1px solid rgba(255,255,255,.08);border-radius:12px">
-        <table id="previewTable"></table>
+      <div class="kpis">
+        <div class="kpi">Train rows: <b id="kTrain">—</b></div>
+        <div class="kpi">Test rows: <b id="kTest">—</b></div>
+        <div class="kpi">Missing%: <b id="kMiss">—</b></div>
+        <div class="kpi">Repairs: <b id="kRep">—</b></div>
       </div>
+      <div id="preview" style="overflow:auto; max-height:300px; margin-top:10px"></div>
     </div>
 
     <!-- Preprocessing -->
     <div class="panel">
       <h2>Preprocessing</h2>
-      <div class="row" style="margin:10px 0">
-        <label>Use case
+      <div class="row" style="margin:8px 0 10px">
+        <label>Use case 
           <select id="useCase">
-            <option value="post" selected>Post-flight recovery (allow ArrivalDelay)</option>
-            <option value="pre">Pre-flight (exclude ArrivalDelay)</option>
+            <option value="post">Post‑flight recovery (allow ArrivalDelay)</option>
+            <option value="pre">Pre‑flight decisioning (exclude ArrivalDelay)</option>
           </select>
         </label>
-        <label class="row"><input type="checkbox" id="chkCross" checked /> Cross: Class×TypeOfTravel</label>
-        <label class="row"><input type="checkbox" id="chkTotalDelay" checked /> Feature: TotalDelay</label>
-        <label class="row" title="Removes all service rating columns (wifi, comfort, food, boarding, entertainment, check-in, cleanliness, etc.) for a strict pre-flight feature set."><input type="checkbox" id="chkNoRatings" /> Exclude service ratings (strict pre‑flight)</label>
-        <button class="btn" id="btnPrep">Run Preprocessing</button>
+        <label><input type="checkbox" id="featCross" checked /> Cross: Class×TypeOfTravel</label>
+        <label><input type="checkbox" id="featTotalDelay" checked /> Feature: TotalDelay</label>
+        <label><input type="checkbox" id="dropRatings" /> Drop all service ratings (pre‑flight‑only)</label>
+        <label><input type="checkbox" id="fastMode" checked /> Fast mode (subset + mixed precision)</label>
+        <button id="btnPrep">Run Preprocessing</button>
       </div>
-      <pre id="prepInfo" class="muted" style="white-space:pre-wrap"></pre>
+      <pre id="prepInfo" class="mini" style="white-space:pre-wrap"></pre>
     </div>
 
     <!-- Model -->
     <div class="panel">
       <h2>Model (Wide & Deep)</h2>
-      <div class="row" style="margin:10px 0">
-        <button class="btn" id="btnBuild">Build Model</button>
-        <button class="btn" id="btnSummary">Show Summary</button>
+      <div class="row" style="margin:8px 0 10px">
+        <button id="btnBuild">Build Model</button>
+        <button id="btnSummary">Show Summary</button>
       </div>
-      <pre id="modelSummary" class="muted" style="white-space:pre-wrap"></pre>
+      <pre id="modelSummary" class="mini" style="white-space:pre-wrap"></pre>
     </div>
 
     <!-- Training -->
     <div class="panel">
       <h2>Training</h2>
-      <div class="row" style="margin:10px 0">
-        <button class="btn" id="btnTrain">Train (25 epochs)</button>
-        <button class="btn" id="btnEarly">Early Stop</button>
-        <span class="badge" id="trainStatus">● Idle</span>
+      <div class="row" style="margin:8px 0 10px">
+        <button id="btnTrain">Train</button>
+        <button id="btnEarly">Early Stop</button>
+        <span class="status" id="trainStatus"><span class="dot idle"></span> Idle</span>
+        <button id="btnCompare" title="Trains two tiny models fast: pre‑flight vs post‑flight, then shows both AUCs.">Quick Compare (Pre vs Post)</button>
       </div>
-      <pre id="trainLog" class="muted" style="white-space:pre-wrap;max-height:420px;overflow:auto"></pre>
+      <pre id="log" class="mini" style="white-space:pre-wrap; max-height:360px; overflow:auto"></pre>
     </div>
 
     <!-- Metrics -->
     <div class="panel">
       <h2>Metrics</h2>
-      <div class="row" style="margin:8px 0">
-        <label>Threshold: <span id="thVal">0.50</span>
-          <input type="range" id="thSlider" min="0" max="1" step="0.01" style="width:240px" />
-        </label>
-        <div class="badge">AUC (current): <b id="aucPrimary">—</b></div>
-        <div class="badge">AUC (strict pre‑flight): <b id="aucStrict">—</b></div>
-        <button class="btn" id="btnCompare">Compare AUCs (train quick strict model)</button>
+      <div class="row" style="align-items:center; gap:14px">
+        <label>Threshold: <input type="range" id="thr" min="0" max="1" step="0.01" value="0.5" style="width:220px"/></label>
+        <span>AUC (current): <b id="aucNow">—</b></span>
+        <span>AUC (previous): <b id="aucPrev">—</b></span>
+        <span>| Pre‑flight AUC: <b id="aucPre">—</b></span>
+        <span>Post‑flight AUC: <b id="aucPost">—</b></span>
       </div>
-      <div id="rocCanvas" class="chart"></div>
-      <div class="row" style="margin-top:10px">
-        <div class="badge">Precision: <b id="prec">—</b></div>
-        <div class="badge">Recall: <b id="rec">—</b></div>
-        <div class="badge">F1: <b id="f1">—</b></div>
-      </div>
-      <div class="grid cols-2" style="margin-top:10px">
-        <div class="panel" style="margin:0"><table id="cmLeft"></table></div>
-        <div class="panel" style="margin:0"><table id="cmRight"></table></div>
+      <div style="margin-top:10px"><canvas id="roc" height="220"></canvas></div>
+      <div class="grid cols-2" style="margin-top:12px">
+        <div>
+          <div class="row" style="gap:8px; margin-bottom:8px">
+            <span style="width:70px"></span>
+            <button disabled>Pred 1</button>
+            <button disabled>Pred 0</button>
+          </div>
+          <div class="row" style="gap:8px; margin-bottom:6px">
+            <button disabled>True 1</button>
+            <div class="kpi"><b id="tp">—</b></div>
+            <div class="kpi"><b id="fn">—</b></div>
+          </div>
+          <div class="row" style="gap:8px">
+            <button disabled>True 0</button>
+            <div class="kpi"><b id="fp">—</b></div>
+            <div class="kpi"><b id="tn">—</b></div>
+          </div>
+        </div>
+        <div class="kpi" style="display:flex;flex-direction:column;gap:6px">
+          <div>Precision: <b id="prec">—</b></div>
+          <div>Recall: <b id="rec">—</b></div>
+          <div>F1: <b id="f1">—</b></div>
+        </div>
       </div>
     </div>
 
-    <!-- Predict / Export -->
+    <!-- Predict & Export -->
     <div class="panel">
       <h2>Predict & Export</h2>
-      <div class="row" style="margin:10px 0">
-        <button class="btn" id="btnPredict">Predict test.csv</button>
-        <button class="btn" id="btnSub">Download submission.csv</button>
-        <button class="btn" id="btnProbs">Download probabilities.csv</button>
-        <button class="btn" id="btnSave">Save model</button>
+      <div class="row" style="margin:8px 0 10px">
+        <button id="btnPredict">Predict test.csv</button>
+        <button id="btnSub">Download submission.csv</button>
+        <button id="btnProb">Download probabilities.csv</button>
+        <button id="btnSave">Save model</button>
       </div>
-      <pre id="predictInfo" class="muted" style="white-space:pre-wrap"></pre>
+      <div class="mini" id="predInfo">—</div>
     </div>
 
-    <div class="muted" style="text-align:center;margin-top:10px">© 2025 • Wide&Deep TF.js • Works on GitHub Pages. No server.</div>
+    <div class="panel" style="text-align:center">© 2025 Airline Satisfaction — Wide & Deep TF.js. Drop this and app.js into a GitHub repo root and enable Pages.</div>
   </div>
 
   <script src="app.js"></script>
