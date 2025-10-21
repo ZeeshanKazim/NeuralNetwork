@@ -1,550 +1,601 @@
-/* Airline Passenger Satisfaction — Wide & Deep (TF.js)
-   Buttons not working? This build fixes: (1) strict defer loading, (2) safe DOM binding,
-   (3) robust CSV parsing (comma + double-quote), (4) explicit enable/disable flow,
-   (5) fast training path + quick AUC comparison.
-*/
+/* =========================================================================
+   Airline Passenger Satisfaction — Wide & Deep (TF.js)
+   FINAL with:
+   - Data leakage fix: fit preprocessing on TRAIN SPLIT ONLY.
+   - UX polish: Suggest best threshold, Reset, backend/params badges, safer disposals.
+   - WebGL preferred; epochs 25, batch 64; early stop patience 3.
+   ========================================================================= */
 
-// ---------- Helpers ----------
-const $ = (id) => document.getElementById(id);
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const S = {
+  rawTrain: [], rawTest: [],
+  map: null,
+  xsWTr: null, xsDTr: null, ysTr: null,
+  xsWVa: null, xsDVa: null, ysVa: null,
+  model: null,
+  valProbs: null, testProbs: null, testIDs: null,
+  thresh: 0.5,
+  isTraining: false
+};
 
-function pretty(obj){ try{return JSON.stringify(obj,null,2)}catch(e){return String(obj)} }
+const $ = id => document.getElementById(id);
 
-function download(name, text){
-  const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
+/* ---------------- UI helpers ---------------- */
+const TRAIN_BTNS = ['btnLoad','btnPre','btnBuild','btnSummary','btnTrain','btnStop','btnPredict','btnSub','btnProb','btnSaveModel','btnBestTh','btnReset'];
+function setBusy(on){
+  S.isTraining = !!on;
+  TRAIN_BTNS.forEach(id=>{
+    const el=$(id); if(!el) return;
+    if(id==='btnStop'){ el.disabled = !on; } else { el.disabled = !!on; }
+  });
+  const dot=$('trainDot'), txt=$('trainText');
+  if(dot&&txt){ dot.classList.toggle('busy', !!on); txt.textContent = on ? 'Training…' : 'Idle'; }
+}
+function appendLog(id, line){
+  const el=$(id); if(!el) return;
+  if(el.textContent==='—') el.textContent='';
+  el.textContent += line;
+  el.scrollTop = el.scrollHeight;
+}
+function clearUI(){
+  $('kTrain').textContent='—';
+  $('kTest').textContent='—';
+  $('kMiss').textContent='—';
+  $('fixNote').textContent='—';
+  $('preInfo').textContent='—';
+  $('modelSummary').textContent='—';
+  $('trainLog').textContent='—';
+  $('predInfo').textContent='—';
+  $('aucText').textContent='—';
+  $('paramBadge').textContent='';
+  $('previewTable').innerHTML='';
+  $('cmTP').textContent='0';$('cmFN').textContent='0';$('cmFP').textContent='0';$('cmTN').textContent='0';
+  $('prf').textContent='—';
+  $('thSlider').value=0.5; $('thVal').textContent='0.50';
+  const ctx = $('rocCanvas').getContext('2d'); ctx.clearRect(0,0,$('rocCanvas').width,$('rocCanvas').height);
 }
 
-function parsePapaFile(file){
+/* --------------- CSV parsing (Kaggle) --------------- */
+async function parseWithPapa(file, delimiter=',', quoteChar='"'){
+  const text = (await file.text()).replace(/^\uFEFF/, '');
   return new Promise((resolve, reject)=>{
-    Papa.parse(file, {
-      header: true,
-      dynamicTyping: true,
-      skipEmptyLines: 'greedy',
-      delimiter: ',',
-      quoteChar: '"',
-      complete: (res)=> resolve(res.data.map(normalizeRow)),
+    Papa.parse(text, {
+      header:true, dynamicTyping:true, skipEmptyLines:'greedy',
+      delimiter, quoteChar,
+      complete: r => resolve(r.data),
       error: reject
     });
   });
 }
-
 function normalizeRow(row){
-  const out = {};
+  const out={};
   for(const [k,v] of Object.entries(row)){
-    const key = String(k || '').trim();
-    let val = v;
-    if(val === '' || val === undefined) val = null;
-    if(typeof val === 'string') val = val.trim();
-    out[key] = val;
+    if(v===''||v===undefined) out[k]=null;
+    else if(typeof v==='string'){ const t=v.trim(); out[k]=t===''? null : t; }
+    else out[k]=v;
   }
   return out;
 }
-
-function tablePreview(rows, limit=8){
-  if(!rows || !rows.length) return '<em>No rows</em>';
-  const cols = Object.keys(rows[0]);
-  const head = '<tr>' + cols.map(c=>`<th>${c}</th>`).join('') + '</tr>';
-  const body = rows.slice(0,limit).map(r=> '<tr>'+ cols.map(c=>`<td>${r[c]===null?'':r[c]}</td>`).join('') + '</tr>').join('');
-  return `<div style="overflow:auto"><table style="border-collapse:collapse;min-width:800px">${head}${body}</table></div>`;
+function missingPct(rows){
+  if(!rows.length) return 100;
+  const cols=Object.keys(rows[0]); let miss=0, tot=rows.length*cols.length;
+  for(const r of rows){ for(const c of cols){ const v=r[c]; if(v==null||v==='') miss++; } }
+  return +(100*miss/tot).toFixed(1);
+}
+function previewTable(rows, limit=8){
+  if(!rows.length){ $('previewTable').innerHTML=''; return; }
+  const cols=Object.keys(rows[0]);
+  const head='<thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead>';
+  const body='<tbody>'+rows.slice(0,limit).map(r=>(
+    '<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>'
+  )).join('')+'</tbody>';
+  $('previewTable').innerHTML = `<table>${head}${body}</table>`;
 }
 
-function median(xs){ const a=xs.filter(v=>v!=null&&!Number.isNaN(v)).sort((x,y)=>x-y); if(!a.length) return null; const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2;}
-function mode(xs){ const m=new Map(); xs.forEach(v=>{if(v!=null){m.set(v,(m.get(v)||0)+1)}}); let best=null,bc=-1; m.forEach((c,k)=>{if(c>bc){bc=c;best=k}}); return best}
-function zscore(xs){ const v=xs.filter(v=>v!=null&&!Number.isNaN(v)); const mean=v.reduce((s,x)=>s+x,0)/Math.max(1,v.length); const sd=Math.sqrt(v.reduce((s,x)=>s+(x-mean)**2,0)/Math.max(1,v.length)); return {mean, sd: sd||1}; }
-
-// ROC + AUC
-function rocAuc(yTrue, yProb){
-  const pairs = yTrue.map((y,i)=>({y, p:yProb[i]})).sort((a,b)=> b.p-a.p);
-  let tp=0, fp=0; const P=yTrue.reduce((s,y)=>s+(y===1?1:0),0); const N=yTrue.length-P;
-  const tprs=[0], fprs=[0]; let prev=-1;
-  for(const {y,p} of pairs){ if(p!==prev){ tprs.push(tp/P); fprs.push(fp/N); prev=p; } if(y===1) tp++; else fp++; }
-  tprs.push(1); fprs.push(1);
-  let auc=0; for(let i=1;i<fprs.length;i++){ const dx=fprs[i]-fprs[i-1]; const avg=(tprs[i]+tprs[i-1])/2; auc+=dx*avg; }
-  return {fprs, tprs, auc};
-}
-
-function drawROC(canvas, fprs, tprs){
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width = canvas.clientWidth; const h = canvas.height = canvas.clientHeight;
-  ctx.clearRect(0,0,w,h);
-  ctx.fillStyle = 'rgba(255,255,255,0.05)'; ctx.fillRect(0,0,w,h);
-  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-  for(let i=0;i<=4;i++){ const x=w*i/4; const y=h*i/4; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
-  // diagonal
-  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.beginPath(); ctx.moveTo(0,h); ctx.lineTo(w,0); ctx.stroke();
-  // roc curve
-  ctx.strokeStyle = '#9db3ff'; ctx.lineWidth=2; ctx.beginPath();
-  for(let i=0;i<fprs.length;i++){ const x = fprs[i]*w; const y = h - tprs[i]*h; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
-  ctx.stroke();
-}
-
-// ---------- State ----------
-const state = {
-  rawTrain: [], rawTest: [],
-  Xwide: null, Xdeep: null, y: null,
-  XwideVal: null, XdeepVal: null, yVal: null,
-  XwideTest: null, XdeepTest: null,
-  wideCols: [], deepCols: [],
-  lastAuc: null, prevAuc: null,
-  model: null, stopFlag: false,
-};
-
-// ---------- UI Wiring (after DOM + tf ready) ----------
-window.addEventListener('DOMContentLoaded', async () => {
-  try{
-    await tf.setBackend('webgl');
-  }catch(e){ /* ignore */ }
-  await tf.ready();
-  $('backend').textContent = `tfjs ${tf.version_core} • backend=${tf.getBackend()}`;
-
-  bindClicks();
-  setDisabled(true);
-} );
-
-function bindClicks(){
-  $('btnLoad').addEventListener('click', onLoadFiles);
-  $('btnPrep').addEventListener('click', onPreprocess);
-  $('btnBuild').addEventListener('click', onBuild);
-  $('btnSummary').addEventListener('click', onSummary);
-  $('btnTrain').addEventListener('click', onTrain);
-  $('btnStop').addEventListener('click', ()=> state.stopFlag=true);
-  $('btnPredict').addEventListener('click', onPredict);
-  $('btnSub').addEventListener('click', onSub);
-  $('btnProb').addEventListener('click', onProb);
-  $('btnSave').addEventListener('click', onSaveModel);
-  $('thSlider').addEventListener('input', ()=> updateThreshold(parseFloat($('thSlider').value)));
-  $('btnQuickCompare').addEventListener('click', onQuickCompare);
-}
-
-function setDisabled(allDisabled){
-  $('btnPrep').disabled = allDisabled;
-  $('btnBuild').disabled = allDisabled;
-  $('btnSummary').disabled = true;
-  $('btnTrain').disabled = true;
-  $('btnStop').disabled = true;
-  $('btnPredict').disabled = allDisabled;
-  $('btnSub').disabled = true;
-  $('btnProb').disabled = true;
-  $('btnSave').disabled = true;
-}
-
-// ---------- Load ----------
-async function onLoadFiles(){
-  try{
-    const fT = $('trainFile').files[0];
-    if(!fT) return alert('Please choose train.csv');
-    const fX = $('testFile').files[0] || null;
-
-    $('btnLoad').disabled = true; $('btnLoad').textContent = 'Loading…';
-
-    // Strict Kaggle CSV (comma + double-quote)
-    state.rawTrain = await parsePapaFile(fT);
-    state.rawTest = fX ? await parsePapaFile(fX) : [];
-
-    $('kTrain').textContent = state.rawTrain.length.toLocaleString();
-    $('kTest').textContent = state.rawTest.length.toLocaleString();
-
-    // Missingness quick check
-    const miss = missingness(state.rawTrain);
-    const missPct = miss.length? (miss[0].percent*100).toFixed(1)+'% worst' : '0%';
-    $('kMiss').textContent = missPct;
-    $('kFix').textContent = '—';
-
-    $('preview').innerHTML = tablePreview(state.rawTrain);
-
-    setDisabled(false); // enable next steps
-
-  }catch(err){
-    console.error(err);
-    alert('Load failed: '+ err.message);
-  }finally{
-    $('btnLoad').disabled = false; $('btnLoad').textContent = 'Load Files';
+/* --------------- Column resolver --------------- */
+const norm = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+const ALIAS = new Map(Object.entries({
+  gender:'gender', sex:'gender',
+  customertype:'customertype','customer_type':'customertype',
+  typeoftravel:'typeoftravel','type_of_travel':'typeoftravel',
+  class:'class',
+  satisfaction:'satisfaction','satisfied':'satisfaction',
+  age:'age',
+  flightdistance:'flightdistance','flight_distance':'flightdistance',
+  inflightwifiservice:'inflightwifiservice','inflight_wifi_service':'inflightwifiservice','wifi':'inflightwifiservice',
+  departurearrivaltimeconvenient:'timeconvenient','departuretimeconvenient':'timeconvenient','arrivaltimeconvenient':'timeconvenient',
+  easeofonlinebooking:'easeonline','ease_online_booking':'easeonline',
+  gatelocation:'gatelocation','gate_location':'gatelocation',
+  foodanddrink:'fooddrink','food_drink':'fooddrink',
+  onlineboarding:'onlineboarding','online_boarding':'onlineboarding',
+  seatcomfort:'seatcomfort','seat_comfort':'seatcomfort',
+  inflightentertainment:'inflightentertainment','inflight_entertainment':'inflightentertainment',
+  onboardservice:'onboardservice','on_board_service':'onboardservice',
+  legroomservice:'legroomservice','leg_room_service':'legroomservice',
+  baggagehandling:'baggagehandling','baggage_handling':'baggagehandling',
+  checkinservice:'checkinservice','check_in_service':'checkinservice',
+  inflightservice:'inflightservice','inflight_service':'inflightservice',
+  cleanliness:'cleanliness',
+  departuredelayinminutes:'departuredelay','departuredelay':'departuredelay',
+  arrivaldelayinminutes:'arrivaldelay','arrivaldelay':'arrivaldelay',
+  id:'id', passengerid:'id'
+}));
+function unifyRow(row){
+  const u={};
+  for(const [k,v] of Object.entries(row)){
+    const key = ALIAS.get(norm(k)) || null;
+    if(key){ u[key]=v; }
   }
+  if('satisfaction' in u){
+    const val=u.satisfaction;
+    if(typeof val==='string'){
+      const t=val.toLowerCase();
+      u.satisfaction = (t.includes('satisfied') && !t.includes('neutral')) ? 1 : 0;
+    } else u.satisfaction = +val;
+  }
+  return u;
 }
 
-function missingness(rows){
-  if(!rows.length) return [];
-  const cols = Object.keys(rows[0]); const n = rows.length; const out=[];
-  for(const c of cols){ let m=0; for(const r of rows){ if(r[c]==null||r[c]==='') m++; } out.push({column:c, missing:m, percent:n?m/n:0}); }
-  out.sort((a,b)=>b.percent-a.percent); return out;
-}
+/* --------------- Stats helpers --------------- */
+const median = a => { const b=a.filter(x=>x!=null&&!Number.isNaN(+x)).map(Number).sort((x,y)=>x-y);
+  if(!b.length) return null; const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; };
+const mode = a => { const m=new Map(); let best=null, c=0; for(const v of a){ if(v==null) continue; const k=String(v); const n=(m.get(k)||0)+1; m.set(k,n); if(n>c){c=n; best=k;} } return best; };
+const mean = a => { const b=a.filter(Number.isFinite); return b.length? b.reduce((s,x)=>s+x,0)/b.length : 0; };
+const sd   = a => { const b=a.filter(Number.isFinite); if(b.length<2) return 0; const mu=mean(b); return Math.sqrt(b.reduce((s,x)=>s+(x-mu)**2,0)/(b.length-1)); };
+const finite = (x, d=0)=> Number.isFinite(+x) ? +x : d;
 
-// ---------- Preprocess ----------
-async function onPreprocess(){
-  try{
-    if(!state.rawTrain.length) return alert('Load files first');
-    $('btnPrep').disabled = true; $('prepLog').textContent = 'Preprocessing…';
+/* --------------- Preprocess mapping (FIT ON TRAIN ONLY) --------------- */
+function buildMapping(fitRows){
+  const useCase = $('useCase').value;
+  const useCross = $('featCross').checked;
+  const useTot   = $('featDelay').checked;
 
-    const useCase = $('useCase').value; // 'pre' | 'post'
-    const dropService = $('dropService').checked;
+  const T = fitRows.map(unifyRow);
 
-    const {Xwide, Xdeep, y, XwideVal, XdeepVal, yVal, wideCols, deepCols} = buildTensors(state.rawTrain, useCase, dropService, $('fastMode').checked);
-    state.Xwide = Xwide; state.Xdeep = Xdeep; state.y = y;
-    state.XwideVal = XwideVal; state.XdeepVal = XdeepVal; state.yVal = yVal;
-    state.wideCols = wideCols; state.deepCols = deepCols;
-
-    $('prepLog').textContent = `Use case: ${useCase==='pre'?'Pre‑flight (arrival delay excluded)':'Post‑flight (arrival delay included)'}\n`+
-      `Wide dim: ${state.wideCols.length}, Deep dim: ${state.deepCols.length}\n`+
-      `Train: wide ${shapeOf(Xwide)}, deep ${shapeOf(Xdeep)}, y ${shapeOf(y)}\n`+
-      `Val:   wide ${shapeOf(XwideVal)}, deep ${shapeOf(XdeepVal)}, y ${shapeOf(yVal)}\n`+
-      `Engineered: cross(Class×TypeOfTravel)${useCase==='post'?', TotalDelay=true':''}${dropService?', SERVICE_RATINGS_DROPPED':''}`;
-
-    $('btnBuild').disabled = false;
-
-  }catch(err){ console.error(err); alert('Preprocessing failed: '+err.message); }
-  finally{ $('btnPrep').disabled = false; }
-}
-
-function shapeOf(t){ return t? `[${t.shape.join(',')}]` : '—'; }
-
-function buildTensors(rows, useCase='post', dropService=false, fast=false){
-  // Canonicalize column names (trim + exact match as in Kaggle dataset)
-  // Expected important cols:
-  // 'Gender','Customer Type','Age','Type of Travel','Class','Flight Distance',
-  // service ratings (many), 'Departure Delay in Minutes','Arrival Delay in Minutes','satisfaction'
-
-  const lab = 'satisfaction';
-  const yAll = [];
-
-  // Build feature lists
-  const catCols = ['Gender','Customer Type','Type of Travel','Class'];
-  const numCols = ['Age','Flight Distance','Departure Delay in Minutes'];
-  if(useCase==='post') numCols.push('Arrival Delay in Minutes');
-
-  const serviceCols = [
-    'Inflight wifi service','Departure/Arrival time convenient','Ease of Online booking','Gate location','Food and drink','Online boarding','Seat comfort','Inflight entertainment','On-board service','Leg room service','Baggage handling','Checkin service','Inflight service','Cleanliness'
+  const CAT_KEYS = ['gender','customertype','typeoftravel','class'];
+  const NUM_KEYS_BASE = [
+    'age','flightdistance','timeconvenient','easeonline','gatelocation','fooddrink','onlineboarding',
+    'seatcomfort','inflightentertainment','onboardservice','legroomservice','baggagehandling',
+    'checkinservice','inflightservice','cleanliness','departuredelay'
   ];
-  const useService = !dropService; // include service ratings by default
+  const NUM_KEYS = [...NUM_KEYS_BASE, ...(useCase==='post'? ['arrivaldelay']:[])];
 
-  const rowsClean = rows.filter(r=> r[lab]!=null);
-
-  // Impute + engineer
-  const ageMed = median(rowsClean.map(r=> r['Age']));
-  const depMed = median(rowsClean.map(r=> r['Departure Delay in Minutes']));
-  const arrMed = median(rowsClean.map(r=> r['Arrival Delay in Minutes']));
-
-  // If fast mode, cap rows for quick demo
-  let data = rowsClean;
-  if(fast){
-    const cap = 104000; // quick demo size
-    if(data.length>cap) data = data.slice(0, cap);
+  // fit numerics on TRAIN ONLY
+  const med = {}, mu={}, sig={};
+  for(const k of NUM_KEYS){
+    const arr = T.map(r => finite(r[k], null)).filter(v=>v!=null);
+    const m = median(arr);
+    med[k] = Number.isFinite(m) ? m : 0;
+    const vals = T.map(r=> finite(r[k], med[k]));
+    mu[k] = mean(vals); sig[k] = sd(vals) || 1;
+  }
+  // fit categoricals on TRAIN ONLY
+  const catVals = {};
+  for(const k of CAT_KEYS){
+    const m = mode(T.map(r=> r[k]==null? null : String(r[k])));
+    // capture all seen values + 'UNK'
+    const uniq = Array.from(new Set(T.map(r=> r[k]==null ? m : String(r[k]))))
+                      .map(v=> v==null?'UNK':String(v));
+    const set = new Set(uniq.concat(['UNK']));
+    catVals[k] = Array.from(set);
   }
 
-  const cats = new Map(); // one-hot vocab per categorical
-  for(const c of catCols){ cats.set(c, new Set()); }
-  if(useService){ for(const c of serviceCols){ cats.set(c, new Set()); } }
-
-  for(const r of data){
-    for(const c of catCols){ cats.get(c).add(r[c]==null? 'UNK': String(r[c])); }
-    if(useService){ for(const c of serviceCols){ cats.get(c).add(r[c]==null? 'UNK': String(r[c])); } }
-  }
-  // Order vocab
-  const vocab = {}; cats.forEach((set,c)=> vocab[c]=Array.from(set.values()).sort());
-
-  // cross feature Class×TypeOfTravel (wide only)
-  const crossName = 'Class×TypeOfTravel';
-  const crossVocab = new Set(data.map(r=> `${r['Class']}×${r['Type of Travel']}`));
-  const crossKeys = Array.from(crossVocab.values()).sort();
-
-  // Build column lists
-  const wideCols = [].concat(
-    ...catCols.map(c=> vocab[c].map(v=> `${c}=${v}`)),
-    useService? [].concat(...serviceCols.map(c=> vocab[c].map(v=> `${c}=${v}`))) : [],
-    crossKeys.map(v=> `${crossName}=${v}`)
-  );
-
-  const deepCols = (function(){
-    const cols = [].concat(numCols);
-    // numeric service ratings (0-5) help deep path if enabled
-    if(useService){ cols.push(...serviceCols); }
-    // engineered total delay
-    if(useCase==='post') cols.push('TotalDelay');
-    return cols;
-  })();
-
-  // zscore params for deep numerics
-  const stats = {};
-  for(const c of deepCols){
-    const xs = data.map(r=>{
-      if(c==='TotalDelay'){
-        const a = r['Arrival Delay in Minutes']!=null? +r['Arrival Delay in Minutes'] : arrMed;
-        const d = r['Departure Delay in Minutes']!=null? +r['Departure Delay in Minutes'] : depMed;
-        return a+d;
-      }
-      let v = r[c];
-      if(v==null && c==='Age') v = ageMed;
-      if(v==null && c==='Departure Delay in Minutes') v = depMed;
-      if(v==null && c==='Arrival Delay in Minutes') v = arrMed;
-      return +v;
-    });
-    stats[c] = zscore(xs);
+  let crossVals = [];
+  const crossKey = 'classXtypeoftravel';
+  if(useCross){
+    crossVals = Array.from(new Set(T.map(r=>{
+      const c = (r.class ?? 'UNK') + '|' + (r.typeoftravel ?? 'UNK');
+      return String(c);
+    })));
+    if(!crossVals.includes('UNK|UNK')) crossVals.push('UNK|UNK');
   }
 
-  // Build matrices
-  const W = []; const D = []; const Y = [];
-  for(const r of data){
-    // y
-    const yv = String(r[lab]).toLowerCase().includes('satisf') ? 1 : 0;
-    Y.push(yv);
+  const DEEP_NUM = [...NUM_KEYS];
+  if(useTot){ DEEP_NUM.push('totaldelay'); }
 
-    // wide one-hot
-    const wrow = new Array(wideCols.length).fill(0);
-    let idx=0;
-    for(const c of catCols){ for(const v of vocab[c]){ if(String(r[c]??'UNK')===String(v)) wrow[idx]=1; idx++; } }
-    if(useService){ for(const c of serviceCols){ for(const v of vocab[c]){ if(String(r[c]??'UNK')===String(v)) wrow[idx]=1; idx++; } } }
-    for(const v of crossKeys){ if(`${r['Class']}×${r['Type of Travel']}`===v) wrow[idx]=1; idx++; }
-    W.push(wrow);
+  const WIDE_SPEC = { cats:[...CAT_KEYS], cross:{enabled:useCross, key:crossKey, values:crossVals} };
+  // deep path uses only normalized numerics (no one-hots) for speed
+  const DEEP_SPEC = { nums:DEEP_NUM, includeCats:false, cats:[...CAT_KEYS] };
+  const idKey = 'id';
 
-    // deep numerics
-    const drow = [];
-    for(const c of deepCols){
-      let val;
-      if(c==='TotalDelay'){
-        const a = r['Arrival Delay in Minutes']!=null? +r['Arrival Delay in Minutes'] : arrMed;
-        const d = r['Departure Delay in Minutes']!=null? +r['Departure Delay in Minutes'] : depMed;
-        val = a+d;
-      }else{
-        val = r[c];
-        if(val==null && c==='Age') val = ageMed;
-        if(val==null && c==='Departure Delay in Minutes') val = depMed;
-        if(val==null && c==='Arrival Delay in Minutes') val = arrMed;
-        val = +val;
-      }
-      const {mean, sd} = stats[c];
-      drow.push((val-mean)/sd);
-    }
-    D.push(drow);
-  }
-
-  // Stratified 80/20 split
-  const idx1 = []; const idx0 = [];
-  Y.forEach((y,i)=> (y===1?idx1:idx0).push(i));
-  function splitIndices(idx){ const n=idx.length; const cut=Math.floor(n*0.8); return [idx.slice(0,cut), idx.slice(cut)]; }
-  const [tr1,va1] = splitIndices(idx1); const [tr0,va0] = splitIndices(idx0);
-  const tr = tr1.concat(tr0); const va = va1.concat(va0);
-
-  function take(list, indices){ return indices.map(i=> list[i]); }
-
-  const Xwide = tf.tensor2d( take(W, tr) );
-  const Xdeep = tf.tensor2d( take(D, tr) );
-  const y = tf.tensor2d( take(Y, tr), [tr.length,1] );
-  const XwideVal = tf.tensor2d( take(W, va) );
-  const XdeepVal = tf.tensor2d( take(D, va) );
-  const yVal = tf.tensor2d( take(Y, va), [va.length,1] );
-
-  return {Xwide, Xdeep, y, XwideVal, XdeepVal, yVal, wideCols, deepCols};
+  return { useCase, useCross, useTot, med, mu, sig, catVals, WIDE_SPEC, DEEP_SPEC, idKey };
 }
 
-// ---------- Build Model ----------
-function buildModel(wideDim, deepDim){
-  const wideIn = tf.input({shape:[wideDim], name:'wide'});
-  const deepIn = tf.input({shape:[deepDim], name:'deep'});
+function imputeAndVec(rows, M){
+  const Xw=[], Xd=[], Y=[], IDS=[];
+  for(let i=0;i<rows.length;i++){
+    const r0 = unifyRow(rows[i]);
+    const rc = {...r0};
+
+    // CATEGORICAL: impute & clamp to known set, or UNK
+    for(const k of Object.keys(M.catVals)){
+      const vals=M.catVals[k];
+      const v = rc[k];
+      rc[k] = (v==null) ? vals[0] : String(v);
+      if(!vals.includes(rc[k])) rc[k]='UNK';
+    }
+    // NUMERIC: impute with training medians
+    for(const k of M.DEEP_SPEC.nums){
+      if(k==='totaldelay') continue;
+      const raw=rc[k];
+      const val=finite(raw, null);
+      rc[k] = (val==null) ? M.med[k] : val;
+    }
+    // engineered total delay
+    if(M.useTot){
+      const dep = finite(rc['departuredelay'], M.med['departuredelay']);
+      const arr = (M.useCase==='post') ? finite(rc['arrivaldelay'], M.med['arrivaldelay']) : 0;
+      rc['totaldelay'] = dep + arr;
+    }
+
+    // WIDE = one-hots (cats + optional cross)
+    const w=[];
+    for(const k of M.WIDE_SPEC.cats){
+      const cats=M.catVals[k];
+      w.push(...cats.map(cv => rc[k]===cv ? 1 : 0));
+    }
+    if(M.WIDE_SPEC.cross.enabled){
+      const key = (rc['class']??'UNK') + '|' + (rc['typeoftravel']??'UNK');
+      const cats = M.WIDE_SPEC.cross.values;
+      w.push(...cats.map(cv => key===cv ? 1 : 0));
+    }
+
+    // DEEP = normalized numerics
+    const d=[];
+    for(const k of M.DEEP_SPEC.nums){
+      const val = finite(rc[k], M.med[k] ?? 0);
+      const z = (val - (M.mu[k]??0)) / (M.sig[k]||1);
+      d.push(Number.isFinite(z)? z : 0);
+    }
+
+    Xw.push(w); Xd.push(d);
+    if('satisfaction' in rc) Y.push(+rc.satisfaction);
+    const id = ('id' in r0) ? r0['id'] : (i+1);
+    IDS.push(id);
+  }
+  return { Xwide:Xw, Xdeep:Xd, y: Y.length? Y : null, ids: IDS };
+}
+
+/* --------------- Split & disposals --------------- */
+function stratifiedSplitRows(rows, rate=0.2){
+  const U = rows.map(unifyRow).map((r,idx)=>({...rows[idx], __y: +r.satisfaction}));
+  const z = U.filter(r=>r.__y===0), o=U.filter(r=>r.__y===1);
+  const split = arr => { const a=arr.slice(); tf.util.shuffle(a);
+    const n=Math.max(1, Math.floor(a.length*rate)); return {val:a.slice(0,n), tr:a.slice(n)}; };
+  const A=split(z), B=split(o);
+  const train=A.tr.concat(B.tr), val=A.val.concat(B.val);
+  tf.util.shuffle(train); tf.util.shuffle(val);
+  train.forEach(r=>delete r.__y); val.forEach(r=>delete r.__y);
+  return { train, val };
+}
+
+function disposeAll(){
+  try{
+    ['xsWTr','xsDTr','ysTr','xsWVa','xsDVa','ysVa'].forEach(k=>{ if(S[k]){ S[k].dispose(); S[k]=null; }});
+    if(S.model){ S.model.dispose(); S.model=null; }
+    S.valProbs=null; S.testProbs=null; S.testIDs=null;
+  }catch{}
+}
+
+/* --------------- Model --------------- */
+function buildWideDeep(wideLen, deepLen){
+  const wideIn = tf.input({shape:[wideLen], name:'wide'});
+  const deepIn = tf.input({shape:[deepLen], name:'deep'});
+
+  const wideLogit = tf.layers.dense({units:1, useBias:false, activation:'linear', name:'wide_logit'}).apply(wideIn);
 
   let x = tf.layers.dense({units:32, activation:'relu'}).apply(deepIn);
-  x = tf.layers.dropout({rate:0.2}).apply(x);
-  const deepLogit = tf.layers.dense({units:1, useBias:false}).apply(x);
-  const wideLogit = tf.layers.dense({units:1, useBias:true}).apply(wideIn);
-  const add = tf.layers.add().apply([deepLogit, wideLogit]);
-  const out = tf.layers.activation({activation:'sigmoid'}).apply(add);
-  const model = tf.model({inputs:[wideIn, deepIn], outputs:out});
+  x = tf.layers.dropout({rate:0.1}).apply(x);
+  x = tf.layers.dense({units:8, activation:'relu'}).apply(x);
+  const deepLogit = tf.layers.dense({units:1, activation:'linear', name:'deep_logit'}).apply(x);
 
-  const lr = $('fastMode').checked ? 0.004 : 0.001;
-  model.compile({optimizer: tf.train.adam(lr), loss:'binaryCrossentropy', metrics:['accuracy']});
+  const sum = tf.layers.add().apply([wideLogit, deepLogit]);
+  const out = tf.layers.activation({activation:'sigmoid', name:'out'}).apply(sum);
+
+  const model = tf.model({inputs:[wideIn, deepIn], outputs:out, name:'wide_deep'});
+  model.compile({optimizer:'adam', loss:'binaryCrossentropy', metrics:['accuracy']});
   return model;
 }
+function modelSummaryText(m){ const lines=[]; m.summary(undefined, undefined, s=>lines.push(s)); return lines.join('\n'); }
+function paramCount(m){ return m.getWeights().reduce((s,w)=>s+w.size,0); }
 
-async function onBuild(){
-  if(!state.Xwide) return alert('Run preprocessing first');
-  state.model?.dispose();
-  state.model = buildModel(state.Xwide.shape[1], state.Xdeep.shape[1]);
-  $('modelSummary').textContent = 'Model built. Click "Show Summary" for details.';
-  $('btnSummary').disabled = false; $('btnTrain').disabled = false; $('btnSave').disabled = false;
-}
-
-function onSummary(){
-  if(!state.model) return;
-  const lines = [];
-  lines.push('Layers:');
-  state.model.layers.forEach(L=>{
-    const conf = L.getConfig();
-    const inShapes = (L.inboundNodes?.[0]?.inboundLayers||[]).map(x=>x.name).join(',');
-    lines.push(`• ${L.name} (${L.getClassName()})`);
-    lines.push('  cfg: '+ pretty(conf));
+/* --------------- Metrics --------------- */
+function rocPoints(yTrue, yProb, steps=200){
+  const T=[]; for(let i=0;i<=steps;i++) T.push(i/steps);
+  const pts=T.map(th=>{
+    let TP=0,FP=0,TN=0,FN=0;
+    for(let i=0;i<yTrue.length;i++){
+      const y=yTrue[i], p=yProb[i]>=th?1:0;
+      if(y===1&&p===1)TP++; else if(y===0&&p===1)FP++; else if(y===0&&p===0)TN++; else FN++;
+    }
+    const TPR=TP/(TP+FN||1), FPR=FP/(FP+TN||1);
+    return {x:FPR,y:TPR,th};
   });
-  lines.push(`Params: ${state.model.countParams()}`);
-  $('modelSummary').textContent = lines.join('\n');
+  const s=pts.slice().sort((a,b)=>a.x-b.x);
+  let auc=0; for(let i=1;i<s.length;i++){ const a=s[i-1], b=s[i]; auc += (b.x-a.x)*(a.y+b.y)/2; }
+  return {points:s, auc};
+}
+function drawROC(canvas, pts){
+  const ctx=canvas.getContext('2d'); const W=canvas.width, H=canvas.height;
+  ctx.clearRect(0,0,W,H); ctx.fillStyle='#0f1628'; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#233350'; ctx.lineWidth=1;
+  for(let i=0;i<=5;i++){const x=i/5; ctx.beginPath(); ctx.moveTo(40+x*(W-60), H-30); ctx.lineTo(40+x*(W-60), 20); ctx.stroke();}
+  for(let i=0;i<=5;i++){const y=i/5; ctx.beginPath(); ctx.moveTo(40, 20+y*(H-50)); ctx.lineTo(W-20, 20+y*(H-50)); ctx.stroke();}
+  ctx.strokeStyle='#8AA3FF'; ctx.lineWidth=2; ctx.beginPath();
+  pts.forEach((p,i)=>{ const x=40+p.x*(W-60), y=H-30-p.y*(H-50); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+  ctx.stroke();
+}
+function confusionStats(yTrue, yProb, th){
+  let TP=0,FP=0,TN=0,FN=0;
+  for(let i=0;i<yTrue.length;i++){
+    const y=yTrue[i], p=yProb[i]>=th?1:0;
+    if(y===1&&p===1)TP++; else if(y===0&&p===1)FP++; else if(y===0&&p===0)TN++; else FN++;
+  }
+  const prec=TP/(TP+FP||1), rec=TP/(TP+FN||1), f1=(2*prec*rec)/((prec+rec)||1);
+  return {TP,FP,TN,FN,prec,rec,f1};
+}
+function bestThreshold(yTrue, yProb){
+  let best={th:0.5,f1:-1,stats:null};
+  for(let t=0;t<=1000;t++){
+    const th=t/1000;
+    const s=confusionStats(yTrue,yProb,th);
+    if(s.f1>best.f1){ best={th,f1:s.f1,stats:s}; }
+  }
+  return best;
 }
 
-// ---------- Train ----------
+/* --------------- Early stop --------------- */
+let stopFlag=false;
+function earlyStopWithRestore(patience=3, monitor='val_loss'){
+  let best=Infinity, wait=0, snap=null;
+  return new tf.CustomCallback({
+    onBatchEnd: async ()=>{ await new Promise(r=>setTimeout(r,0)); },
+    onEpochEnd: async (_e, logs)=>{
+      await tf.nextFrame();
+      const cur=logs?.[monitor];
+      if(cur!=null){
+        if(cur<best-1e-12){
+          best=cur; wait=0;
+          if(snap) snap.forEach(t=>t.dispose());
+          snap = S.model.getWeights().map(w=>w.clone());
+        }else if(++wait>=patience){
+          if(snap){ S.model.setWeights(snap); snap=null; }
+          S.model.stopTraining=true;
+        }
+      }
+      if(stopFlag) S.model.stopTraining=true;
+    }
+  });
+}
+
+/* --------------- Sanity checks --------------- */
+function ensureReadyForTraining(){
+  if(!(S.xsWTr && S.xsDTr && S.ysTr && S.xsWVa && S.xsDVa && S.ysVa)) {
+    throw new Error('Tensors not built. Run “Run Preprocessing” again.');
+  }
+  const nTr = S.xsWTr.shape[0];
+  if(nTr===0) throw new Error('No training rows after preprocessing.');
+  if(S.xsWTr.shape[0]!==S.xsDTr.shape[0] || S.xsWTr.shape[0]!==S.ysTr.shape[0]) {
+    throw new Error(`Train shape mismatch: wide=${S.xsWTr.shape} deep=${S.xsDTr.shape} y=${S.ysTr.shape}`);
+  }
+  if(S.xsWVa.shape[0]!==S.xsDVa.shape[0] || S.xsWVa.shape[0]!==S.ysVa.shape[0]) {
+    throw new Error(`Val shape mismatch: wide=${S.xsWVa.shape} deep=${S.xsDVa.shape} y=${S.ysVa.shape}`);
+  }
+  if(S.xsWTr.shape[1]===0 || S.xsDTr.shape[1]===0){
+    throw new Error('Feature vectors are empty (0 columns). Check categorical mapping.');
+  }
+}
+
+/* --------------- Handlers --------------- */
+async function onLoad(){
+  try{
+    const fT = $('trainFile')?.files?.[0];
+    const fX = $('testFile')?.files?.[0];
+    if(!fT){ alert('Please choose train.csv'); return; }
+
+    // Force Kaggle defaults: comma + double-quote
+    const rawTrain = (await parseWithPapa(fT, ',', '"')).map(normalizeRow);
+    const rawTest  = fX ? (await parseWithPapa(fX, ',', '"')).map(normalizeRow) : [];
+
+    disposeAll();
+    S.rawTrain = rawTrain; S.rawTest = rawTest;
+
+    $('kTrain').textContent = rawTrain.length;
+    $('kTest').textContent  = rawTest.length || '—';
+    $('kMiss').textContent  = missingPct(rawTrain) + '%';
+    $('fixNote').textContent= '—';
+    previewTable(rawTrain);
+  }catch(e){ console.error(e); alert('Load failed: '+(e?.message||e)); }
+}
+
+function onReset(){
+  try{
+    disposeAll();
+    S.rawTrain=[]; S.rawTest=[]; S.map=null; S.valProbs=null; S.testProbs=null; S.thresh=0.5;
+    clearUI();
+    $('trainFile').value=''; $('testFile').value='';
+  }catch(e){ console.error(e); }
+}
+
+function onPreprocess(){
+  try{
+    if(!S.rawTrain.length){ alert('Load train.csv first'); return; }
+
+    // 1) Split first (so our mapping fits ONLY on train => no leakage)
+    const split = stratifiedSplitRows(S.rawTrain, 0.2);
+    const trainRows = split.train;
+    const valRows   = split.val;
+
+    // Dispose previous tensors if any
+    disposeAll();
+
+    // 2) Fit mapping on TRAIN ONLY, then transform train & val
+    S.map = buildMapping(trainRows);
+
+    const TV = imputeAndVec(trainRows, S.map);
+    const VV = imputeAndVec(valRows,   S.map);
+
+    S.xsWTr = tf.tensor2d(TV.Xwide, [TV.Xwide.length, TV.Xwide[0].length], 'float32');
+    S.xsDTr = tf.tensor2d(TV.Xdeep, [TV.Xdeep.length, TV.Xdeep[0].length], 'float32');
+    S.ysTr  = tf.tensor2d(TV.y,     [TV.y.length, 1], 'float32');
+
+    S.xsWVa = tf.tensor2d(VV.Xwide, [VV.Xwide.length, VV.Xwide[0].length], 'float32');
+    S.xsDVa = tf.tensor2d(VV.Xdeep, [VV.Xdeep.length, VV.Xdeep[0].length], 'float32');
+    S.ysVa  = tf.tensor2d(VV.y,     [VV.y.length, 1], 'float32');
+
+    $('preInfo').textContent = [
+      `Use case: ${S.map.useCase==='pre'?'Pre-flight (ArrivalDelay excluded)':'Post-flight (ArrivalDelay included)'}`,
+      `Wide len: ${S.xsWTr.shape[1]} | Deep len: ${S.xsDTr.shape[1]}`,
+      `Train: wide ${S.xsWTr.shape} / deep ${S.xsDTr.shape} | Val: wide ${S.xsWVa.shape} / deep ${S.xsDVa.shape}`,
+      `Impute/scale: medians & z-score from TRAIN ONLY`,
+      `Engineered: Cross=${S.map.useCross}, TotalDelay=${S.map.useTot}`
+    ].join('\n');
+  }catch(e){ console.error(e); alert('Preprocessing failed: '+(e?.message||e)); }
+}
+
+function onBuild(){
+  try{
+    if(!S.xsWTr){ alert('Run Preprocessing first'); return; }
+    if(S.model){ S.model.dispose(); S.model=null; }
+    S.model = buildWideDeep(S.xsWTr.shape[1], S.xsDTr.shape[1]);
+    const p = paramCount(S.model);
+    $('paramBadge').textContent = `Params: ${p.toLocaleString()}`;
+    $('modelSummary').textContent = 'Model built. Click “Show Summary”.';
+  }catch(e){ console.error(e); alert('Build failed: '+(e?.message||e)); }
+}
+function onSummary(){
+  try{
+    if(!S.model){ alert('Build model first'); return; }
+    $('modelSummary').textContent = modelSummaryText(S.model);
+  }catch(e){ console.error(e); alert('Summary failed: '+(e?.message||e)); }
+}
+
 async function onTrain(){
   try{
-    if(!state.model) return alert('Build model first');
-    $('btnTrain').disabled = true; $('btnStop').disabled = false; $('trainLog').textContent='';
-    state.stopFlag = false; $('trainStatus').textContent = 'Training…';
+    if(!S.model){ alert('Build the model first'); return; }
+    if(S.isTraining){ alert('Training is already running. Please wait or click Early Stop.'); return; }
 
-    const epochs = $('fastMode').checked ? 12 : 30;
-    const batchSize = $('fastMode').checked ? 128 : 64;
+    ensureReadyForTraining();
+    setBusy(true); stopFlag=false;
+    $('trainLog').textContent = 'epoch 0: starting…\n';
+    appendLog('trainLog', `Train shapes: wide ${S.xsWTr.shape}, deep ${S.xsDTr.shape}, y ${S.ysTr.shape}\n`);
+    appendLog('trainLog', `Val shapes:   wide ${S.xsWVa.shape}, deep ${S.xsDVa.shape}, y ${S.ysVa.shape}\n`);
 
-    const hist = await state.model.fit(
-      {wide: state.Xwide, deep: state.Xdeep}, state.y,
+    const cb = earlyStopWithRestore(3,'val_loss');
+    await S.model.fit(
+      [S.xsWTr, S.xsDTr], S.ysTr,
       {
-        epochs, batchSize,
-        validationData: [{wide: state.XwideVal, deep: state.XdeepVal}, state.yVal],
+        epochs: 25,
+        batchSize: 64,
+        validationData: [[S.xsWVa, S.xsDVa], S.ysVa],
         callbacks: [{
-          onEpochEnd: async (epoch, logs)=>{
-            $('trainLog').textContent += `epoch ${epoch+1}: loss=${logs.loss.toFixed(4)} val_loss=${logs.val_loss.toFixed(4)} acc=${(logs.acc||logs.accuracy||0).toFixed(4)}\n`;
-            if(state.stopFlag){ state.model.stopTraining = true; $('trainLog').textContent += '⏹ Early stop requested.\n'; }
-            await sleep(10);
-          }
+          onEpochEnd: async (ep, logs)=>{
+            appendLog('trainLog', `epoch ${ep+1}: loss=${logs.loss.toFixed(4)} val_loss=${logs.val_loss.toFixed(4)} acc=${(logs.acc??logs.accuracy??0).toFixed(4)}\n`);
+            await cb.onEpochEnd?.(ep, logs);
+          },
+          onBatchEnd: async (b, logs)=>{ await cb.onBatchEnd?.(b, logs); }
         }]
       }
     );
 
-    $('trainStatus').textContent = 'Idle'; $('btnStop').disabled = true;
+    const valProbs = tf.tidy(()=> S.model.predict([S.xsWVa, S.xsDVa]).dataSync());
+    S.valProbs = Float32Array.from(valProbs);
+    const yTrue = Array.from(S.ysVa.dataSync()).map(v=>+v);
 
-    // Compute ROC
-    const yProb = Array.from( (await state.model.predict({wide: state.XwideVal, deep: state.XdeepVal})).dataSync() );
-    const yTrue = Array.from(state.yVal.dataSync()).map(x=> x>0.5?1:0);
-    const {fprs, tprs, auc} = rocAuc(yTrue, yProb);
-    drawROC($('roc'), fprs, tprs);
-    $('auc').textContent = auc.toFixed(4);
-    state.prevAuc = state.lastAuc; state.lastAuc = auc; $('lastAuc').textContent = auc.toFixed(4); $('prevAuc').textContent = state.prevAuc? state.prevAuc.toFixed(4) : '—';
+    const {points, auc} = rocPoints(yTrue, S.valProbs, 200);
+    drawROC($('rocCanvas'), points);
+    $('aucText').textContent = auc.toFixed(4);
 
-    // Confusion at default threshold 0.5
-    $('thSlider').value = 0.5; updateThreshold(0.5, yTrue, yProb);
-
-  }catch(err){ console.error(err); alert('Training failed: '+err.message); }
-  finally{ $('btnTrain').disabled = false; }
+    updateThreshold(S.thresh);
+  }catch(e){
+    console.error(e);
+    alert('Training failed: ' + (e?.message || e));
+  } finally {
+    setBusy(false);
+  }
 }
+function onStop(){ if(S.isTraining){ stopFlag=true; appendLog('trainLog', 'Early stop requested…\n'); } }
 
-function updateThreshold(t=null, yTrueCached=null, yProbCached=null){
-  $('thVal').textContent = (t??parseFloat($('thSlider').value)).toFixed(2);
-  const yTrue = yTrueCached || Array.from(state.yVal.dataSync()).map(x=> x>0.5?1:0);
-  const yProb = yProbCached || Array.from( state.model.predict({wide: state.XwideVal, deep: state.XdeepVal}).dataSync() );
-  const thr = t??parseFloat($('thSlider').value);
-  let tp=0,fp=0,tn=0,fn=0; for(let i=0;i<yTrue.length;i++){ const p = yProb[i]>=thr?1:0; const y=yTrue[i]; if(p===1&&y===1)tp++; else if(p===1&&y===0)fp++; else if(p===0&&y===0)tn++; else fn++; }
-  $('cm11').textContent = tp; $('cm10').textContent = fn; $('cm01').textContent = fp; $('cm00').textContent = tn;
-  const prec = tp+fp? tp/(tp+fp):0; const rec = tp+fn? tp/(tp+fn):0; const f1 = (prec+rec)? 2*prec*rec/(prec+rec):0;
-  $('prec').textContent = (prec*100).toFixed(2)+'%'; $('rec').textContent=(rec*100).toFixed(2)+'%'; $('f1').textContent=f1.toFixed(4);
+/* --------------- Threshold --------------- */
+function updateThreshold(th){
+  $('thVal').textContent=(+th).toFixed(2);
+  if(S.valProbs==null) return;
+  const yTrue=Array.from(S.ysVa.dataSync()).map(v=>+v);
+  const st=confusionStats(yTrue,S.valProbs,+th);
+  $('cmTP').textContent=st.TP; $('cmFN').textContent=st.FN;
+  $('cmFP').textContent=st.FP; $('cmTN').textContent=st.TN;
+  $('prf').textContent=`Precision: ${(st.prec*100).toFixed(2)}%\nRecall: ${(st.rec*100).toFixed(2)}%\nF1: ${st.f1.toFixed(4)}`;
+  S.thresh=+th;
 }
-
-// ---------- Quick Compare (tiny runs) ----------
-async function onQuickCompare(){
+function onSuggestBestThreshold(){
   try{
-    if(!state.rawTrain.length) return alert('Load files first');
-    $('btnQuickCompare').disabled = true;
-
-    // Pre-flight (no ArrivalDelay + drop service if toggle on)
-    const pre = buildTensors(state.rawTrain, 'pre', $('dropService').checked, true);
-    const m1 = buildModel(pre.wideCols.length, pre.deepCols.length);
-    await m1.fit({wide:pre.Xwide, deep:pre.Xdeep}, pre.y, {epochs:6, batchSize:128, validationData:[{wide:pre.XwideVal, deep:pre.XdeepVal}, pre.yVal]});
-    const y1 = Array.from( m1.predict({wide:pre.XwideVal, deep:pre.XdeepVal}).dataSync() );
-    const t1 = Array.from(pre.yVal.dataSync()).map(x=>x>0.5?1:0);
-    const a1 = rocAuc(t1,y1).auc; $('aucPre').textContent = a1.toFixed(4);
-    m1.dispose(); pre.Xwide.dispose(); pre.Xdeep.dispose(); pre.y.dispose(); pre.XwideVal.dispose(); pre.XdeepVal.dispose(); pre.yVal.dispose();
-
-    // Post-flight (allow ArrivalDelay, include service unless user dropped globally)
-    const post = buildTensors(state.rawTrain, 'post', $('dropService').checked, true);
-    const m2 = buildModel(post.wideCols.length, post.deepCols.length);
-    await m2.fit({wide:post.Xwide, deep:post.Xdeep}, post.y, {epochs:6, batchSize:128, validationData:[{wide:post.XwideVal, deep:post.XdeepVal}, post.yVal]});
-    const y2 = Array.from( m2.predict({wide:post.XwideVal, deep:post.XdeepVal}).dataSync() );
-    const t2 = Array.from(post.yVal.dataSync()).map(x=>x>0.5?1:0);
-    const a2 = rocAuc(t2,y2).auc; $('aucPost').textContent = a2.toFixed(4);
-    m2.dispose(); post.Xwide.dispose(); post.Xdeep.dispose(); post.y.dispose(); post.XwideVal.dispose(); post.XdeepVal.dispose(); post.yVal.dispose();
-
-  }catch(err){ console.error(err); alert('Quick compare failed: '+err.message); }
-  finally{ $('btnQuickCompare').disabled = false; }
+    if(S.valProbs==null){ alert('Train the model first to compute validation probabilities.'); return; }
+    const yTrue=Array.from(S.ysVa.dataSync()).map(v=>+v);
+    const best = bestThreshold(yTrue, S.valProbs);
+    $('thSlider').value = best.th;
+    updateThreshold(best.th);
+    appendLog('trainLog', `best threshold (max F1): th=${best.th.toFixed(3)}  F1=${best.f1.toFixed(4)}  (P=${(best.stats.prec*100).toFixed(2)}%, R=${(best.stats.rec*100).toFixed(2)}%)\n`);
+  }catch(e){ console.error(e); }
 }
 
-// ---------- Predict & Export ----------
-let lastTestProbs = null; let lastTestIds = null;
-
-async function onPredict(){
+/* --------------- Predict & Export --------------- */
+function onPredict(){
   try{
-    if(!state.model) return alert('Train a model first');
-    if(!state.rawTest.length) return alert('Load test.csv to predict');
+    if(!S.model){ alert('Train the model first'); return; }
+    if(!S.rawTest.length){ alert('Load test.csv'); return; }
 
-    const useCase = $('useCase').value; const drop = $('dropService').checked;
-    const {Xwide, Xdeep} = adaptTest(state.rawTest, state.wideCols, state.deepCols, useCase, drop);
+    const V = imputeAndVec(S.rawTest, S.map);
+    const xsW = tf.tensor2d(V.Xwide, [V.Xwide.length, V.Xwide[0].length], 'float32');
+    const xsD = tf.tensor2d(V.Xdeep, [V.Xdeep.length, V.Xdeep[0].length], 'float32');
+    const probs = tf.tidy(()=> S.model.predict([xsW, xsD]).dataSync());
+    xsW.dispose(); xsD.dispose();
 
-    const probs = Array.from( state.model.predict({wide:Xwide, deep:Xdeep}).dataSync() );
-    lastTestProbs = probs; lastTestIds = state.rawTest.map(r=> r['id']||r['Id']||r['PassengerId']||r['ID']||'');
-    $('exportMsg').textContent = `Predicted ${probs.length} rows. Use buttons to download.`;
-    $('btnSub').disabled = false; $('btnProb').disabled = false;
-
-    Xwide.dispose(); Xdeep.dispose();
-  }catch(err){ console.error(err); alert('Predict failed: '+err.message); }
+    S.testProbs = Float32Array.from(probs);
+    S.testIDs   = V.ids;
+    $('predInfo').textContent = `Predicted ${S.testProbs.length} rows. Ready to download.`;
+  }catch(e){ console.error(e); alert('Prediction failed: '+(e?.message||e)); }
 }
-
-function adaptTest(rows, wideCols, deepCols, useCase, dropService){
-  // Construct features using same columns and stats as train (approx: mean=0 z-scored already)
-  // For simplicity here we recompute means from test with guards
-  const depMed = median(rows.map(r=> r['Departure Delay in Minutes']));
-  const arrMed = median(rows.map(r=> r['Arrival Delay in Minutes']));
-  const ageMed = median(rows.map(r=> r['Age']));
-
-  const W=[]; const D=[];
-  for(const r of rows){
-    const wrow=new Array(wideCols.length).fill(0);
-    wideCols.forEach((col,i)=>{
-      // format: "ColName=value"
-      const [c,v] = col.split('=');
-      if(c.includes('×')){
-        // cross feature
-        const [c1, c2] = ['Class','Type of Travel'];
-        if(`${r[c1]}×${r[c2]}`===v) wrow[i]=1;
-      }else{
-        if(String(r[c])===v) wrow[i]=1;
-      }
-    });
-    W.push(wrow);
-
-    const drow=[];
-    for(const c of deepCols){
-      let val;
-      if(c==='TotalDelay'){
-        const a = r['Arrival Delay in Minutes']!=null? +r['Arrival Delay in Minutes'] : arrMed;
-        const d = r['Departure Delay in Minutes']!=null? +r['Departure Delay in Minutes'] : depMed;
-        val = a+d;
-      }else{
-        val = r[c];
-        if(val==null && c==='Age') val = ageMed;
-        if(val==null && c==='Departure Delay in Minutes') val = depMed;
-        if(val==null && c==='Arrival Delay in Minutes') val = arrMed;
-        val = +val;
-      }
-      drow.push(val); // we didn't persist train z-score stats; model handles scale reasonably
-    }
-    D.push(drow);
-  }
-  return { Xwide: tf.tensor2d(W), Xdeep: tf.tensor2d(D) };
+function downloadCSV(name, rows){
+  if(!rows.length) return;
+  const cols=Object.keys(rows[0]);
+  const esc=v=>{ if(v==null) return ''; const s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; };
+  const csv=[cols.join(',')].concat(rows.map(r=> cols.map(c=>esc(r[c])).join(','))).join('\n');
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
 }
-
-function onSub(){
-  if(!lastTestProbs) return alert('Predict first');
-  const thr = parseFloat($('thSlider').value);
-  const lines = ['id,satisfaction'];
-  for(let i=0;i<lastTestProbs.length;i++){
-    const pred = lastTestProbs[i]>=thr? 'satisfied':'neutral or dissatisfied';
-    const id = lastTestIds?.[i] ?? (i+1);
-    lines.push(`${id},${pred}`);
-  }
-  download('submission.csv', lines.join('\n'));
+function onDownloadSubmission(){
+  try{
+    if(S.testProbs==null){ alert('Run Predict first'); return; }
+    const out = S.testIDs.map((id,i)=>({ id, satisfaction: (S.testProbs[i]>=S.thresh? 1 : 0) }));
+    downloadCSV('submission.csv', out);
+  }catch(e){ console.error(e); alert('Download failed: '+(e?.message||e)); }
 }
-
-function onProb(){
-  if(!lastTestProbs) return alert('Predict first');
-  const lines = ['id,prob_satisfied'];
-  for(let i=0;i<lastTestProbs.length;i++){
-    const id = lastTestIds?.[i] ?? (i+1);
-    lines.push(`${id},${lastTestProbs[i]}`);
-  }
-  download('probabilities.csv', lines.join('\n'));
+function onDownloadProbs(){
+  try{
+    if(S.testProbs==null){ alert('Run Predict first'); return; }
+    const out = S.testIDs.map((id,i)=>({ id, prob_satisfied: S.testProbs[i] }));
+    downloadCSV('probabilities.csv', out);
+  }catch(e){ console.error(e); alert('Download failed: '+(e?.message||e)); }
 }
-
 async function onSaveModel(){
-  if(!state.model) return alert('Build a model first');
-  await state.model.save('downloads://airline-wide-deep-tfjs');
+  try{
+    if(!S.model){ alert('Train the model first'); return; }
+    await S.model.save('downloads://airline_wide_deep_tfjs');
+  }catch(e){ console.error(e); alert('Save failed: '+(e?.message||e)); }
 }
+
+/* --------------- Wire-up --------------- */
+window.addEventListener('DOMContentLoaded', ()=>{
+  $('btnLoad').addEventListener('click', onLoad);
+  $('btnReset').addEventListener('click', onReset);
+  $('btnPre').addEventListener('click', onPreprocess);
+  $('btnBuild').addEventListener('click', onBuild);
+  $('btnSummary').addEventListener('click', onSummary);
+  $('btnTrain').addEventListener('click', onTrain);
+  $('btnStop').addEventListener('click', onStop);
+  $('thSlider').addEventListener('input', e=>updateThreshold(+e.target.value));
+  $('btnBestTh').addEventListener('click', onSuggestBestThreshold);
+  $('btnPredict').addEventListener('click', onPredict);
+  $('btnSub').addEventListener('click', onDownloadSubmission);
+  $('btnProb').addEventListener('click', onDownloadProbs);
+  $('btnSaveModel').addEventListener('click', onSaveModel);
+});
