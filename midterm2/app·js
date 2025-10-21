@@ -1,11 +1,13 @@
 /* =========================================================================
    Airline Passenger Satisfaction — Wide & Deep (TF.js)
-   FINAL with:
-   - Data leakage fix: fit preprocessing on TRAIN SPLIT ONLY.
-   - UX polish: Suggest best threshold, Reset, backend/params badges, safer disposals.
-   - WebGL preferred; epochs 25, batch 64; early stop patience 3.
+   - Buttons fixed (listeners after DOM & libs ready)
+   - Kaggle-safe CSV parsing (comma + double-quote + BOM strip)
+   - No leakage: preprocessing stats are learned on TRAIN SPLIT only
+   - Two-input wide & deep model; early stop; ROC/AUC; threshold CM
    ========================================================================= */
+'use strict';
 
+/* ---------------- State & Shortcuts ---------------- */
 const S = {
   rawTrain: [], rawTest: [],
   map: null,
@@ -16,11 +18,11 @@ const S = {
   thresh: 0.5,
   isTraining: false
 };
-
 const $ = id => document.getElementById(id);
+window.S = S; // handy for console debugging
 
 /* ---------------- UI helpers ---------------- */
-const TRAIN_BTNS = ['btnLoad','btnPre','btnBuild','btnSummary','btnTrain','btnStop','btnPredict','btnSub','btnProb','btnSaveModel','btnBestTh','btnReset'];
+const TRAIN_BTNS = ['btnLoad','btnPre','btnBuild','btnSummary','btnTrain','btnStop','btnPredict','btnSub','btnProb','btnSaveModel'];
 function setBusy(on){
   S.isTraining = !!on;
   TRAIN_BTNS.forEach(id=>{
@@ -36,28 +38,14 @@ function appendLog(id, line){
   el.textContent += line;
   el.scrollTop = el.scrollHeight;
 }
-function clearUI(){
-  $('kTrain').textContent='—';
-  $('kTest').textContent='—';
-  $('kMiss').textContent='—';
-  $('fixNote').textContent='—';
-  $('preInfo').textContent='—';
-  $('modelSummary').textContent='—';
-  $('trainLog').textContent='—';
-  $('predInfo').textContent='—';
-  $('aucText').textContent='—';
-  $('paramBadge').textContent='';
-  $('previewTable').innerHTML='';
-  $('cmTP').textContent='0';$('cmFN').textContent='0';$('cmFP').textContent='0';$('cmTN').textContent='0';
-  $('prf').textContent='—';
-  $('thSlider').value=0.5; $('thVal').textContent='0.50';
-  const ctx = $('rocCanvas').getContext('2d'); ctx.clearRect(0,0,$('rocCanvas').width,$('rocCanvas').height);
-}
+function showErr(id, msg){ const el=$(id); if(el) el.textContent = msg||''; }
 
-/* --------------- CSV parsing (Kaggle) --------------- */
+/* ---------------- CSV parsing (Kaggle defaults) ---------------- */
 async function parseWithPapa(file, delimiter=',', quoteChar='"'){
-  const text = (await file.text()).replace(/^\uFEFF/, '');
+  if(!file) throw new Error('No file provided');
+  const text = (await file.text()).replace(/^\uFEFF/, ''); // strip BOM
   return new Promise((resolve, reject)=>{
+    if(!window.Papa){ reject(new Error('PapaParse not loaded')); return; }
     Papa.parse(text, {
       header:true, dynamicTyping:true, skipEmptyLines:'greedy',
       delimiter, quoteChar,
@@ -75,13 +63,7 @@ function normalizeRow(row){
   }
   return out;
 }
-function missingPct(rows){
-  if(!rows.length) return 100;
-  const cols=Object.keys(rows[0]); let miss=0, tot=rows.length*cols.length;
-  for(const r of rows){ for(const c of cols){ const v=r[c]; if(v==null||v==='') miss++; } }
-  return +(100*miss/tot).toFixed(1);
-}
-function previewTable(rows, limit=8){
+function previewTable(rows, limit=10){
   if(!rows.length){ $('previewTable').innerHTML=''; return; }
   const cols=Object.keys(rows[0]);
   const head='<thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead>';
@@ -90,8 +72,14 @@ function previewTable(rows, limit=8){
   )).join('')+'</tbody>';
   $('previewTable').innerHTML = `<table>${head}${body}</table>`;
 }
+function missingPct(rows){
+  if(!rows.length) return 0;
+  const cols=Object.keys(rows[0]); let miss=0, tot=rows.length*cols.length;
+  for(const r of rows){ for(const c of cols){ const v=r[c]; if(v==null||v==='') miss++; } }
+  return +(100*miss/tot).toFixed(1);
+}
 
-/* --------------- Column resolver --------------- */
+/* ---------------- Column resolver ---------------- */
 const norm = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
 const ALIAS = new Map(Object.entries({
   gender:'gender', sex:'gender',
@@ -101,13 +89,13 @@ const ALIAS = new Map(Object.entries({
   satisfaction:'satisfaction','satisfied':'satisfaction',
   age:'age',
   flightdistance:'flightdistance','flight_distance':'flightdistance',
-  inflightwifiservice:'inflightwifiservice','inflight_wifi_service':'inflightwifiservice','wifi':'inflightwifiservice',
   departurearrivaltimeconvenient:'timeconvenient','departuretimeconvenient':'timeconvenient','arrivaltimeconvenient':'timeconvenient',
   easeofonlinebooking:'easeonline','ease_online_booking':'easeonline',
   gatelocation:'gatelocation','gate_location':'gatelocation',
   foodanddrink:'fooddrink','food_drink':'fooddrink',
   onlineboarding:'onlineboarding','online_boarding':'onlineboarding',
   seatcomfort:'seatcomfort','seat_comfort':'seatcomfort',
+  inflightwifiservice:'inflightwifiservice','inflight_wifi_service':'inflightwifiservice',
   inflightentertainment:'inflightentertainment','inflight_entertainment':'inflightentertainment',
   onboardservice:'onboardservice','on_board_service':'onboardservice',
   legroomservice:'legroomservice','leg_room_service':'legroomservice',
@@ -125,6 +113,7 @@ function unifyRow(row){
     const key = ALIAS.get(norm(k)) || null;
     if(key){ u[key]=v; }
   }
+  // satisfaction → 1/0
   if('satisfaction' in u){
     const val=u.satisfaction;
     if(typeof val==='string'){
@@ -135,7 +124,7 @@ function unifyRow(row){
   return u;
 }
 
-/* --------------- Stats helpers --------------- */
+/* ---------------- Small stats helpers ---------------- */
 const median = a => { const b=a.filter(x=>x!=null&&!Number.isNaN(+x)).map(Number).sort((x,y)=>x-y);
   if(!b.length) return null; const m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2; };
 const mode = a => { const m=new Map(); let best=null, c=0; for(const v of a){ if(v==null) continue; const k=String(v); const n=(m.get(k)||0)+1; m.set(k,n); if(n>c){c=n; best=k;} } return best; };
@@ -143,13 +132,13 @@ const mean = a => { const b=a.filter(Number.isFinite); return b.length? b.reduce
 const sd   = a => { const b=a.filter(Number.isFinite); if(b.length<2) return 0; const mu=mean(b); return Math.sqrt(b.reduce((s,x)=>s+(x-mu)**2,0)/(b.length-1)); };
 const finite = (x, d=0)=> Number.isFinite(+x) ? +x : d;
 
-/* --------------- Preprocess mapping (FIT ON TRAIN ONLY) --------------- */
-function buildMapping(fitRows){
+/* ---------------- Build mapping (from TRAIN ONLY) ---------------- */
+function buildMapping(trainRows){
   const useCase = $('useCase').value;
   const useCross = $('featCross').checked;
   const useTot   = $('featDelay').checked;
 
-  const T = fitRows.map(unifyRow);
+  const T = trainRows.map(unifyRow);
 
   const CAT_KEYS = ['gender','customertype','typeoftravel','class'];
   const NUM_KEYS_BASE = [
@@ -159,7 +148,6 @@ function buildMapping(fitRows){
   ];
   const NUM_KEYS = [...NUM_KEYS_BASE, ...(useCase==='post'? ['arrivaldelay']:[])];
 
-  // fit numerics on TRAIN ONLY
   const med = {}, mu={}, sig={};
   for(const k of NUM_KEYS){
     const arr = T.map(r => finite(r[k], null)).filter(v=>v!=null);
@@ -168,17 +156,16 @@ function buildMapping(fitRows){
     const vals = T.map(r=> finite(r[k], med[k]));
     mu[k] = mean(vals); sig[k] = sd(vals) || 1;
   }
-  // fit categoricals on TRAIN ONLY
   const catVals = {};
   for(const k of CAT_KEYS){
     const m = mode(T.map(r=> r[k]==null? null : String(r[k])));
-    // capture all seen values + 'UNK'
     const uniq = Array.from(new Set(T.map(r=> r[k]==null ? m : String(r[k]))))
                       .map(v=> v==null?'UNK':String(v));
     const set = new Set(uniq.concat(['UNK']));
     catVals[k] = Array.from(set);
   }
 
+  // optional cross
   let crossVals = [];
   const crossKey = 'classXtypeoftravel';
   if(useCross){
@@ -189,45 +176,45 @@ function buildMapping(fitRows){
     if(!crossVals.includes('UNK|UNK')) crossVals.push('UNK|UNK');
   }
 
+  // deep numeric list (categoricals NOT duplicated to deep)
   const DEEP_NUM = [...NUM_KEYS];
   if(useTot){ DEEP_NUM.push('totaldelay'); }
 
-  const WIDE_SPEC = { cats:[...CAT_KEYS], cross:{enabled:useCross, key:crossKey, values:crossVals} };
-  // deep path uses only normalized numerics (no one-hots) for speed
-  const DEEP_SPEC = { nums:DEEP_NUM, includeCats:false, cats:[...CAT_KEYS] };
+  const WIDE_SPEC = { cats:['gender','customertype','typeoftravel','class'], cross:{enabled:useCross, key:crossKey, values:crossVals} };
+  const DEEP_SPEC = { nums:DEEP_NUM, includeCats:false, cats:['gender','customertype','typeoftravel','class'] };
   const idKey = 'id';
 
   return { useCase, useCross, useTot, med, mu, sig, catVals, WIDE_SPEC, DEEP_SPEC, idKey };
 }
 
+/* ---------------- Impute + Vectorize ---------------- */
 function imputeAndVec(rows, M){
   const Xw=[], Xd=[], Y=[], IDS=[];
   for(let i=0;i<rows.length;i++){
     const r0 = unifyRow(rows[i]);
     const rc = {...r0};
 
-    // CATEGORICAL: impute & clamp to known set, or UNK
+    // cats
     for(const k of Object.keys(M.catVals)){
       const vals=M.catVals[k];
       const v = rc[k];
       rc[k] = (v==null) ? vals[0] : String(v);
       if(!vals.includes(rc[k])) rc[k]='UNK';
     }
-    // NUMERIC: impute with training medians
+    // nums
     for(const k of M.DEEP_SPEC.nums){
       if(k==='totaldelay') continue;
       const raw=rc[k];
       const val=finite(raw, null);
       rc[k] = (val==null) ? M.med[k] : val;
     }
-    // engineered total delay
     if(M.useTot){
       const dep = finite(rc['departuredelay'], M.med['departuredelay']);
       const arr = (M.useCase==='post') ? finite(rc['arrivaldelay'], M.med['arrivaldelay']) : 0;
       rc['totaldelay'] = dep + arr;
     }
 
-    // WIDE = one-hots (cats + optional cross)
+    // wide one-hots
     const w=[];
     for(const k of M.WIDE_SPEC.cats){
       const cats=M.catVals[k];
@@ -239,7 +226,7 @@ function imputeAndVec(rows, M){
       w.push(...cats.map(cv => key===cv ? 1 : 0));
     }
 
-    // DEEP = normalized numerics
+    // deep normalized
     const d=[];
     for(const k of M.DEEP_SPEC.nums){
       const val = finite(rc[k], M.med[k] ?? 0);
@@ -255,7 +242,7 @@ function imputeAndVec(rows, M){
   return { Xwide:Xw, Xdeep:Xd, y: Y.length? Y : null, ids: IDS };
 }
 
-/* --------------- Split & disposals --------------- */
+/* ---------------- Split (stratified) ---------------- */
 function stratifiedSplitRows(rows, rate=0.2){
   const U = rows.map(unifyRow).map((r,idx)=>({...rows[idx], __y: +r.satisfaction}));
   const z = U.filter(r=>r.__y===0), o=U.filter(r=>r.__y===1);
@@ -268,15 +255,7 @@ function stratifiedSplitRows(rows, rate=0.2){
   return { train, val };
 }
 
-function disposeAll(){
-  try{
-    ['xsWTr','xsDTr','ysTr','xsWVa','xsDVa','ysVa'].forEach(k=>{ if(S[k]){ S[k].dispose(); S[k]=null; }});
-    if(S.model){ S.model.dispose(); S.model=null; }
-    S.valProbs=null; S.testProbs=null; S.testIDs=null;
-  }catch{}
-}
-
-/* --------------- Model --------------- */
+/* ---------------- Model ---------------- */
 function buildWideDeep(wideLen, deepLen){
   const wideIn = tf.input({shape:[wideLen], name:'wide'});
   const deepIn = tf.input({shape:[deepLen], name:'deep'});
@@ -296,9 +275,8 @@ function buildWideDeep(wideLen, deepLen){
   return model;
 }
 function modelSummaryText(m){ const lines=[]; m.summary(undefined, undefined, s=>lines.push(s)); return lines.join('\n'); }
-function paramCount(m){ return m.getWeights().reduce((s,w)=>s+w.size,0); }
 
-/* --------------- Metrics --------------- */
+/* ---------------- Metrics ---------------- */
 function rocPoints(yTrue, yProb, steps=200){
   const T=[]; for(let i=0;i<=steps;i++) T.push(i/steps);
   const pts=T.map(th=>{
@@ -320,7 +298,7 @@ function drawROC(canvas, pts){
   ctx.strokeStyle='#233350'; ctx.lineWidth=1;
   for(let i=0;i<=5;i++){const x=i/5; ctx.beginPath(); ctx.moveTo(40+x*(W-60), H-30); ctx.lineTo(40+x*(W-60), 20); ctx.stroke();}
   for(let i=0;i<=5;i++){const y=i/5; ctx.beginPath(); ctx.moveTo(40, 20+y*(H-50)); ctx.lineTo(W-20, 20+y*(H-50)); ctx.stroke();}
-  ctx.strokeStyle='#8AA3FF'; ctx.lineWidth=2; ctx.beginPath();
+  ctx.strokeStyle='#8aa3ff'; ctx.lineWidth=2; ctx.beginPath();
   pts.forEach((p,i)=>{ const x=40+p.x*(W-60), y=H-30-p.y*(H-50); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
   ctx.stroke();
 }
@@ -333,17 +311,8 @@ function confusionStats(yTrue, yProb, th){
   const prec=TP/(TP+FP||1), rec=TP/(TP+FN||1), f1=(2*prec*rec)/((prec+rec)||1);
   return {TP,FP,TN,FN,prec,rec,f1};
 }
-function bestThreshold(yTrue, yProb){
-  let best={th:0.5,f1:-1,stats:null};
-  for(let t=0;t<=1000;t++){
-    const th=t/1000;
-    const s=confusionStats(yTrue,yProb,th);
-    if(s.f1>best.f1){ best={th,f1:s.f1,stats:s}; }
-  }
-  return best;
-}
 
-/* --------------- Early stop --------------- */
+/* ---------------- Early stopping ---------------- */
 let stopFlag=false;
 function earlyStopWithRestore(patience=3, monitor='val_loss'){
   let best=Infinity, wait=0, snap=null;
@@ -367,7 +336,7 @@ function earlyStopWithRestore(patience=3, monitor='val_loss'){
   });
 }
 
-/* --------------- Sanity checks --------------- */
+/* ---------------- Guards ---------------- */
 function ensureReadyForTraining(){
   if(!(S.xsWTr && S.xsDTr && S.ysTr && S.xsWVa && S.xsDVa && S.ysVa)) {
     throw new Error('Tensors not built. Run “Run Preprocessing” again.');
@@ -385,18 +354,27 @@ function ensureReadyForTraining(){
   }
 }
 
-/* --------------- Handlers --------------- */
+/* ---------------- Handlers ---------------- */
+async function initOnce(){
+  // wait for tf + papa
+  if(!(window.tf && window.Papa)) throw new Error('Libraries failed to load.');
+  // backend selection
+  for(const b of ['webgl','cpu']){
+    try{ await tf.setBackend(b); await tf.ready(); if(tf.getBackend()===b) break; }catch{}
+  }
+  console.log('TF backend:', tf.getBackend());
+}
 async function onLoad(){
   try{
+    showErr('loadError',''); showErr('preError',''); showErr('trainError',''); showErr('predError','');
     const fT = $('trainFile')?.files?.[0];
     const fX = $('testFile')?.files?.[0];
-    if(!fT){ alert('Please choose train.csv'); return; }
+    if(!fT){ throw new Error('Please choose train.csv'); }
 
-    // Force Kaggle defaults: comma + double-quote
+    // Kaggle defaults (comma + double-quote)
     const rawTrain = (await parseWithPapa(fT, ',', '"')).map(normalizeRow);
     const rawTest  = fX ? (await parseWithPapa(fX, ',', '"')).map(normalizeRow) : [];
 
-    disposeAll();
     S.rawTrain = rawTrain; S.rawTest = rawTest;
 
     $('kTrain').textContent = rawTrain.length;
@@ -404,75 +382,55 @@ async function onLoad(){
     $('kMiss').textContent  = missingPct(rawTrain) + '%';
     $('fixNote').textContent= '—';
     previewTable(rawTrain);
-  }catch(e){ console.error(e); alert('Load failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('loadError','Load failed: '+(e?.message||e)); }
 }
-
-function onReset(){
-  try{
-    disposeAll();
-    S.rawTrain=[]; S.rawTest=[]; S.map=null; S.valProbs=null; S.testProbs=null; S.thresh=0.5;
-    clearUI();
-    $('trainFile').value=''; $('testFile').value='';
-  }catch(e){ console.error(e); }
-}
-
 function onPreprocess(){
   try{
-    if(!S.rawTrain.length){ alert('Load train.csv first'); return; }
+    showErr('preError','');
+    if(!S.rawTrain.length){ throw new Error('Load train.csv first'); }
 
-    // 1) Split first (so our mapping fits ONLY on train => no leakage)
-    const split = stratifiedSplitRows(S.rawTrain, 0.2);
-    const trainRows = split.train;
-    const valRows   = split.val;
+    // split FIRST → learn preprocessing on TRAIN ONLY (no leakage)
+    const {train, val} = stratifiedSplitRows(S.rawTrain, 0.2);
+    S.map = buildMapping(train);
 
-    // Dispose previous tensors if any
-    disposeAll();
-
-    // 2) Fit mapping on TRAIN ONLY, then transform train & val
-    S.map = buildMapping(trainRows);
-
-    const TV = imputeAndVec(trainRows, S.map);
-    const VV = imputeAndVec(valRows,   S.map);
+    const TV = imputeAndVec(train, S.map);
+    const VV = imputeAndVec(val,   S.map);
 
     S.xsWTr = tf.tensor2d(TV.Xwide, [TV.Xwide.length, TV.Xwide[0].length], 'float32');
     S.xsDTr = tf.tensor2d(TV.Xdeep, [TV.Xdeep.length, TV.Xdeep[0].length], 'float32');
-    S.ysTr  = tf.tensor2d(TV.y,     [TV.y.length, 1], 'float32');
+    S.ysTr  = tf.tensor2d(TV.y, [TV.y.length, 1], 'float32');
 
     S.xsWVa = tf.tensor2d(VV.Xwide, [VV.Xwide.length, VV.Xwide[0].length], 'float32');
     S.xsDVa = tf.tensor2d(VV.Xdeep, [VV.Xdeep.length, VV.Xdeep[0].length], 'float32');
-    S.ysVa  = tf.tensor2d(VV.y,     [VV.y.length, 1], 'float32');
+    S.ysVa  = tf.tensor2d(VV.y, [VV.y.length, 1], 'float32');
 
     $('preInfo').textContent = [
       `Use case: ${S.map.useCase==='pre'?'Pre-flight (ArrivalDelay excluded)':'Post-flight (ArrivalDelay included)'}`,
       `Wide len: ${S.xsWTr.shape[1]} | Deep len: ${S.xsDTr.shape[1]}`,
       `Train: wide ${S.xsWTr.shape} / deep ${S.xsDTr.shape} | Val: wide ${S.xsWVa.shape} / deep ${S.xsDVa.shape}`,
-      `Impute/scale: medians & z-score from TRAIN ONLY`,
+      `Impute stats learned on TRAIN split only (no leakage).`,
       `Engineered: Cross=${S.map.useCross}, TotalDelay=${S.map.useTot}`
     ].join('\n');
-  }catch(e){ console.error(e); alert('Preprocessing failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('preError','Preprocessing failed: '+(e?.message||e)); }
 }
-
 function onBuild(){
   try{
-    if(!S.xsWTr){ alert('Run Preprocessing first'); return; }
-    if(S.model){ S.model.dispose(); S.model=null; }
+    if(!S.xsWTr){ throw new Error('Run Preprocessing first'); }
     S.model = buildWideDeep(S.xsWTr.shape[1], S.xsDTr.shape[1]);
-    const p = paramCount(S.model);
-    $('paramBadge').textContent = `Params: ${p.toLocaleString()}`;
     $('modelSummary').textContent = 'Model built. Click “Show Summary”.';
-  }catch(e){ console.error(e); alert('Build failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('trainError','Build failed: '+(e?.message||e)); }
 }
 function onSummary(){
   try{
-    if(!S.model){ alert('Build model first'); return; }
+    if(!S.model){ throw new Error('Build model first'); }
     $('modelSummary').textContent = modelSummaryText(S.model);
-  }catch(e){ console.error(e); alert('Summary failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('trainError','Summary failed: '+(e?.message||e)); }
 }
 
 async function onTrain(){
   try{
-    if(!S.model){ alert('Build the model first'); return; }
-    if(S.isTraining){ alert('Training is already running. Please wait or click Early Stop.'); return; }
+    if(!S.model){ throw new Error('Build the model first'); }
+    if(S.isTraining){ throw new Error('Training is already running. Please wait or click Early Stop.'); }
 
     ensureReadyForTraining();
     setBusy(true); stopFlag=false;
@@ -500,22 +458,20 @@ async function onTrain(){
     const valProbs = tf.tidy(()=> S.model.predict([S.xsWVa, S.xsDVa]).dataSync());
     S.valProbs = Float32Array.from(valProbs);
     const yTrue = Array.from(S.ysVa.dataSync()).map(v=>+v);
-
     const {points, auc} = rocPoints(yTrue, S.valProbs, 200);
     drawROC($('rocCanvas'), points);
     $('aucText').textContent = auc.toFixed(4);
-
     updateThreshold(S.thresh);
   }catch(e){
     console.error(e);
-    alert('Training failed: ' + (e?.message || e));
+    showErr('trainError','Training failed: ' + (e?.message || e));
   } finally {
     setBusy(false);
   }
 }
 function onStop(){ if(S.isTraining){ stopFlag=true; appendLog('trainLog', 'Early stop requested…\n'); } }
 
-/* --------------- Threshold --------------- */
+/* ---------------- Threshold & Metrics ---------------- */
 function updateThreshold(th){
   $('thVal').textContent=(+th).toFixed(2);
   if(S.valProbs==null) return;
@@ -526,22 +482,21 @@ function updateThreshold(th){
   $('prf').textContent=`Precision: ${(st.prec*100).toFixed(2)}%\nRecall: ${(st.rec*100).toFixed(2)}%\nF1: ${st.f1.toFixed(4)}`;
   S.thresh=+th;
 }
-function onSuggestBestThreshold(){
-  try{
-    if(S.valProbs==null){ alert('Train the model first to compute validation probabilities.'); return; }
-    const yTrue=Array.from(S.ysVa.dataSync()).map(v=>+v);
-    const best = bestThreshold(yTrue, S.valProbs);
-    $('thSlider').value = best.th;
-    updateThreshold(best.th);
-    appendLog('trainLog', `best threshold (max F1): th=${best.th.toFixed(3)}  F1=${best.f1.toFixed(4)}  (P=${(best.stats.prec*100).toFixed(2)}%, R=${(best.stats.rec*100).toFixed(2)}%)\n`);
-  }catch(e){ console.error(e); }
-}
 
-/* --------------- Predict & Export --------------- */
+/* ---------------- Predict & Export ---------------- */
+function downloadCSV(name, rows){
+  if(!rows.length) return;
+  const cols=Object.keys(rows[0]);
+  const esc=v=>{ if(v==null) return ''; const s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; };
+  const csv=[cols.join(',')].concat(rows.map(r=> cols.map(c=>esc(r[c])).join(','))).join('\n');
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
+}
 function onPredict(){
   try{
-    if(!S.model){ alert('Train the model first'); return; }
-    if(!S.rawTest.length){ alert('Load test.csv'); return; }
+    showErr('predError','');
+    if(!S.model){ throw new Error('Train the model first'); }
+    if(!S.rawTest.length){ throw new Error('Load test.csv'); }
 
     const V = imputeAndVec(S.rawTest, S.map);
     const xsW = tf.tensor2d(V.Xwide, [V.Xwide.length, V.Xwide[0].length], 'float32');
@@ -552,48 +507,45 @@ function onPredict(){
     S.testProbs = Float32Array.from(probs);
     S.testIDs   = V.ids;
     $('predInfo').textContent = `Predicted ${S.testProbs.length} rows. Ready to download.`;
-  }catch(e){ console.error(e); alert('Prediction failed: '+(e?.message||e)); }
-}
-function downloadCSV(name, rows){
-  if(!rows.length) return;
-  const cols=Object.keys(rows[0]);
-  const esc=v=>{ if(v==null) return ''; const s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; };
-  const csv=[cols.join(',')].concat(rows.map(r=> cols.map(c=>esc(r[c])).join(','))).join('\n');
-  const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
-  const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
+  }catch(e){ console.error(e); showErr('predError','Prediction failed: '+(e?.message||e)); }
 }
 function onDownloadSubmission(){
   try{
-    if(S.testProbs==null){ alert('Run Predict first'); return; }
+    if(S.testProbs==null){ throw new Error('Run Predict first'); }
     const out = S.testIDs.map((id,i)=>({ id, satisfaction: (S.testProbs[i]>=S.thresh? 1 : 0) }));
     downloadCSV('submission.csv', out);
-  }catch(e){ console.error(e); alert('Download failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('predError','Download failed: '+(e?.message||e)); }
 }
 function onDownloadProbs(){
   try{
-    if(S.testProbs==null){ alert('Run Predict first'); return; }
+    if(S.testProbs==null){ throw new Error('Run Predict first'); }
     const out = S.testIDs.map((id,i)=>({ id, prob_satisfied: S.testProbs[i] }));
     downloadCSV('probabilities.csv', out);
-  }catch(e){ console.error(e); alert('Download failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('predError','Download failed: '+(e?.message||e)); }
 }
 async function onSaveModel(){
   try{
-    if(!S.model){ alert('Train the model first'); return; }
+    if(!S.model){ throw new Error('Train the model first'); }
     await S.model.save('downloads://airline_wide_deep_tfjs');
-  }catch(e){ console.error(e); alert('Save failed: '+(e?.message||e)); }
+  }catch(e){ console.error(e); showErr('predError','Save failed: '+(e?.message||e)); }
 }
 
-/* --------------- Wire-up --------------- */
-window.addEventListener('DOMContentLoaded', ()=>{
+/* ---------------- Wire-up (after DOM & libs) ---------------- */
+window.addEventListener('DOMContentLoaded', async ()=>{
+  try{
+    await initOnce(); // ensures tf & papa are ready; sets backend
+  }catch(e){
+    console.error(e);
+    alert('Libraries failed to initialize. Check your internet connection and refresh.');
+    return;
+  }
   $('btnLoad').addEventListener('click', onLoad);
-  $('btnReset').addEventListener('click', onReset);
   $('btnPre').addEventListener('click', onPreprocess);
   $('btnBuild').addEventListener('click', onBuild);
   $('btnSummary').addEventListener('click', onSummary);
   $('btnTrain').addEventListener('click', onTrain);
   $('btnStop').addEventListener('click', onStop);
   $('thSlider').addEventListener('input', e=>updateThreshold(+e.target.value));
-  $('btnBestTh').addEventListener('click', onSuggestBestThreshold);
   $('btnPredict').addEventListener('click', onPredict);
   $('btnSub').addEventListener('click', onDownloadSubmission);
   $('btnProb').addEventListener('click', onDownloadProbs);
