@@ -16,8 +16,7 @@
     .badge{display:inline-block;padding:4px 8px;border:1px solid var(--border);border-radius:8px;background:var(--glass);color:var(--muted)}
     .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;margin:16px 0}
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    input[type="file"],button,select,input[type="number"]{background:var(--glass);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:8px 12px;cursor:pointer}
-    input[type="number"]{width:120px}
+    input[type="file"],button,select{background:var(--glass);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:8px 12px;cursor:pointer}
     button[disabled]{opacity:.6;cursor:not-allowed}
     button:hover:not([disabled]){outline:1px solid #8aa3ff}
     .kpis{display:flex;gap:12px;flex-wrap:wrap}
@@ -38,7 +37,10 @@
 <body>
 <div class="wrap">
   <h1>Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
-  <div class="badge">GPU/WebGL backend • no data leakage • seeded split • Best-F1 threshold • Reset session</div>
+  <div class="badge">
+    End-to-end in your browser • WebGL if available • Train → ROC → Predict/Export
+    <span id="backendBadge" style="margin-left:8px"></span>
+  </div>
 
   <div class="panel">
     <h2>Data Load</h2>
@@ -46,6 +48,7 @@
       <label>train.csv <input id="trainFile" type="file" accept=".csv"/></label>
       <label>test.csv <input id="testFile" type="file" accept=".csv"/></label>
       <button id="btnLoad">Load Files</button>
+      <button id="btnReset" title="Dispose tensors & clear UI">Reset</button>
       <div class="kpis">
         <div class="kpi">Train rows: <b id="kTrain">—</b></div>
         <div class="kpi">Test rows: <b id="kTest">—</b></div>
@@ -67,7 +70,6 @@
       </label>
       <label><input id="featCross" type="checkbox" checked/> Cross: Class×TypeOfTravel</label>
       <label><input id="featDelay" type="checkbox" checked/> Feature: TotalDelay</label>
-      <label>Split seed <input id="splitSeed" type="number" value="1337"/></label>
       <button id="btnPre">Run Preprocessing</button>
     </div>
     <pre id="preInfo">—</pre>
@@ -78,6 +80,7 @@
     <div class="row">
       <button id="btnBuild">Build Model</button>
       <button id="btnSummary">Show Summary</button>
+      <span class="badge" id="paramBadge"></span>
     </div>
     <pre id="modelSummary">—</pre>
   </div>
@@ -87,7 +90,6 @@
     <div class="row" style="gap:16px;">
       <button id="btnTrain">Train (25 epochs)</button>
       <button id="btnStop">Early Stop</button>
-      <button id="btnReset">Reset Session</button>
       <span class="badge" id="trainStatus"><span id="trainDot" class="dot"></span><span id="trainText">Idle</span></span>
     </div>
     <pre id="trainLog">—</pre>
@@ -98,7 +100,7 @@
     <div class="row" style="gap:16px;align-items:center">
       <div>Threshold: <b id="thVal">0.50</b></div>
       <input id="thSlider" type="range" min="0" max="1" step="0.01" value="0.5" style="width:280px"/>
-      <button id="btnBestTh">Best F1</button>
+      <button id="btnBestTh" title="Max F1 on validation">Suggest best threshold</button>
       <div>AUC: <b id="aucText">—</b></div>
     </div>
     <canvas id="rocCanvas" width="900" height="300"></canvas>
@@ -125,12 +127,12 @@
 </div>
 
 <script>
-  // Prefer GPU (WebGL); fall back to CPU if not available.
   (async ()=>{
+    // Prefer GPU (WebGL); fall back to CPU
     for (const b of ['webgl','cpu']) {
       try { await tf.setBackend(b); await tf.ready(); if (tf.getBackend()===b) break; } catch {}
     }
-    console.log('TF backend:', tf.getBackend());
+    document.getElementById('backendBadge').textContent = `TF backend: ${tf.getBackend()}`;
   })();
 </script>
 <script src="app.js"></script>
