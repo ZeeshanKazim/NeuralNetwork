@@ -4,138 +4,135 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Airline Passenger Satisfaction — Wide & Deep (TF.js)</title>
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
-  <!-- TF.js + PapaParse (CDN) -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" defer></script>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net"/>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4"></script>
   <style>
-    :root{--bg:#0b0f17;--panel:#0f1524;--ink:#e9edf6;--muted:#a7b0c3;--glass:rgba(255,255,255,.06);--border:rgba(255,255,255,.12);--brand:#8aa3ff}
+    :root{ --bg:#0b0f17; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3; --border:rgba(255,255,255,.12); --glass:rgba(255,255,255,.06); }
     *{box-sizing:border-box}
-    body{margin:0;background:radial-gradient(1000px 500px at 10% -10%, #1a2b47 0%, var(--bg) 60%), linear-gradient(180deg,#090f1a,var(--bg));color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
-    .wrap{max-width:1200px;margin:0 auto;padding:22px}
-    h1{margin:0 0 12px}
-    .hint{color:var(--muted);margin-bottom:14px}
-    .panel{background:linear-gradient(180deg,var(--panel),#0b1222);border:1px solid var(--border);border-radius:14px;padding:14px;margin:12px 0}
-    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-    label{display:flex;gap:8px;align-items:center}
-    input[type=file],select,button{background:var(--glass);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:8px 10px}
-    button{cursor:pointer}
-    button[disabled]{opacity:.55;cursor:not-allowed}
-    .kpis{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}
-    .kpi{min-width:160px;background:var(--glass);border:1px solid var(--border);border-radius:10px;padding:10px}
-    .kpi b{font-size:1.1rem}
-    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    @media(max-width:900px){.grid2{grid-template-columns:1fr}}
-    textarea,pre{width:100%;min-height:200px;background:var(--glass);border:1px solid var(--border);border-radius:10px;color:var(--ink);padding:10px;overflow:auto}
-    canvas{width:100%;height:240px;background:var(--glass);border:1px solid var(--border);border-radius:10px}
-    .ok{color:#9ef59f}
-    .bad{color:#ff8f8f}
+    body{margin:0;padding:26px;background:linear-gradient(180deg,#0a0f1a,#0b0f17);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    .wrap{max-width:1200px;margin:0 auto}
+    h1{margin:0 0 10px 0}
+    .badge{display:inline-block;padding:4px 8px;border:1px solid var(--border);border-radius:8px;background:var(--glass);color:var(--muted)}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;margin:16px 0}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    input[type="file"],button,select,input[type="number"]{background:var(--glass);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:8px 12px;cursor:pointer}
+    input[type="number"]{width:120px}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    button:hover:not([disabled]){outline:1px solid #8aa3ff}
+    .kpis{display:flex;gap:12px;flex-wrap:wrap}
+    .kpi{background:var(--glass);border:1px solid var(--border);border-radius:12px;padding:8px 12px}
+    table{border-collapse:collapse;width:100%;background:var(--glass);border:1px solid var(--border)}
+    th,td{padding:8px 10px;border-bottom:1px solid var(--border);font-size:.95rem}
+    th{position:sticky;top:0;background:rgba(255,255,255,.05)}
+    .scroll{max-height:320px;overflow:auto}
+    pre{white-space:pre-wrap;background:var(--glass);border:1px solid var(--border);border-radius:12px;padding:12px}
+    canvas{width:100%;height:280px;border:1px solid var(--border);border-radius:12px;background:#0f1628}
+    .cm{display:grid;grid-template-columns:140px 90px 90px;gap:6px;align-items:center}
+    .cm div{background:var(--glass);border:1px solid var(--border);padding:8px;border-radius:10px;text-align:center}
+    .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#6bd66b}
+    .dot.busy{background:#f5a524;animation:pulse 1s infinite}
+    @keyframes pulse{50%{transform:scale(1.2)}}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
-    <div class="hint">GPU/WebGL on? <span id="backend">…</span> • FAST mode is enabled by default so training completes quickly for class demo.</div>
+<div class="wrap">
+  <h1>Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
+  <div class="badge">GPU/WebGL backend • no data leakage • seeded split • Best-F1 threshold • Reset session</div>
 
-    <!-- Data Load -->
-    <div class="panel">
-      <h2>Data Load</h2>
-      <div class="row" style="margin:8px 0 10px">
-        <label>train.csv <input id="trainFile" type="file" accept=".csv" /></label>
-        <label>test.csv <input id="testFile" type="file" accept=".csv" /></label>
-        <button id="btnLoad">Load Files</button>
-        <label><input id="fastMode" type="checkbox" checked/> FAST train</label>
-        <label><input id="dropService" type="checkbox"/> Drop all service ratings (pre‑flight only)</label>
-      </div>
+  <div class="panel">
+    <h2>Data Load</h2>
+    <div class="row">
+      <label>train.csv <input id="trainFile" type="file" accept=".csv"/></label>
+      <label>test.csv <input id="testFile" type="file" accept=".csv"/></label>
+      <button id="btnLoad">Load Files</button>
       <div class="kpis">
-        <div class="kpi">Train rows: <b id="kTrain">–</b></div>
-        <div class="kpi">Test rows: <b id="kTest">–</b></div>
-        <div class="kpi">Missing% (train): <b id="kMiss">–</b></div>
-        <div class="kpi">Repairs: <b id="kFix">–</b></div>
-      </div>
-      <div class="panel" style="margin-top:12px">
-        <div id="preview" class="hint">Preview will appear after loading (first 8 rows).</div>
+        <div class="kpi">Train rows: <b id="kTrain">—</b></div>
+        <div class="kpi">Test rows: <b id="kTest">—</b></div>
+        <div class="kpi">Missing%: <b id="kMiss">—</b></div>
+        <div class="kpi">Repairs: <b id="fixNote">—</b></div>
       </div>
     </div>
+    <div class="scroll" id="previewTable"></div>
+  </div>
 
-    <!-- Preprocessing -->
-    <div class="panel">
-      <h2>Preprocessing</h2>
-      <div class="row">
-        <label>Use case
-          <select id="useCase">
-            <option value="post">Post‑flight (allow ArrivalDelay)</option>
-            <option value="pre">Pre‑flight (no ArrivalDelay)</option>
-          </select>
-        </label>
-        <button id="btnPrep">Run Preprocessing</button>
-      </div>
-      <pre id="prepLog">–</pre>
+  <div class="panel">
+    <h2>Preprocessing</h2>
+    <div class="row">
+      <label>Use case
+        <select id="useCase">
+          <option value="post">Post-flight recovery (allow ArrivalDelay)</option>
+          <option value="pre">Pre-flight prediction (exclude ArrivalDelay)</option>
+        </select>
+      </label>
+      <label><input id="featCross" type="checkbox" checked/> Cross: Class×TypeOfTravel</label>
+      <label><input id="featDelay" type="checkbox" checked/> Feature: TotalDelay</label>
+      <label>Split seed <input id="splitSeed" type="number" value="1337"/></label>
+      <button id="btnPre">Run Preprocessing</button>
     </div>
+    <pre id="preInfo">—</pre>
+  </div>
 
-    <!-- Model -->
-    <div class="panel">
-      <h2>Model (Wide & Deep)</h2>
-      <div class="row">
-        <button id="btnBuild">Build Model</button>
-        <button id="btnSummary">Show Summary</button>
-        <span class="hint">Prev AUC: <b id="prevAuc">–</b> • Last run: <b id="lastAuc">–</b></span>
-      </div>
-      <pre id="modelSummary">–</pre>
+  <div class="panel">
+    <h2>Model (Wide & Deep)</h2>
+    <div class="row">
+      <button id="btnBuild">Build Model</button>
+      <button id="btnSummary">Show Summary</button>
     </div>
+    <pre id="modelSummary">—</pre>
+  </div>
 
-    <!-- Training -->
-    <div class="panel">
-      <h2>Training</h2>
-      <div class="row">
-        <button id="btnTrain">Train</button>
-        <button id="btnStop">Early Stop</button>
-        <span class="hint">Status: <span id="trainStatus">Idle</span></span>
-        <button id="btnQuickCompare">Quick Compare AUC (Pre vs Post)</button>
-      </div>
-      <pre id="trainLog">–</pre>
+  <div class="panel">
+    <h2>Training</h2>
+    <div class="row" style="gap:16px;">
+      <button id="btnTrain">Train (25 epochs)</button>
+      <button id="btnStop">Early Stop</button>
+      <button id="btnReset">Reset Session</button>
+      <span class="badge" id="trainStatus"><span id="trainDot" class="dot"></span><span id="trainText">Idle</span></span>
     </div>
+    <pre id="trainLog">—</pre>
+  </div>
 
-    <!-- Metrics -->
-    <div class="panel">
-      <h2>Metrics</h2>
-      <div class="row">Threshold:&nbsp;<b id="thVal">0.50</b>
-        <input id="thSlider" type="range" min="0" max="1" step="0.01" value="0.5" style="width:240px"/>
-        <span class="hint">AUC: <b id="auc">–</b> • Pre‑only AUC: <b id="aucPre">–</b> • Post AUC: <b id="aucPost">–</b></span>
-      </div>
-      <div class="grid2" style="margin-top:10px">
-        <canvas id="roc"></canvas>
-        <div>
-          <div class="row" style="gap:14px;margin:6px 0 10px">
-            <div>Pred 1</div><div>Pred 0</div>
-          </div>
-          <div class="row" style="gap:14px">
-            <div>True 1: <b id="cm11">–</b></div>
-            <div><b id="cm10">–</b></div>
-          </div>
-          <div class="row" style="gap:14px;margin-top:8px">
-            <div>True 0: <b id="cm01">–</b></div>
-            <div><b id="cm00">–</b></div>
-          </div>
-          <div class="hint" style="margin-top:12px">Precision: <b id="prec">–</b> • Recall: <b id="rec">–</b> • F1: <b id="f1">–</b></div>
-        </div>
-      </div>
+  <div class="panel">
+    <h2>Metrics</h2>
+    <div class="row" style="gap:16px;align-items:center">
+      <div>Threshold: <b id="thVal">0.50</b></div>
+      <input id="thSlider" type="range" min="0" max="1" step="0.01" value="0.5" style="width:280px"/>
+      <button id="btnBestTh">Best F1</button>
+      <div>AUC: <b id="aucText">—</b></div>
     </div>
-
-    <!-- Predict & Export -->
-    <div class="panel">
-      <h2>Predict & Export</h2>
-      <div class="row">
-        <button id="btnPredict">Predict test.csv</button>
-        <button id="btnSub">Download submission.csv</button>
-        <button id="btnProb">Download probabilities.csv</button>
-        <button id="btnSave">Save model</button>
+    <canvas id="rocCanvas" width="900" height="300"></canvas>
+    <div class="row" style="margin-top:10px">
+      <div class="cm">
+        <div></div><div><b>Pred 1</b></div><div><b>Pred 0</b></div>
+        <div><b>True 1</b></div><div id="cmTP">0</div><div id="cmFN">0</div>
+        <div><b>True 0</b></div><div id="cmFP">0</div><div id="cmTN">0</div>
       </div>
-      <div id="exportMsg" class="hint" style="margin-top:8px">–</div>
+      <pre id="prf" style="flex:1;margin-left:12px">—</pre>
     </div>
   </div>
 
-  <!-- Your app logic MUST be deferred so DOM exists before it runs -->
-  <script src="./app.js" defer></script>
+  <div class="panel">
+    <h2>Predict & Export</h2>
+    <div class="row">
+      <button id="btnPredict">Predict test.csv</button>
+      <button id="btnSub">Download submission.csv</button>
+      <button id="btnProb">Download probabilities.csv</button>
+      <button id="btnSaveModel">Save model</button>
+    </div>
+    <pre id="predInfo">—</pre>
+  </div>
+</div>
+
+<script>
+  // Prefer GPU (WebGL); fall back to CPU if not available.
+  (async ()=>{
+    for (const b of ['webgl','cpu']) {
+      try { await tf.setBackend(b); await tf.ready(); if (tf.getBackend()===b) break; } catch {}
+    }
+    console.log('TF backend:', tf.getBackend());
+  })();
+</script>
+<script src="app.js"></script>
 </body>
 </html>
