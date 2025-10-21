@@ -4,25 +4,31 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Airline Passenger Satisfaction — Wide & Deep (TF.js)</title>
-  <link rel="preconnect" href="https://cdn.jsdelivr.net"/>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4"></script>
+
+  <!-- Libs (deferred; order preserved) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+
   <style>
-    :root{ --bg:#0b0f17; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3; --border:rgba(255,255,255,.12); --glass:rgba(255,255,255,.06); }
+    :root{ --bg:#0b0f17; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3;
+           --border:rgba(255,255,255,.12); --glass:rgba(255,255,255,.06); }
     *{box-sizing:border-box}
-    body{margin:0;padding:26px;background:linear-gradient(180deg,#0a0f1a,#0b0f17);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    body{margin:0;padding:26px;background:linear-gradient(180deg,#0a0f1a,#0b0f17);
+         color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
     .wrap{max-width:1200px;margin:0 auto}
-    h1{margin:0 0 10px 0}
-    .badge{display:inline-block;padding:4px 8px;border:1px solid var(--border);border-radius:8px;background:var(--glass);color:var(--muted)}
+    h1{margin:0 0 10px}
+    .badge{display:inline-block;padding:4px 8px;border:1px solid var(--border);
+           border-radius:8px;background:var(--glass);color:var(--muted)}
     .panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;margin:16px 0}
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    input[type="file"],button,select{background:var(--glass);color:var(--ink);border:1px solid var(--border);border-radius:10px;padding:8px 12px;cursor:pointer}
+    input[type="file"],button,select{background:var(--glass);color:var(--ink);border:1px solid var(--border);
+           border-radius:10px;padding:8px 12px;cursor:pointer}
     button[disabled]{opacity:.6;cursor:not-allowed}
     button:hover:not([disabled]){outline:1px solid #8aa3ff}
     .kpis{display:flex;gap:12px;flex-wrap:wrap}
     .kpi{background:var(--glass);border:1px solid var(--border);border-radius:12px;padding:8px 12px}
     table{border-collapse:collapse;width:100%;background:var(--glass);border:1px solid var(--border)}
-    th,td{padding:8px 10px;border-bottom:1px solid var(--border);font-size:.95rem}
+    th,td{padding:8px 10px;border-bottom:1px solid var(--border);font-size:.95rem;white-space:nowrap}
     th{position:sticky;top:0;background:rgba(255,255,255,.05)}
     .scroll{max-height:320px;overflow:auto}
     pre{white-space:pre-wrap;background:var(--glass);border:1px solid var(--border);border-radius:12px;padding:12px}
@@ -32,15 +38,13 @@
     .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#6bd66b}
     .dot.busy{background:#f5a524;animation:pulse 1s infinite}
     @keyframes pulse{50%{transform:scale(1.2)}}
+    .err{color:#ff9aa2}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
-  <div class="badge">
-    End-to-end in your browser • WebGL if available • Train → ROC → Predict/Export
-    <span id="backendBadge" style="margin-left:8px"></span>
-  </div>
+  <div class="badge">Upload CSVs → Preprocess → Build → Train → ROC → Predict/Export. Runs fully in your browser.</div>
 
   <div class="panel">
     <h2>Data Load</h2>
@@ -48,7 +52,6 @@
       <label>train.csv <input id="trainFile" type="file" accept=".csv"/></label>
       <label>test.csv <input id="testFile" type="file" accept=".csv"/></label>
       <button id="btnLoad">Load Files</button>
-      <button id="btnReset" title="Dispose tensors & clear UI">Reset</button>
       <div class="kpis">
         <div class="kpi">Train rows: <b id="kTrain">—</b></div>
         <div class="kpi">Test rows: <b id="kTest">—</b></div>
@@ -57,6 +60,7 @@
       </div>
     </div>
     <div class="scroll" id="previewTable"></div>
+    <div id="loadError" class="err"></div>
   </div>
 
   <div class="panel">
@@ -73,6 +77,7 @@
       <button id="btnPre">Run Preprocessing</button>
     </div>
     <pre id="preInfo">—</pre>
+    <div id="preError" class="err"></div>
   </div>
 
   <div class="panel">
@@ -80,7 +85,7 @@
     <div class="row">
       <button id="btnBuild">Build Model</button>
       <button id="btnSummary">Show Summary</button>
-      <span class="badge" id="paramBadge"></span>
+      <span class="badge" id="trainStatus"><span id="trainDot" class="dot"></span><span id="trainText">Idle</span></span>
     </div>
     <pre id="modelSummary">—</pre>
   </div>
@@ -90,9 +95,9 @@
     <div class="row" style="gap:16px;">
       <button id="btnTrain">Train (25 epochs)</button>
       <button id="btnStop">Early Stop</button>
-      <span class="badge" id="trainStatus"><span id="trainDot" class="dot"></span><span id="trainText">Idle</span></span>
     </div>
     <pre id="trainLog">—</pre>
+    <div id="trainError" class="err"></div>
   </div>
 
   <div class="panel">
@@ -100,7 +105,6 @@
     <div class="row" style="gap:16px;align-items:center">
       <div>Threshold: <b id="thVal">0.50</b></div>
       <input id="thSlider" type="range" min="0" max="1" step="0.01" value="0.5" style="width:280px"/>
-      <button id="btnBestTh" title="Max F1 on validation">Suggest best threshold</button>
       <div>AUC: <b id="aucText">—</b></div>
     </div>
     <canvas id="rocCanvas" width="900" height="300"></canvas>
@@ -123,18 +127,11 @@
       <button id="btnSaveModel">Save model</button>
     </div>
     <pre id="predInfo">—</pre>
+    <div id="predError" class="err"></div>
   </div>
 </div>
 
-<script>
-  (async ()=>{
-    // Prefer GPU (WebGL); fall back to CPU
-    for (const b of ['webgl','cpu']) {
-      try { await tf.setBackend(b); await tf.ready(); if (tf.getBackend()===b) break; } catch {}
-    }
-    document.getElementById('backendBadge').textContent = `TF backend: ${tf.getBackend()}`;
-  })();
-</script>
-<script src="app.js"></script>
+<!-- App code (deferred) -->
+<script defer src="app.js"></script>
 </body>
 </html>
