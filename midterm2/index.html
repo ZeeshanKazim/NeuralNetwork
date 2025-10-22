@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Airline Satisfaction — Wide & Deep (Fast TF.js)</title>
   <link rel="preconnect" href="https://cdn.jsdelivr.net"/>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4"></script>
+  <!-- libs first -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4" defer></script>
   <style>
     :root{ --bg:#0b0f17; --panel:#0f1524; --ink:#e9edf6; --muted:#a7b0c3; --border:rgba(255,255,255,.12); --glass:rgba(255,255,255,.06); }
     *{box-sizing:border-box}
@@ -32,6 +33,7 @@
     .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#6bd66b}
     .dot.busy{background:#f5a524;animation:pulse 1s infinite}
     @keyframes pulse{50%{transform:scale(1.2)}}
+    .err{background:#2a1220;border:1px solid #b5476d;color:#ffd9e2;border-radius:12px;padding:10px;margin:12px 0;display:none}
   </style>
 </head>
 <body>
@@ -39,11 +41,13 @@
   <h1>Airline Passenger Satisfaction — Wide & Deep (TF.js)</h1>
   <div class="badge">GPU/WebGL backend • smaller deep model • fewer epochs • bigger batch. Upload CSVs → Preprocess → Build → Train → ROC → Predict/Export.</div>
 
+  <div id="errBox" class="err"></div>
+
   <div class="panel">
     <h2>Data Load</h2>
     <div class="row">
-      <label>train.csv <input id="trainFile" type="file" accept=".csv"/></label>
-      <label>test.csv <input id="testFile" type="file" accept=".csv"/></label>
+      <label>train.csv <input id="trainFile" type="file" accept=".csv,text/csv"/></label>
+      <label>test.csv <input id="testFile" type="file" accept=".csv,text/csv"/></label>
       <button id="btnLoad" type="button">Load Files</button>
       <div class="kpis">
         <div class="kpi">Train rows: <b id="kTrain">—</b></div>
@@ -60,8 +64,8 @@
     <div class="row">
       <label>Use case
         <select id="useCase">
-          <option value="post">Post‑flight recovery (allow ArrivalDelay)</option>
-          <option value="pre">Pre‑flight prediction (exclude ArrivalDelay)</option>
+          <option value="post">Post-flight recovery (allow ArrivalDelay)</option>
+          <option value="pre">Pre-flight prediction (exclude ArrivalDelay)</option>
         </select>
       </label>
       <label><input id="featCross" type="checkbox" checked/> Cross: Class×TypeOfTravel</label>
@@ -120,16 +124,20 @@
   </div>
 </div>
 
-<script>
-  // Prefer GPU (WebGL); fall back to CPU if not available.
+<!-- backend select (after tfjs loads via defer) -->
+<script defer>
   (async ()=>{
-    for (var i=0;i<2;i++){
-      var b = (i===0?'webgl':'cpu');
-      try { await tf.setBackend(b); await tf.ready(); if (tf.getBackend()===b) break; } catch (e) {}
-    }
-    console.log('TF backend:', tf.getBackend());
+    try{
+      for (var i=0;i<2;i++){
+        var b = i===0 ? 'webgl' : 'cpu';
+        try { await tf.setBackend(b); await tf.ready(); if (tf.getBackend()===b) break; } catch(e){}
+      }
+      console.log('TF backend:', tf.getBackend());
+    }catch(e){ console.warn('TF backend selection failed', e); }
   })();
 </script>
-<script src="app.js"></script>
+
+<!-- your app -->
+<script src="app.js" defer></script>
 </body>
 </html>
