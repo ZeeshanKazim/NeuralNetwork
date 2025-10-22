@@ -1,6 +1,7 @@
 /* =========================================================================
    Airline Passenger Satisfaction — Wide & Deep (TF.js)
-   FAST BUILD (GPU, fewer epochs, larger batch, smaller deep path)
+   Small compatibility fixes: no optional chaining/nullish ops,
+   resilient event wiring, safer file reading, visible error banner.
    ========================================================================= */
 
 var S = {
@@ -16,16 +17,30 @@ var S = {
 
 function $(id){ return document.getElementById(id); }
 
+/* ---------- error surface ---------- */
+function showErr(msg){
+  try{
+    var box = $('errBox');
+    if(!box) return alert(msg);
+    box.style.display = 'block';
+    box.textContent = String(msg || 'Unknown error');
+  }catch(e){ /* noop */ }
+}
+window.addEventListener('error', function(e){
+  console.error(e?.error || e.message || e);
+  showErr('JavaScript error: ' + (e.message || e.error || e));
+});
+
 /* ---------------- UI helpers ---------------- */
 var TRAIN_BTNS = ['btnLoad','btnPre','btnBuild','btnSummary','btnTrain','btnStop','btnPredict','btnSub','btnProb','btnSaveModel'];
 function setBusy(on){
   S.isTraining = !!on;
-  for (var i=0;i<TRAIN_BTNS.length;i++){
+  for(var i=0;i<TRAIN_BTNS.length;i++){
     var el=$(TRAIN_BTNS[i]); if(!el) continue;
     if(TRAIN_BTNS[i]==='btnStop'){ el.disabled = !on; } else { el.disabled = !!on; }
   }
   var dot=$('trainDot'), txt=$('trainText');
-  if(dot && txt){ if(on){ dot.classList.add('busy'); txt.textContent='Training…'; } else { dot.classList.remove('busy'); txt.textContent='Idle'; } }
+  if(dot&&txt){ if(on){ dot.classList.add('busy'); txt.textContent='Training…'; } else { dot.classList.remove('busy'); txt.textContent='Idle'; } }
 }
 function appendLog(id, line){
   var el=$(id); if(!el) return;
@@ -35,24 +50,36 @@ function appendLog(id, line){
 }
 
 /* --------------- CSV parsing (Kaggle) --------------- */
+function fileToText(file){
+  return new Promise(function(resolve,reject){
+    try{
+      var r = new FileReader();
+      r.onload = function(ev){
+        var s = String(ev.target.result || '').replace(/^\uFEFF/,'');
+        resolve(s);
+      };
+      r.onerror = function(e){ reject(e); };
+      r.readAsText(file);
+    }catch(e){ reject(e); }
+  });
+}
 async function parseWithPapa(file, delimiter, quoteChar){
-  delimiter = delimiter || ',';
-  quoteChar = quoteChar || '"';
-  var text = (await file.text()).replace(/^\uFEFF/, '');
+  if(!window.Papa){ throw new Error('PapaParse not loaded'); }
+  var text = await fileToText(file);
   return new Promise(function(resolve, reject){
     Papa.parse(text, {
       header:true, dynamicTyping:true, skipEmptyLines:'greedy',
-      delimiter: delimiter, quoteChar: quoteChar,
-      complete: function(r){ resolve(r.data); },
-      error: reject
+      delimiter: delimiter || ',', quoteChar: quoteChar || '"',
+      complete: function(r){ resolve(r.data || []); },
+      error: function(err){ reject(err); }
     });
   });
 }
 function normalizeRow(row){
-  var out={}, k, v;
-  for(k in row){
+  var out={};
+  for(var k in row){
     if(!Object.prototype.hasOwnProperty.call(row,k)) continue;
-    v=row[k];
+    var v = row[k];
     if(v===''||v===undefined) out[k]=null;
     else if(typeof v==='string'){ var t=v.trim(); out[k]=t===''? null : t; }
     else out[k]=v;
@@ -65,21 +92,22 @@ function missingPct(rows){
   for(var i=0;i<rows.length;i++){
     var r=rows[i];
     for(var j=0;j<cols.length;j++){
-      var c=cols[j]; var v=r[c]; if(v==null||v==='') miss++;
+      var v=r[cols[j]];
+      if(v==null||v==='') miss++;
     }
   }
   return +(100*miss/tot).toFixed(1);
 }
 function previewTable(rows, limit){
-  limit = limit || 8;
-  var el = $('previewTable'); if(!el) return;
-  if(!rows.length){ el.innerHTML=''; return; }
+  limit = (typeof limit==='number'? limit : 8);
+  var host=$('previewTable'); if(!host) return;
+  if(!rows.length){ host.innerHTML=''; return; }
   var cols=Object.keys(rows[0]);
   var head='<thead><tr>'+cols.map(function(c){return '<th>'+c+'</th>';}).join('')+'</tr></thead>';
   var body='<tbody>'+rows.slice(0,limit).map(function(r){
-    return '<tr>'+cols.map(function(c){ var v=r[c]; return '<td>'+(v==null?'':v)+'</td>'; }).join('')+'</tr>';
+    return '<tr>'+cols.map(function(c){ return '<td>'+(r[c]==null? '' : r[c])+'</td>'; }).join('')+'</tr>';
   }).join('')+'</tbody>';
-  el.innerHTML = '<table>'+head+body+'</table>';
+  host.innerHTML = '<table>'+head+body+'</table>';
 }
 
 /* --------------- Column resolver --------------- */
@@ -88,7 +116,7 @@ var ALIAS = new Map(Object.entries({
   gender:'gender', sex:'gender',
   customertype:'customertype','customer_type':'customertype',
   typeoftravel:'typeoftravel','type_of_travel':'typeoftravel',
-  class:'class',
+  'class':'class',
   satisfaction:'satisfaction','satisfied':'satisfaction',
   age:'age',
   flightdistance:'flightdistance','flight_distance':'flightdistance',
@@ -111,12 +139,11 @@ var ALIAS = new Map(Object.entries({
   id:'id', passengerid:'id'
 }));
 function unifyRow(row){
-  var u={}, k, v, key;
-  for(k in row){
+  var u={};
+  for(var k in row){
     if(!Object.prototype.hasOwnProperty.call(row,k)) continue;
-    v=row[k];
-    key = ALIAS.get(norm(k)) || null;
-    if(key){ u[key]=v; }
+    var key = ALIAS.get(norm(k)) || null;
+    if(key){ u[key]=row[k]; }
   }
   if(Object.prototype.hasOwnProperty.call(u,'satisfaction')){
     var val=u.satisfaction;
@@ -130,8 +157,11 @@ function unifyRow(row){
 
 /* --------------- Stats --------------- */
 function median(a){
-  var b=a.filter(function(x){return x!=null && !Number.isNaN(+x);}).map(Number).sort(function(x,y){return x-y;});
-  if(!b.length) return null; var m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2;
+  var b=[];
+  for(var i=0;i<a.length;i++){ var x=a[i]; if(x!=null && !Number.isNaN(+x)) b.push(+x); }
+  b.sort(function(x,y){return x-y;});
+  if(!b.length) return null;
+  var m=Math.floor(b.length/2); return b.length%2? b[m] : (b[m-1]+b[m])/2;
 }
 function mode(a){
   var m=new Map(); var best=null, c=0;
@@ -140,7 +170,7 @@ function mode(a){
 }
 function mean(a){ var b=a.filter(Number.isFinite); return b.length? b.reduce(function(s,x){return s+x;},0)/b.length : 0; }
 function sd(a){ var b=a.filter(Number.isFinite); if(b.length<2) return 0; var mu=mean(b); return Math.sqrt(b.reduce(function(s,x){return s+(x-mu)*(x-mu);},0)/(b.length-1)); }
-function finite(x, d){ d = (d===undefined?0:d); return Number.isFinite(+x) ? +x : d; }
+function finite(x, d){ d = (typeof d==='number'? d : 0); return Number.isFinite(+x) ? +x : d; }
 
 /* --------------- Preprocess mapping --------------- */
 function buildMapping(trainRows){
@@ -161,7 +191,7 @@ function buildMapping(trainRows){
 
   var med = {}, mu={}, sig={};
   for(var i=0;i<NUM_KEYS.length;i++){
-    var k = NUM_KEYS[i];
+    var k=NUM_KEYS[i];
     var arr = T.map(function(r){ return finite(r[k], null); }).filter(function(v){ return v!=null; });
     var m = median(arr);
     med[k] = Number.isFinite(m) ? m : 0;
@@ -169,11 +199,11 @@ function buildMapping(trainRows){
     mu[k] = mean(vals); sig[k] = sd(vals) || 1;
   }
   var catVals = {};
-  for(var j=0;j<CAT_KEYS.length;j++){
-    var ck = CAT_KEYS[j];
-    var m2 = mode(T.map(function(r){ return r[ck]==null? null : String(r[ck]); }));
-    var uniq = Array.from(new Set(T.map(function(r){ return r[ck]==null ? m2 : String(r[ck]); })))
-                    .map(function(v){ return v==null?'UNK':String(v); });
+  for(i=0;i<CAT_KEYS.length;i++){
+    var ck = CAT_KEYS[i];
+    var mv = mode(T.map(function(r){ return r[ck]==null? null : String(r[ck]); }));
+    var uniq = Array.from(new Set(T.map(function(r){ return r[ck]==null ? mv : String(r[ck]); })))
+                    .map(function(v){ return v==null? 'UNK' : String(v); });
     var set = new Set(uniq.concat(['UNK']));
     catVals[ck] = Array.from(set);
   }
@@ -182,7 +212,7 @@ function buildMapping(trainRows){
   var crossKey = 'classXtypeoftravel';
   if(useCross){
     crossVals = Array.from(new Set(T.map(function(r){
-      var c = (r.class != null ? r.class : 'UNK') + '|' + (r.typeoftravel != null ? r.typeoftravel : 'UNK');
+      var c = (r['class'] != null ? r['class'] : 'UNK') + '|' + (r['typeoftravel'] != null ? r['typeoftravel'] : 'UNK');
       return String(c);
     })));
     if(crossVals.indexOf('UNK|UNK')===-1) crossVals.push('UNK|UNK');
@@ -192,7 +222,7 @@ function buildMapping(trainRows){
   if(useTot){ DEEP_NUM.push('totaldelay'); }
 
   var WIDE_SPEC = { cats: CAT_KEYS.slice(), cross:{enabled:useCross, key:crossKey, values:crossVals} };
-  var DEEP_SPEC = { nums:DEEP_NUM, includeCats:false, cats: CAT_KEYS.slice() };
+  var DEEP_SPEC = { nums:DEEP_NUM, includeCats:false, cats:CAT_KEYS.slice() };
   var idKey = 'id';
 
   return { useCase:useCase, useCross:useCross, useTot:useTot, med:med, mu:mu, sig:sig, catVals:catVals, WIDE_SPEC:WIDE_SPEC, DEEP_SPEC:DEEP_SPEC, idKey:idKey };
@@ -203,22 +233,20 @@ function imputeAndVec(rows, M){
   for(var i=0;i<rows.length;i++){
     var r0 = unifyRow(rows[i]);
     var rc = {};
-    for(var p in r0){ if(Object.prototype.hasOwnProperty.call(r0,p)) rc[p]=r0[p]; }
+    for(var k in r0){ rc[k]=r0[k]; }
 
-    var k, vals, v;
-    for(k in M.catVals){
-      if(!Object.prototype.hasOwnProperty.call(M.catVals,k)) continue;
-      vals=M.catVals[k];
-      v = rc[k];
-      rc[k] = (v==null) ? vals[0] : String(v);
-      if(vals.indexOf(rc[k])===-1) rc[k]='UNK';
+    for(var ck in M.catVals){
+      var vals=M.catVals[ck];
+      var v = rc[ck];
+      rc[ck] = (v==null) ? vals[0] : String(v);
+      if(vals.indexOf(rc[ck])===-1) rc[ck]='UNK';
     }
-    for(var n=0;n<M.DEEP_SPEC.nums.length;n++){
-      k = M.DEEP_SPEC.nums[n];
-      if(k==='totaldelay') continue;
-      var raw=rc[k];
+    for(var j=0;j<M.DEEP_SPEC.nums.length;j++){
+      var nk=M.DEEP_SPEC.nums[j];
+      if(nk==='totaldelay') continue;
+      var raw=rc[nk];
       var val=finite(raw, null);
-      rc[k] = (val==null) ? M.med[k] : val;
+      rc[nk] = (val==null) ? M.med[nk] : val;
     }
     if(M.useTot){
       var dep = finite(rc['departuredelay'], M.med['departuredelay']);
@@ -227,55 +255,57 @@ function imputeAndVec(rows, M){
     }
 
     var w=[];
-    for(var c=0;c<M.WIDE_SPEC.cats.length;c++){
-      k = M.WIDE_SPEC.cats[c];
-      var cats=M.catVals[k];
-      for(var ci=0; ci<cats.length; ci++){ w.push( rc[k]===cats[ci] ? 1 : 0 ); }
+    for(j=0;j<M.WIDE_SPEC.cats.length;j++){
+      var catKey=M.WIDE_SPEC.cats[j];
+      var cats=M.catVals[catKey];
+      for(var c=0;c<cats.length;c++){ w.push(rc[catKey]===cats[c] ? 1 : 0); }
     }
     if(M.WIDE_SPEC.cross.enabled){
       var key = (rc['class']!=null?rc['class']:'UNK') + '|' + (rc['typeoftravel']!=null?rc['typeoftravel']:'UNK');
       var cats2 = M.WIDE_SPEC.cross.values;
-      for(var cj=0;cj<cats2.length;cj++){ w.push( key===cats2[cj] ? 1 : 0 ); }
+      for(c=0;c<cats2.length;c++){ w.push(key===cats2[c] ? 1 : 0); }
     }
 
     var d=[];
-    for(var q=0;q<M.DEEP_SPEC.nums.length;q++){
-      k = M.DEEP_SPEC.nums[q];
-      var vv = finite(rc[k], (M.med[k]!==undefined?M.med[k]:0));
-      var z = (vv - (M.mu[k]!==undefined?M.mu[k]:0)) / ((M.sig[k]||1));
-      d.push( Number.isFinite(z)? z : 0 );
+    for(j=0;j<M.DEEP_SPEC.nums.length;j++){
+      var nk2=M.DEEP_SPEC.nums[j];
+      var val2 = finite(rc[nk2], (M.med[nk2] != null ? M.med[nk2] : 0));
+      var z = (val2 - (M.mu[nk2] != null ? M.mu[nk2] : 0)) / ((M.sig[nk2] || 1));
+      d.push(Number.isFinite(z)? z : 0);
     }
 
     Xw.push(w); Xd.push(d);
     if(Object.prototype.hasOwnProperty.call(rc,'satisfaction')) Y.push(+rc.satisfaction);
-    var id = Object.prototype.hasOwnProperty.call(r0,'id') ? r0['id'] : (i+1);
+    var id = (Object.prototype.hasOwnProperty.call(r0,'id')) ? r0['id'] : (i+1);
     IDS.push(id);
   }
-  return { Xwide:Xw, Xdeep:Xd, y: (Y.length? Y : null), ids: IDS };
+  return { Xwide:Xw, Xdeep:Xd, y: Y.length? Y : null, ids: IDS };
 }
 
 /* --------------- Split --------------- */
 function stratifiedSplitRows(rows, rate){
-  rate = rate || 0.2;
+  rate = (typeof rate==='number'? rate : 0.2);
   var U = rows.map(unifyRow).map(function(r,idx){
-    var copy = {}; for(var k in rows[idx]) if(Object.prototype.hasOwnProperty.call(rows[idx],k)) copy[k]=rows[idx][k];
-    copy.__y = +r.satisfaction;
-    return copy;
+    var base = {};
+    for(var k in rows[idx]){ base[k]=rows[idx][k]; }
+    base.__y = +r.satisfaction;
+    return base;
   });
   var z = U.filter(function(r){return r.__y===0;}), o=U.filter(function(r){return r.__y===1;});
   function split(arr){
     var a=arr.slice(); tf.util.shuffle(a);
-    var n=Math.max(1, Math.floor(a.length*rate)); return {val:a.slice(0,n), tr:a.slice(n)};
+    var n=Math.max(1, Math.floor(a.length*rate));
+    return {val:a.slice(0,n), tr:a.slice(n)};
   }
   var A=split(z), B=split(o);
   var train=A.tr.concat(B.tr), val=A.val.concat(B.val);
   tf.util.shuffle(train); tf.util.shuffle(val);
-  for(var i=0;i<train.length;i++) delete train[i].__y;
-  for(var j=0;j<val.length;j++) delete val[j].__y;
+  for(var i=0;i<train.length;i++){ delete train[i].__y; }
+  for(i=0;i<val.length;i++){ delete val[i].__y; }
   return { train:train, val:val };
 }
 
-/* --------------- Model (smaller deep) --------------- */
+/* --------------- Model --------------- */
 function buildWideDeep(wideLen, deepLen){
   var wideIn = tf.input({shape:[wideLen], name:'wide'});
   var deepIn = tf.input({shape:[deepLen], name:'deep'});
@@ -294,9 +324,7 @@ function buildWideDeep(wideLen, deepLen){
   model.compile({optimizer:'adam', loss:'binaryCrossentropy', metrics:['accuracy']});
   return model;
 }
-function modelSummaryText(m){
-  var lines=[]; m.summary(undefined, undefined, function(s){ lines.push(s); }); return lines.join('\n');
-}
+function modelSummaryText(m){ var lines=[]; m.summary(undefined, undefined, function(s){lines.push(s);}); return lines.join('\n'); }
 
 /* --------------- Metrics --------------- */
 function rocPoints(yTrue, yProb, steps){
@@ -308,11 +336,11 @@ function rocPoints(yTrue, yProb, steps){
       var y=yTrue[i], p=yProb[i]>=th?1:0;
       if(y===1&&p===1)TP++; else if(y===0&&p===1)FP++; else if(y===0&&p===0)TN++; else FN++;
     }
-    var TPR=TP/((TP+FN)||1), FPR=FP/((FP+TN)||1);
+    var TPR=TP/(TP+FN||1), FPR=FP/(FP+TN||1);
     return {x:FPR,y:TPR,th:th};
   });
   var s=pts.slice().sort(function(a,b){return a.x-b.x;});
-  var auc=0; for(var j=1;j<s.length;j++){ var a=s[j-1], b=s[j]; auc += (b.x-a.x)*(a.y+b.y)/2; }
+  var auc=0; for(i=1;i<s.length;i++){ var a=s[i-1], b=s[i]; auc += (b.x-a.x)*(a.y+b.y)/2; }
   return {points:s, auc:auc};
 }
 function drawROC(canvas, pts){
@@ -320,7 +348,7 @@ function drawROC(canvas, pts){
   ctx.clearRect(0,0,W,H); ctx.fillStyle='#0f1628'; ctx.fillRect(0,0,W,H);
   ctx.strokeStyle='#233350'; ctx.lineWidth=1;
   for(var i=0;i<=5;i++){var x=i/5; ctx.beginPath(); ctx.moveTo(40+x*(W-60), H-30); ctx.lineTo(40+x*(W-60), 20); ctx.stroke();}
-  for(var j=0;j<=5;j++){var y=j/5; ctx.beginPath(); ctx.moveTo(40, 20+y*(H-50)); ctx.lineTo(W-20, 20+y*(H-50)); ctx.stroke();}
+  for(i=0;i<=5;i++){var y=i/5; ctx.beginPath(); ctx.moveTo(40, 20+y*(H-50)); ctx.lineTo(W-20, 20+y*(H-50)); ctx.stroke();}
   ctx.strokeStyle='#8aa3ff'; ctx.lineWidth=2; ctx.beginPath();
   pts.forEach(function(p,i){ var x=40+p.x*(W-60), y=H-30-p.y*(H-50); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
   ctx.stroke();
@@ -331,32 +359,29 @@ function confusionStats(yTrue, yProb, th){
     var y=yTrue[i], p=yProb[i]>=th?1:0;
     if(y===1&&p===1)TP++; else if(y===0&&p===1)FP++; else if(y===0&&p===0)TN++; else FN++;
   }
-  var prec=TP/((TP+FP)||1), rec=TP/((TP+FN)||1), f1=(2*prec*rec)/((prec+rec)||1);
+  var prec=TP/(TP+FP||1), rec=TP/(TP+FN||1), f1=(2*prec*rec)/((prec+rec)||1);
   return {TP:TP,FP:FP,TN:TN,FN:FN,prec:prec,rec:rec,f1:f1};
 }
 
 /* --------------- Early stop --------------- */
 var stopFlag=false;
 function earlyStopWithRestore(patience, monitor){
-  patience = (patience==null?3:patience);
+  patience = (typeof patience==='number'? patience : 3);
   monitor = monitor || 'val_loss';
   var best=Infinity, wait=0, snap=null;
   return new tf.CustomCallback({
-    onBatchEnd: async function(){ await new Promise(function(r){ setTimeout(r,0); }); },
+    onBatchEnd: async function(){ await new Promise(function(r){return setTimeout(r,0);}); },
     onEpochEnd: async function(_e, logs){
       await tf.nextFrame();
-      var cur = logs && (logs[monitor]);
+      var cur=logs && logs[monitor];
       if(cur!=null){
         if(cur<best-1e-12){
           best=cur; wait=0;
-          if(snap) snap.forEach(function(t){ t.dispose(); });
-          snap = S.model.getWeights().map(function(w){ return w.clone(); });
-        }else{
-          wait += 1;
-          if(wait>=patience){
-            if(snap){ S.model.setWeights(snap); snap=null; }
-            S.model.stopTraining=true;
-          }
+          if(snap) snap.forEach(function(t){return t.dispose();});
+          snap = S.model.getWeights().map(function(w){return w.clone();});
+        }else if(++wait>=patience){
+          if(snap){ S.model.setWeights(snap); snap=null; }
+          S.model.stopTraining=true;
         }
       }
       if(stopFlag) S.model.stopTraining=true;
@@ -385,10 +410,10 @@ function ensureReadyForTraining(){
 /* --------------- Handlers --------------- */
 async function onLoad(){
   try{
-    var trainEl = $('trainFile');
-    var testEl  = $('testFile');
-    var fT = (trainEl && trainEl.files && trainEl.files[0]) ? trainEl.files[0] : null;
-    var fX = (testEl && testEl.files && testEl.files[0]) ? testEl.files[0] : null;
+    $('errBox').style.display='none';
+    var tfEl = $('trainFile'), txEl=$('testFile');
+    var fT = tfEl && tfEl.files && tfEl.files[0];
+    var fX = txEl && txEl.files && txEl.files[0];
     if(!fT){ alert('Please choose train.csv'); return; }
 
     var rawTrain = (await parseWithPapa(fT, ',', '"')).map(normalizeRow);
@@ -396,12 +421,12 @@ async function onLoad(){
 
     S.rawTrain = rawTrain; S.rawTest = rawTest;
 
-    $('kTrain').textContent = String(rawTrain.length);
-    $('kTest').textContent  = rawTest.length ? String(rawTest.length) : '—';
+    $('kTrain').textContent = rawTrain.length;
+    $('kTest').textContent  = (rawTest.length ? String(rawTest.length) : '—');
     $('kMiss').textContent  = missingPct(rawTrain) + '%';
     $('fixNote').textContent= '—';
     previewTable(rawTrain);
-  }catch(e){ console.error(e); alert('Load failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Load failed: '+(e && e.message ? e.message : e)); }
 }
 function onPreprocess(){
   try{
@@ -427,20 +452,20 @@ function onPreprocess(){
       'Impute: medians for numerics; modes for categoricals',
       'Engineered: Cross=' + S.map.useCross + ', TotalDelay=' + S.map.useTot
     ].join('\n');
-  }catch(e){ console.error(e); alert('Preprocessing failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Preprocessing failed: '+(e && e.message ? e.message : e)); }
 }
 function onBuild(){
   try{
     if(!S.xsWTr){ alert('Run Preprocessing first'); return; }
     S.model = buildWideDeep(S.xsWTr.shape[1], S.xsDTr.shape[1]);
     $('modelSummary').textContent = 'Model built. Click “Show Summary”.';
-  }catch(e){ console.error(e); alert('Build failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Build failed: '+(e && e.message ? e.message : e)); }
 }
 function onSummary(){
   try{
     if(!S.model){ alert('Build model first'); return; }
     $('modelSummary').textContent = modelSummaryText(S.model);
-  }catch(e){ console.error(e); alert('Summary failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Summary failed: '+(e && e.message ? e.message : e)); }
 }
 
 async function onTrain(){
@@ -463,11 +488,10 @@ async function onTrain(){
         validationData: [[S.xsWVa, S.xsDVa], S.ysVa],
         callbacks: [{
           onEpochEnd: async function(ep, logs){
-            var acc = (typeof logs.acc==='number') ? logs.acc : ((typeof logs.accuracy==='number') ? logs.accuracy : 0);
-            appendLog('trainLog', 'epoch '+(ep+1)+': loss='+logs.loss.toFixed(4)+' val_loss='+logs.val_loss.toFixed(4)+' acc='+acc.toFixed(4)+'\n');
-            if(cb && cb.onEpochEnd) await cb.onEpochEnd(ep, logs);
+            appendLog('trainLog', 'epoch '+(ep+1)+': loss='+logs.loss.toFixed(4)+' val_loss='+logs.val_loss.toFixed(4)+' acc='+( (logs.acc||logs.accuracy||0).toFixed(4) )+'\n');
+            if(cb.onEpochEnd) await cb.onEpochEnd(ep, logs);
           },
-          onBatchEnd: async function(b, logs){ if(cb && cb.onBatchEnd) await cb.onBatchEnd(b, logs); }
+          onBatchEnd: async function(b, logs){ if(cb.onBatchEnd) await cb.onBatchEnd(b, logs); }
         }]
       }
     );
@@ -475,13 +499,13 @@ async function onTrain(){
     var valProbs = tf.tidy(function(){ return S.model.predict([S.xsWVa, S.xsDVa]).dataSync(); });
     S.valProbs = Float32Array.from(valProbs);
     var yTrue = Array.from(S.ysVa.dataSync()).map(function(v){return +v;});
-    var roc = rocPoints(yTrue, S.valProbs, 200);
-    drawROC($('rocCanvas'), roc.points);
-    $('aucText').textContent = roc.auc.toFixed(4);
+    var rp = rocPoints(yTrue, S.valProbs, 200);
+    drawROC($('rocCanvas'), rp.points);
+    $('aucText').textContent = rp.auc.toFixed(4);
     updateThreshold(S.thresh);
   }catch(e){
     console.error(e);
-    alert('Training failed: ' + (e && e.message ? e.message : e));
+    showErr('Training failed: ' + (e && e.message ? e.message : e));
   } finally {
     setBusy(false);
   }
@@ -491,7 +515,7 @@ function onStop(){ if(S.isTraining){ stopFlag=true; appendLog('trainLog', 'Early
 /* --------------- Threshold --------------- */
 function updateThreshold(th){
   $('thVal').textContent=(+th).toFixed(2);
-  if(S.valProbs==null || !S.ysVa) return;
+  if(S.valProbs==null) return;
   var yTrue=Array.from(S.ysVa.dataSync()).map(function(v){return +v;});
   var st=confusionStats(yTrue,S.valProbs,+th);
   $('cmTP').textContent=st.TP; $('cmFN').textContent=st.FN;
@@ -515,55 +539,53 @@ function onPredict(){
     S.testProbs = Float32Array.from(probs);
     S.testIDs   = V.ids;
     $('predInfo').textContent = 'Predicted '+S.testProbs.length+' rows. Ready to download.';
-  }catch(e){ console.error(e); alert('Prediction failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Prediction failed: '+(e && e.message ? e.message : e)); }
 }
 function downloadCSV(name, rows){
   if(!rows.length) return;
   var cols=Object.keys(rows[0]);
   function esc(v){ if(v==null) return ''; var s=String(v); return /[",\n]/.test(s)? '"'+s.replace(/"/g,'""')+'"' : s; }
-  var csv=[cols.join(',')].concat(rows.map(function(r){ return cols.map(function(c){ return esc(r[c]); }).join(','); })).join('\n');
+  var csv=[cols.join(',')].concat(rows.map(function(r){return cols.map(function(c){return esc(r[c]);}).join(',');})).join('\n');
   var blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); var url=URL.createObjectURL(blob);
   var a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
 }
 function onDownloadSubmission(){
   try{
     if(S.testProbs==null){ alert('Run Predict first'); return; }
-    var out = S.testIDs.map(function(id,i){ return { id:id, satisfaction: (S.testProbs[i]>=S.thresh? 1 : 0) }; });
+    var out = S.testIDs.map(function(id,i){return { id:id, satisfaction: (S.testProbs[i]>=S.thresh? 1 : 0) };});
     downloadCSV('submission.csv', out);
-  }catch(e){ console.error(e); alert('Download failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Download failed: '+(e && e.message ? e.message : e)); }
 }
 function onDownloadProbs(){
   try{
     if(S.testProbs==null){ alert('Run Predict first'); return; }
-    var out = S.testIDs.map(function(id,i){ return { id:id, prob_satisfied: S.testProbs[i] }; });
+    var out = S.testIDs.map(function(id,i){return { id:id, prob_satisfied: S.testProbs[i] };});
     downloadCSV('probabilities.csv', out);
-  }catch(e){ console.error(e); alert('Download failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Download failed: '+(e && e.message ? e.message : e)); }
 }
 async function onSaveModel(){
   try{
     if(!S.model){ alert('Train the model first'); return; }
     await S.model.save('downloads://airline_wide_deep_tfjs');
-  }catch(e){ console.error(e); alert('Save failed: '+(e && e.message ? e.message : e)); }
+  }catch(e){ console.error(e); showErr('Save failed: '+(e && e.message ? e.message : e)); }
 }
 
-/* --------------- Wire-up (robust) --------------- */
-function bindUI(){
-  var el;
-  if((el=$('btnLoad'))) el.addEventListener('click', onLoad);
-  if((el=$('btnPre'))) el.addEventListener('click', onPreprocess);
-  if((el=$('btnBuild'))) el.addEventListener('click', onBuild);
-  if((el=$('btnSummary'))) el.addEventListener('click', onSummary);
-  if((el=$('btnTrain'))) el.addEventListener('click', onTrain);
-  if((el=$('btnStop'))) el.addEventListener('click', onStop);
-  if((el=$('thSlider'))) el.addEventListener('input', function(e){ updateThreshold(+e.target.value); });
-  if((el=$('btnPredict'))) el.addEventListener('click', onPredict);
-  if((el=$('btnSub'))) el.addEventListener('click', onDownloadSubmission);
-  if((el=$('btnProb'))) el.addEventListener('click', onDownloadProbs);
-  if((el=$('btnSaveModel'))) el.addEventListener('click', onSaveModel);
+/* --------------- Wire-up (resilient) --------------- */
+function wire(){
+  var map = {
+    btnLoad: onLoad, btnPre: onPreprocess, btnBuild: onBuild, btnSummary: onSummary,
+    btnTrain: onTrain, btnStop: onStop, btnPredict: onPredict,
+    btnSub: onDownloadSubmission, btnProb: onDownloadProbs, btnSaveModel: onSaveModel
+  };
+  for(var id in map){
+    var el=$(id);
+    if(el){ el.addEventListener('click', map[id]); }
+  }
+  var sl=$('thSlider'); if(sl){ sl.addEventListener('input', function(e){ updateThreshold(+e.target.value); }); }
+  console.log('UI wired');
 }
-// Attach listeners immediately if DOM is ready, otherwise wait.
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', bindUI);
-} else {
-  bindUI();
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded', wire);
+}else{
+  wire();
 }
