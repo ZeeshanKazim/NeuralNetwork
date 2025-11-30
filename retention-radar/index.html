@@ -5,89 +5,74 @@
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>AI Retention Radar — E-commerce Churn Scoring</title>
 
-  <!-- CDNs -->
+  <!-- libs -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
   <style>
-    :root{
-      --bg:#0b0f17; --bg2:#0e1320; --card:#101728; --ink:#e9edf6; --muted:#a8b1c6; --accent:#7ee787; --accent2:#8aa3ff; --border:rgba(255,255,255,.12);
-    }
+    :root{--bg:#0b0f17;--bg2:#0e1320;--card:#101728;--ink:#e9edf6;--muted:#a8b1c6;--accent:#7ee787;--accent2:#8aa3ff;--border:rgba(255,255,255,.12)}
     *{box-sizing:border-box;margin:0;padding:0}
     body{min-height:100vh;color:var(--ink);background:
       radial-gradient(1200px 700px at 10% -10%, #1a2b47 0%, var(--bg) 60%),
       radial-gradient(800px 500px at 120% 10%, #222a44 0%, var(--bg2) 60%),
       linear-gradient(180deg,#090f1a, var(--bg2));
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      padding:26px}
+      font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:26px}
     .wrap{max-width:1100px;margin:0 auto}
     .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
     h1{font-size:clamp(1.4rem,2.4vw,2rem)}
     .badge{display:inline-block;font-size:.85rem;color:#111;background:#d2f1d9;border-radius:999px;padding:4px 10px;margin-left:6px}
-    .badge.err{background:#ffd9de}
-    .badge.mut{background:#e1e7f5}
-    .panel{background:linear-gradient(180deg,var(--card),#0c1426); border:1px solid var(--border); border-radius:16px; padding:16px; margin:10px 0}
-    .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center}
+    .err{background:#ffd9de}
+    .mut{color:var(--muted)}
+    .panel{background:linear-gradient(180deg,var(--card),#0c1426);border:1px solid var(--border);border-radius:16px;padding:16px;margin:10px 0}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
     input[type=file]{background:#111929;color:var(--ink);border:1px solid var(--border);padding:10px;border-radius:10px}
     button{background:#1a2340;color:var(--ink);border:1px solid var(--border);padding:10px 14px;border-radius:12px;cursor:pointer}
     button:disabled{opacity:.5;cursor:not-allowed}
-    table{width:100%;border-collapse:collapse;margin-top:8px}
+    .pill{display:inline-block;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#0f182e}
+    .scroll{max-height:420px;overflow:auto;border-radius:8px;border:1px solid var(--border)}
+    table{width:100%;border-collapse:collapse}
     th,td{border-bottom:1px solid var(--border);padding:8px 6px;text-align:left;font-size:.95rem}
-    .grid{display:grid;gap:12px}
-    .cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .grid{display:grid;gap:12px}.cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
     @media(max-width:900px){.cols-2{grid-template-columns:1fr}}
     .kpis{display:flex;gap:12px;flex-wrap:wrap}
     .kpi{background:#0f182e;border:1px solid var(--border);border-radius:12px;padding:10px 12px;min-width:180px}
     .kpi .label{color:var(--muted);font-size:.9rem}
     .kpi .value{font-size:1.2rem;font-weight:700;margin-top:4px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
     .chart{height:320px}
-    .mut{color:var(--muted)}
-    .right{display:flex;gap:8px;align-items:center}
-    .pill{display:inline-block;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#0f182e}
-    .mt8{margin-top:8px}
-    .mt12{margin-top:12px}
-    .mt16{margin-top:16px}
-    .scroll{max-height:420px;overflow:auto;border-radius:8px;border:1px solid var(--border)}
     .foot{margin-top:24px;color:var(--muted);text-align:center;font-size:.9rem}
     code{background:#0e1627;border:1px solid var(--border);padding:2px 6px;border-radius:6px}
+    .tiny{font-size:.85rem}
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="header">
     <h1>AI Retention Radar — E-commerce Churn Scoring</h1>
-    <div class="right">
-      <span>Model:</span><span id="modelStatus" class="badge err">loading…</span>
-      <span>Spec:</span><span id="specStatus" class="badge err">loading…</span>
+    <div>
+      <span>Model:</span> <span id="modelStatus" class="badge err">loading…</span>
+      <span class="tiny" id="modelUrlShown"></span><br/>
+      <span>Spec:</span>  <span id="specStatus"  class="badge err">loading…</span>
+      <span class="tiny" id="specUrlShown"></span>
     </div>
   </div>
   <p class="mut">Load your exported TF.js model, upload a CSV, get probabilities, metrics, and downloads — client-side only.</p>
 
-  <!-- 1) DATA LOAD -->
   <div class="panel">
     <div class="row">
-      <div>
-        <b>1) Data Load</b><br>
-        <span class="mut">Upload CSV (train or test)</span>
-      </div>
+      <div><b>1) Data Load</b><br><span class="mut">Upload CSV (train or test)</span></div>
       <input id="csvFile" type="file" accept=".csv,text/csv"/>
       <span id="shape" class="pill">Rows: — | Cols: —</span>
     </div>
-    <div id="previewWrap" class="mt12">
+    <div id="previewWrap" style="margin-top:12px">
       <div class="mut">Preview</div>
-      <div class="scroll">
-        <table id="preview"></table>
-      </div>
+      <div class="scroll"><table id="preview"></table></div>
     </div>
   </div>
 
-  <!-- 2) PREPROCESS & PREDICT -->
   <div class="panel">
     <div class="row">
-      <div>
-        <b>2) Preprocess & Predict</b>
-      </div>
+      <b>2) Preprocess & Predict</b>
       <button id="btnPredict" disabled>Run Predictions</button>
       <span class="pill" id="scoredRows">Scored Rows: —</span>
       <span class="pill" id="hasLabels">Has Labels: —</span>
@@ -95,21 +80,19 @@
     </div>
   </div>
 
-  <!-- 3) ROC -->
   <div class="panel">
     <b>3) ROC Curve</b>
     <div class="chart"><canvas id="rocChart"></canvas></div>
-    <div class="mut mt8">Upload a CSV with the label column to display ROC/AUC.</div>
+    <div class="mut" style="margin-top:8px">Upload a CSV with the label column to display ROC/AUC.</div>
   </div>
 
-  <!-- 4) THRESHOLD -->
   <div class="panel">
     <b>4) Threshold, Confusion & F1</b>
-    <div class="row mt8">
+    <div class="row" style="margin-top:8px">
       <label for="thr">Threshold: <code id="thrVal">0.50</code></label>
       <input id="thr" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1"/>
     </div>
-    <div class="grid cols-2 mt12">
+    <div class="grid cols-2" style="margin-top:12px">
       <table>
         <thead><tr><th>Metric</th><th>Value</th></tr></thead>
         <tbody id="metricsBody">
@@ -130,21 +113,20 @@
     </div>
   </div>
 
-  <!-- 5) TOP RISK -->
   <div class="panel">
     <div class="row">
       <b>5) Top Risk — Churn Ranking</b>
       <button id="btnDownloadSubmit" disabled>Download submission.csv</button>
       <button id="btnDownloadProbs" disabled>Download probabilities.csv</button>
     </div>
-    <div class="scroll mt12">
-      <table id="rankTable"></table>
-    </div>
+    <div class="scroll" style="margin-top:12px"><table id="rankTable"></table></div>
   </div>
 
-  <div class="foot">If the top badges show “failed to load”, check that your files exist at <code>web_model/model.json</code> and <code>web_model/preprocess.json</code>.</div>
+  <div class="foot">
+    If the badges still say “failed to load”, click the tiny URL shown next to them to check it returns your files.
+  </div>
 </div>
 
-<script src="./app.js"></script>
+<script src="./app.js?v=4"></script>
 </body>
 </html>
