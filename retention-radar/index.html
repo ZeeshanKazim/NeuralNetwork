@@ -2,131 +2,114 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>AI Retention Radar — E-commerce Churn Scoring</title>
 
-  <!-- libs -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- Force relative resolution inside the current folder -->
+  <base href="./">
 
+  <!-- libs -->
+  <script defer src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
   <style>
-    :root{--bg:#0b0f17;--bg2:#0e1320;--card:#101728;--ink:#e9edf6;--muted:#a8b1c6;--accent:#7ee787;--accent2:#8aa3ff;--border:rgba(255,255,255,.12)}
+    :root{--bg:#0b0f17;--panel:#12182a;--ink:#e9edf6;--muted:#a7b0c3;--accent:#7ee787;--warn:#ff9aa2;}
     *{box-sizing:border-box;margin:0;padding:0}
-    body{min-height:100vh;color:var(--ink);background:
-      radial-gradient(1200px 700px at 10% -10%, #1a2b47 0%, var(--bg) 60%),
-      radial-gradient(800px 500px at 120% 10%, #222a44 0%, var(--bg2) 60%),
-      linear-gradient(180deg,#090f1a, var(--bg2));
-      font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:26px}
+    body{background:linear-gradient(180deg,#0a0f1a,#0f1424);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,sans-serif;padding:26px}
     .wrap{max-width:1100px;margin:0 auto}
-    .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-    h1{font-size:clamp(1.4rem,2.4vw,2rem)}
-    .badge{display:inline-block;font-size:.85rem;color:#111;background:#d2f1d9;border-radius:999px;padding:4px 10px;margin-left:6px}
-    .err{background:#ffd9de}
-    .mut{color:var(--muted)}
-    .panel{background:linear-gradient(180deg,var(--card),#0c1426);border:1px solid var(--border);border-radius:16px;padding:16px;margin:10px 0}
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-    input[type=file]{background:#111929;color:var(--ink);border:1px solid var(--border);padding:10px;border-radius:10px}
-    button{background:#1a2340;color:var(--ink);border:1px solid var(--border);padding:10px 14px;border-radius:12px;cursor:pointer}
-    button:disabled{opacity:.5;cursor:not-allowed}
-    .pill{display:inline-block;padding:6px 10px;border:1px solid var(--border);border-radius:999px;background:#0f182e}
-    .scroll{max-height:420px;overflow:auto;border-radius:8px;border:1px solid var(--border)}
-    table{width:100%;border-collapse:collapse}
-    th,td{border-bottom:1px solid var(--border);padding:8px 6px;text-align:left;font-size:.95rem}
-    .grid{display:grid;gap:12px}.cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
-    @media(max-width:900px){.cols-2{grid-template-columns:1fr}}
-    .kpis{display:flex;gap:12px;flex-wrap:wrap}
-    .kpi{background:#0f182e;border:1px solid var(--border);border-radius:12px;padding:10px 12px;min-width:180px}
-    .kpi .label{color:var(--muted);font-size:.9rem}
-    .kpi .value{font-size:1.2rem;font-weight:700;margin-top:4px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
-    .chart{height:320px}
-    .foot{margin-top:24px;color:var(--muted);text-align:center;font-size:.9rem}
-    code{background:#0e1627;border:1px solid var(--border);padding:2px 6px;border-radius:6px}
-    .tiny{font-size:.85rem}
+    h1{font-size:clamp(1.5rem,2.6vw,2.1rem);margin-bottom:6px}
+    .muted{color:var(--muted)}
+    .badges{position:fixed;right:16px;top:16px;display:flex;gap:8px;z-index:5}
+    .badge{padding:6px 10px;border-radius:999px;font-size:.85rem;background:#1a2239;border:1px solid rgba(255,255,255,.12)}
+    .ok{background:rgba(126,231,135,.18);border-color:rgba(126,231,135,.35)}
+    .fail{background:rgba(255,154,162,.18);border-color:rgba(255,154,162,.4)}
+    .panel{margin-top:14px;padding:14px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:var(--panel)}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    button, input[type="file"]{background:#1c2440;color:var(--ink);border:1px solid rgba(255,255,255,.16);padding:9px 12px;border-radius:10px;cursor:pointer}
+    .pill{padding:7px 10px;border-radius:10px;background:#1a2239;border:1px solid rgba(255,255,255,.12);font-size:.9rem}
+    #preview{margin-top:10px;max-height:240px;overflow:auto;border:1px dashed rgba(255,255,255,.18);border-radius:10px;padding:8px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9rem;white-space:pre}
+    #roc{height:340px;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;color:var(--muted)}
+    table.kv{width:100%;border-collapse:collapse;margin-top:10px}
+    table.kv th,table.kv td{border-bottom:1px solid rgba(255,255,255,.1);padding:8px;text-align:left}
+    .grid{display:grid;gap:14px}
+    @media(min-width:900px){.cols-2{grid-template-columns:1fr 1fr}}
   </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="header">
-    <h1>AI Retention Radar — E-commerce Churn Scoring</h1>
-    <div>
-      <span>Model:</span> <span id="modelStatus" class="badge err">loading…</span>
-      <span class="tiny" id="modelUrlShown"></span><br/>
-      <span>Spec:</span>  <span id="specStatus"  class="badge err">loading…</span>
-      <span class="tiny" id="specUrlShown"></span>
-    </div>
-  </div>
-  <p class="mut">Load your exported TF.js model, upload a CSV, get probabilities, metrics, and downloads — client-side only.</p>
+<div class="badges">
+  <span id="bModel" class="badge fail">Model: failed to load</span>
+  <span id="bSpec"  class="badge fail">Spec: failed to load</span>
+</div>
 
+<div class="wrap">
+  <h1>AI Retention Radar — E-commerce Churn Scoring</h1>
+  <p class="muted">Load your exported TF.js model, upload a CSV, get probabilities, metrics, and downloads — client-side only.</p>
+
+  <!-- 1) Data -->
   <div class="panel">
     <div class="row">
-      <div><b>1) Data Load</b><br><span class="mut">Upload CSV (train or test)</span></div>
-      <input id="csvFile" type="file" accept=".csv,text/csv"/>
+      <strong>1) Data Load</strong>
+      <input id="csvFile" type="file" accept=".csv"/>
       <span id="shape" class="pill">Rows: — | Cols: —</span>
     </div>
-    <div id="previewWrap" style="margin-top:12px">
-      <div class="mut">Preview</div>
-      <div class="scroll"><table id="preview"></table></div>
-    </div>
+    <div id="preview" class="muted">Preview</div>
   </div>
 
+  <!-- 2) Predict -->
   <div class="panel">
     <div class="row">
-      <b>2) Preprocess & Predict</b>
-      <button id="btnPredict" disabled>Run Predictions</button>
-      <span class="pill" id="scoredRows">Scored Rows: —</span>
-      <span class="pill" id="hasLabels">Has Labels: —</span>
-      <span class="pill" id="aucPill">AUC: —</span>
+      <strong>2) Preprocess & Predict</strong>
+      <button id="btnRun">Run Predictions</button>
+      <span id="scored"  class="pill">Scored Rows: —</span>
+      <span id="hasY"    class="pill">Has Labels: —</span>
+      <span id="aucTxt"  class="pill">AUC: —</span>
     </div>
   </div>
 
+  <!-- 3) ROC -->
   <div class="panel">
-    <b>3) ROC Curve</b>
-    <div class="chart"><canvas id="rocChart"></canvas></div>
-    <div class="mut" style="margin-top:8px">Upload a CSV with the label column to display ROC/AUC.</div>
+    <strong>3) ROC Curve</strong>
+    <div id="roc" class="muted">Upload a CSV with the label column to display ROC/AUC.</div>
   </div>
 
+  <!-- 4) Threshold -->
   <div class="panel">
-    <b>4) Threshold, Confusion & F1</b>
-    <div class="row" style="margin-top:8px">
-      <label for="thr">Threshold: <code id="thrVal">0.50</code></label>
-      <input id="thr" type="range" min="0" max="1" step="0.01" value="0.5" style="flex:1"/>
+    <strong>4) Threshold, Confusion & F1</strong>
+    <div class="row" style="margin-top:10px">
+      <label>Threshold:
+        <input id="thr" type="range" min="0" max="1" step="0.01" value="0.5"/>
+      </label>
+      <span id="thrVal" class="pill">0.50</span>
     </div>
-    <div class="grid cols-2" style="margin-top:12px">
-      <table>
-        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
-        <tbody id="metricsBody">
-          <tr><td>TN</td><td id="mTN">—</td></tr>
-          <tr><td>FP</td><td id="mFP">—</td></tr>
-          <tr><td>FN</td><td id="mFN">—</td></tr>
-          <tr><td>TP</td><td id="mTP">—</td></tr>
-          <tr><td>Precision</td><td id="mP">—</td></tr>
-          <tr><td>Recall</td><td id="mR">—</td></tr>
-          <tr><td>F1</td><td id="mF1">—</td></tr>
-        </tbody>
-      </table>
-      <div class="kpis">
-        <div class="kpi"><div class="label">Default Threshold</div><div class="value" id="kDefThr">—</div></div>
-        <div class="kpi"><div class="label">Positive Class = “Churn”</div><div class="value">1</div></div>
-        <div class="kpi"><div class="label">Spec Target</div><div class="value" id="kTarget">—</div></div>
-      </div>
+    <table class="kv">
+      <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+      <tbody id="cmBody">
+        <tr><td>TN</td><td>—</td></tr>
+        <tr><td>FP</td><td>—</td></tr>
+        <tr><td>FN</td><td>—</td></tr>
+        <tr><td>TP</td><td>—</td></tr>
+        <tr><td>Precision</td><td>—</td></tr>
+        <tr><td>Recall</td><td>—</td></tr>
+        <tr><td>F1</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <div class="row" style="margin-top:10px">
+      <span id="posClass" class="pill">Positive Class = “Churn”</span>
+      <span id="defaultThr" class="pill">Default Threshold —</span>
+      <span id="specTarget" class="pill">Spec Target —</span>
     </div>
   </div>
 
+  <!-- 5) Ranking -->
   <div class="panel">
-    <div class="row">
-      <b>5) Top Risk — Churn Ranking</b>
-      <button id="btnDownloadSubmit" disabled>Download submission.csv</button>
-      <button id="btnDownloadProbs" disabled>Download probabilities.csv</button>
+    <strong>5) Top Risk — Churn Ranking</strong>
+    <div class="row" style="margin-top:10px">
+      <button id="btnSub">Download submission.csv</button>
+      <button id="btnProbs">Download probabilities.csv</button>
     </div>
-    <div class="scroll" style="margin-top:12px"><table id="rankTable"></table></div>
-  </div>
-
-  <div class="foot">
-    If the badges still say “failed to load”, click the tiny URL shown next to them to check it returns your files.
+    <div id="rank" class="muted" style="margin-top:10px">Sort by probability desc.</div>
   </div>
 </div>
 
-<script src="./app.js?v=4"></script>
+<script defer src="app.js"></script>
 </body>
 </html>
