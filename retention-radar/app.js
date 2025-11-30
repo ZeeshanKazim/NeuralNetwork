@@ -1,323 +1,399 @@
-/* AI Retention Radar — In-browser churn scoring with a TF.js model and a frozen preprocessing spec. */
+/* AI Retention Radar — Inference-only client
+ * Loads TF.js model + preprocess.json, parses CSV, transforms per spec,
+ * predicts probabilities, plots ROC, and exports CSVs.
+ * Works from nested GitHub Pages paths.
+ */
 
-// ------------ Config (paths are relative to index.html)
-const MODEL_URL = './web_model/model.json';
-const SPEC_URL  = './web_model/preprocess.json';
+// --------- Constants & Status ----------
+const MODEL_URL = new URL('web_model/model.json?v=2', document.baseURI).toString();
+const SPEC_URL  = new URL('web_model/preprocess.json?v=2', document.baseURI).toString();
 
-// ------------ Globals
-let MODEL = null;
-let SPEC  = null;
-let RAW_ROWS = [];       // CSV as array of objects
-let PROBS = [];          // predicted probabilities
-let YTRUE = null;        // optional labels if CSV has target
-let IDS = [];            // customer_id for export
-let ROC_CHART = null;
-
-// Label mapping (must match Colab binarization)
-const POS = new Set(['churn','churned','cancelled','canceled','inactive','terminated','closed','ended','lost','paused','1','yes','true']);
-const NEG = new Set(['active','current','subscribed','renewed','retained','open','live','0','no','false']);
-function labelTo01(v){
-  const s = String(v ?? '').trim().toLowerCase();
-  if (POS.has(s)) return 1;
-  if (NEG.has(s)) return 0;
-  return null; // unknown → ignore for metrics
-}
-
-// ------------ Small helpers
-const $ = (id)=> document.getElementById(id);
-const fmtPct = x => isFinite(x) ? (Math.round(x*1000)/10).toFixed(1)+'%' : '—';
-const download = (filename, text)=>{
-  const blob = new Blob([text], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
+const el = (id)=>document.getElementById(id);
+const state = {
+  spec: null,
+  model: null,
+  rows: [],
+  header: [],
+  idCol: null,
+  targetCol: null,
+  probs: [],
+  yTrue: null,     // 0/1 or null
+  rocChart: null
 };
 
-// ROC + AUC from scores
-function rocCurve(y, p){
-  // y: 0/1, p: prob
-  const pairs = y.map((yy,i)=>({y:yy, p:p[i]})).filter(d=>d.y!=null && isFinite(d.p));
-  pairs.sort((a,b)=> b.p - a.p);
-  const P = pairs.reduce((s,d)=> s + (d.y===1?1:0), 0);
-  const N = pairs.length - P;
-  let tp=0, fp=0, prev=-1, pts=[[0,0]];
-  for(const d of pairs){
-    if(d.p!==prev){ pts.push([fp/N, tp/P]); prev=d.p; }
-    if(d.y===1) tp++; else fp++;
-  }
-  pts.push([1,1]);
-  // trapezoid AUC
-  let auc=0;
-  for(let i=1;i<pts.length;i++){
-    const [x1,y1]=pts[i-1], [x2,y2]=pts[i];
-    auc += (x2-x1)*(y1+y2)/2;
-  }
-  return {pts, auc};
+// --------- Utilities ----------
+const toNum = (v) => {
+  if (v === null || v === undefined || v === '') return null;
+  const x = +v;
+  return Number.isFinite(x) ? x : null;
+};
+const toStr = (v) => (v === null || v === undefined) ? '' : String(v);
+
+// Safe CSV download
+function downloadCsv(name, header, rows) {
+  const esc = (s) => {
+    const v = s == null ? '' : String(s);
+    return /[",\n]/.test(v) ? `"${v.replace(/"/g,'""')}"` : v;
+  };
+  const csv = [header.map(esc).join(',')]
+    .concat(rows.map(r => r.map(esc).join(',')))
+    .join('\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
 }
 
-function confusion(yTrue, probs, th){
-  let TP=0,FP=0,TN=0,FN=0;
-  for(let i=0;i<yTrue.length;i++){
-    const y = yTrue[i]; if(y==null) continue;
-    const yhat = probs[i] >= th ? 1 : 0;
-    if(y===1 && yhat===1) TP++;
-    else if(y===0 && yhat===1) FP++;
-    else if(y===0 && yhat===0) TN++;
-    else if(y===1 && yhat===0) FN++;
-  }
-  const prec = (TP+FP)? TP/(TP+FP) : 0;
-  const rec  = (TP+FN)? TP/(TP+FN) : 0;
-  const f1   = (prec+rec)? 2*prec*rec/(prec+rec) : 0;
-  return {TN,FP,FN,TP,prec,rec,f1};
+function setBadge(okEl, ok) {
+  okEl.textContent = ok ? 'OK' : 'failed to load';
+  okEl.className = 'badge ' + (ok ? '' : 'err');
 }
 
-// ------------ Preprocess using SPEC (frozen means/scales + OHE)
-function buildMatrix(rows){
-  const numCols = SPEC.numeric || [];
-  const catSpec = SPEC.categorical || {};
-  const order   = SPEC.input_order || [];
-  const means   = SPEC.numeric_mean || {};
-  const scales  = SPEC.numeric_scale || {};
-
-  const M = rows.length;
-  const D = order.length;
-  const X = new Float32Array(M*D);
-
-  const catIndex = {}; // map "cat:col=val" -> column position
-  order.forEach((key, j)=>{ catIndex[key]=j; });
-
-  for(let i=0;i<M;i++){
-    const r = rows[i];
-    // Fill numeric first: "num:col"
-    for(const col of numCols){
-      const j = catIndex[`num:${col}`];
-      let v = r[col];
-      let x = (v===undefined || v===null || v==='') ? means[col] : parseFloat(v);
-      if (!isFinite(x)) x = means[col];
-      const z = (x - (means[col] ?? 0)) / (scales[col] || 1);
-      X[i*D + j] = isFinite(z) ? z : 0;
-    }
-    // Fill categorical one-hots: "cat:col=value"
-    for(const col in catSpec){
-      const val = String(r[col] ?? '').trim();
-      const allowed = catSpec[col] || [];
-      for(const v of allowed){
-        const j = catIndex[`cat:${col}=${v}`];
-        X[i*D + j] = (val===String(v)) ? 1 : 0;
-      }
-      // Unknown categories ⇒ all zeros (already default)
-    }
-  }
-  return {X, D};
-}
-
-// ------------ UI updates
-function setStatus(id, ok, msg){
-  const el = $(id);
-  el.innerHTML = (ok ? '✅ ' : '⚠️ ') + msg;
-  el.className = 'pill small ' + (ok?'ok':'bad');
-}
-
-function renderPreview(rows){
-  if(!rows.length){ $('preview').textContent='Empty CSV'; return; }
-  const cols = Object.keys(rows[0]);
-  const head = cols.slice(0,8).map(c=>`<th>${c}</th>`).join('');
-  const body = rows.slice(0,5).map(r=> `<tr>${cols.slice(0,8).map(c=>`<td>${r[c]??''}</td>`).join('')}</tr>` ).join('');
-  $('preview').innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
-  $('shapeNote').textContent = `Rows: ${rows.length} | Cols: ${cols.length}`;
-}
-
-function renderRanking(rows, probs, idCol, yTrue=null){
-  const cols = ['rank', idCol, SPEC.target_col, 'prob', 'age','purchase_frequency','unit_price','quantity','cancellations_count','country','preferred_category','category','gender'];
-  const thead = cols.map(c=>`<th>${c}</th>`).join('');
-  $('rankHead').innerHTML = thead;
-
-  const items = rows.map((r,i)=>({i, id:r[idCol], prob:probs[i], y:yTrue?yTrue[i]:null}));
-  items.sort((a,b)=> b.prob - a.prob);
-
-  const tr = items.slice(0,200).map((o,rank)=> {
-    const r = rows[o.i];
-    return `<tr>
-      <td>${rank+1}</td>
-      <td>${o.id??''}</td>
-      <td>${o.y==null?'':o.y}</td>
-      <td>${o.prob.toFixed(4)}</td>
-      <td>${r.age??''}</td>
-      <td>${r.purchase_frequency??''}</td>
-      <td>${r.unit_price??''}</td>
-      <td>${r.quantity??''}</td>
-      <td>${r.cancellations_count??''}</td>
-      <td>${r.country??''}</td>
-      <td>${r.preferred_category??''}</td>
-      <td>${r.category??''}</td>
-      <td>${r.gender??''}</td>
-    </tr>`;
-  }).join('');
-  $('rankBody').innerHTML = tr || `<tr><td colspan="13" class="muted">No rows</td></tr>`;
-}
-
-// ------------ Main actions
-async function loadModelAndSpec(){
-  try{
-    MODEL = await tf.loadLayersModel(MODEL_URL);
-    setStatus('modelStatus', true, 'loaded');
-  }catch(e){
-    console.error(e);
-    setStatus('modelStatus', false, 'failed to load');
-  }
-  try{
-    const res = await fetch(SPEC_URL); SPEC = await res.json();
-    setStatus('specStatus', true, 'loaded');
-    // Set default threshold from spec
-    const t = SPEC.threshold_default ?? 0.5;
-    $('thSlider').value = t; $('thVal').textContent = (+t).toFixed(2);
-  }catch(e){
-    console.error(e);
-    setStatus('specStatus', false, 'failed to load');
+// --------- Load Spec & Model ----------
+async function loadSpec() {
+  try {
+    const res = await fetch(SPEC_URL, {cache:'no-store'});
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const spec = await res.json();
+    // Minimal validation
+    if (!spec.input_order || !Array.isArray(spec.input_order)) throw new Error('invalid spec: input_order');
+    state.spec = spec;
+    state.idCol = spec.id_col || null;
+    state.targetCol = spec.target_col || null;
+    el('kTarget').textContent = state.targetCol || '—';
+    el('kDefThr').textContent = (spec.threshold_default ?? 0.5).toFixed(2);
+    setBadge(el('specStatus'), true);
+  } catch (e) {
+    console.error('Spec load error:', SPEC_URL, e);
+    setBadge(el('specStatus'), false);
   }
 }
 
-async function parseCsvFile(file){
-  return new Promise((resolve,reject)=>{
+async function loadModel() {
+  try {
+    const model = await tf.loadLayersModel(MODEL_URL);
+    state.model = model;
+    setBadge(el('modelStatus'), true);
+  } catch (e) {
+    console.error('Model load error:', MODEL_URL, e);
+    setBadge(el('modelStatus'), false);
+  }
+}
+
+// --------- CSV Parse & Preview ----------
+function parseCsvFile(file) {
+  return new Promise((resolve, reject) => {
     Papa.parse(file, {
-      header:true, dynamicTyping:false, skipEmptyLines:'greedy',
-      delimiter: ',', quoteChar: '"',
-      complete: r => resolve(r.data),
+      header: true,
+      dynamicTyping: false,     // keep raw; we’ll coerce later
+      skipEmptyLines: 'greedy',
+      delimiter: ',',           // Kaggle default
+      quoteChar: '"',
+      complete: (res) => resolve(res.data),
       error: reject
     });
   });
 }
 
-function prepareLabels(rows){
-  const y = [];
-  let hasAny=false;
-  for(const r of rows){
-    const v = r[SPEC.target_col];
-    const m = labelTo01(v);
-    y.push(m);
-    if(m!==null) hasAny=true;
-  }
-  return hasAny ? y : null;
+function renderPreview(rows) {
+  const table = el('preview');
+  table.innerHTML = '';
+  if (!rows.length) return;
+
+  const cols = Object.keys(rows[0]);
+  const thead = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`;
+  const bodyRows = rows.slice(0, 10).map(r =>
+    `<tr>${cols.map(c => `<td>${toStr(r[c])}</td>`).join('')}</tr>`
+  ).join('');
+  table.innerHTML = thead + `<tbody>${bodyRows}</tbody>`;
+
+  el('shape').textContent = `Rows: ${rows.length} | Cols: ${cols.length}`;
 }
 
-async function runPredict(){
-  if(!MODEL || !SPEC){ alert('Model/spec not loaded yet.'); return; }
-  if(!RAW_ROWS.length){ alert('Please load a CSV first.'); return; }
+el('csvFile').addEventListener('change', async (e) => {
+  const f = e.target.files?.[0];
+  if (!f) return;
 
-  $('prepNote').textContent = 'Building features…';
-  const {X, D} = buildMatrix(RAW_ROWS);
-  if (D !== (MODEL.inputs[0].shape[1] || SPEC.input_order.length)){
-    alert(`Feature length mismatch. Got ${D}, expected ${MODEL.inputs[0].shape[1]}.`);
-    return;
+  try {
+    const rows = await parseCsvFile(f);
+    // Strip Papa's potential trailing empty row
+    const cleaned = rows.filter(r => r && Object.keys(r).length);
+    state.rows = cleaned;
+    state.header = cleaned.length ? Object.keys(cleaned[0]) : [];
+    renderPreview(cleaned);
+    el('btnPredict').disabled = !(state.model && state.spec && state.rows.length);
+    el('scoredRows').textContent = 'Scored Rows: —';
+    el('hasLabels').textContent = 'Has Labels: —';
+    el('aucPill').textContent = 'AUC: —';
+    el('btnDownloadSubmit').disabled = true;
+    el('btnDownloadProbs').disabled = true;
+    el('rankTable').innerHTML = '';
+    clearRoc();
+  } catch (err) {
+    console.error('CSV parse error:', err);
+    alert('Failed to parse CSV. Ensure it is a comma-separated file with quotes for text fields.');
   }
+});
 
-  IDS = RAW_ROWS.map(r=> r[SPEC.id_col] ?? r['customer_id'] ?? r['id'] ?? '');
-  YTRUE = prepareLabels(RAW_ROWS);
+// --------- Transform According to Spec ----------
+function transformRows(rows, spec) {
+  // Collect numeric & categorical metadata
+  const nMeans = spec.numeric_mean || {};
+  const nScales = spec.numeric_scale || {};
+  const inputOrder = spec.input_order || [];
 
-  $('prepNote').textContent = 'Running model…';
-  const tensor = tf.tensor2d(X, [RAW_ROWS.length, D]);
-  const out = MODEL.predict(tensor);
-  const probs = Array.from(await out.data());
-  tensor.dispose(); out.dispose();
-
-  PROBS = probs;
-  $('kRows').textContent = String(PROBS.length);
-  $('kHasY').textContent = YTRUE ? 'Yes' : 'No';
-
-  // Metrics if labels
-  if(YTRUE){
-    const cleanIdx = YTRUE.map((v,i)=> v!=null ? i : -1).filter(i=>i>=0);
-    const yC = cleanIdx.map(i=> YTRUE[i]);
-    const pC = cleanIdx.map(i=> PROBS[i]);
-    const {pts, auc} = rocCurve(yC, pC);
-    $('kAUC').textContent = (Math.round(auc*1000)/1000).toFixed(3);
-    drawROC(pts);
-    updateConfusion();
-    $('rocNote').textContent = '';
-  }else{
-    $('kAUC').textContent = '—';
-    drawROC([]); // clear
-    clearConfusion();
-    $('rocNote').textContent = 'No label column in this CSV.';
+  const X = new Array(rows.length);
+  for (let i=0;i<rows.length;i++) {
+    const r = rows[i];
+    const vec = new Array(inputOrder.length);
+    for (let j=0;j<inputOrder.length;j++) {
+      const token = inputOrder[j];
+      if (token.startsWith('num:')) {
+        const col = token.slice(4);
+        const raw = toNum(r[col]);
+        const mean = nMeans[col] ?? 0;
+        const scale = (nScales[col] ?? 1) || 1;
+        const z = (raw == null) ? 0 : (raw - mean) / scale;
+        vec[j] = Number.isFinite(z) ? z : 0;
+      } else if (token.startsWith('cat:')) {
+        // token looks like: cat:country=USA
+        const [left, value] = token.split('=');
+        const col = left.slice(4);
+        const s = toStr(r[col]);
+        vec[j] = (s === value) ? 1 : 0;
+      } else {
+        vec[j] = 0;
+      }
+    }
+    X[i] = vec;
   }
-
-  renderRanking(RAW_ROWS, PROBS, SPEC.id_col || 'customer_id', YTRUE);
-  $('prepNote').textContent = 'Done.';
+  return X;
 }
 
-function drawROC(points){
-  const ctx = $('rocChart').getContext('2d');
-  if(ROC_CHART){ ROC_CHART.destroy(); ROC_CHART=null; }
-  ROC_CHART = new Chart(ctx, {
-    type:'line',
-    data:{
-      labels: points.map(p=>p[0]),
-      datasets: [{
-        label:'ROC (TPR vs FPR)',
-        data: points.map(p=>({x:p[0], y:p[1]})),
-        fill:false, pointRadius:0, borderWidth:2
-      }]
+// Try to binarize labels for evaluation
+function binarizeLabelVector(rows, targetCol) {
+  if (!targetCol) return null;
+  if (!rows.length || !(targetCol in rows[0])) return null;
+
+  const pos = new Set(['churn','churned','cancelled','canceled','inactive','terminated','closed','ended','lost','paused','1','yes','true']);
+  const neg = new Set(['active','current','subscribed','renewed','retained','open','live','0','no','false']);
+
+  const y = new Array(rows.length).fill(null);
+  let hasAny = false;
+  for (let i=0;i<rows.length;i++) {
+    const v = rows[i][targetCol];
+    if (v === undefined) { y[i] = null; continue; }
+    const s = String(v).trim().toLowerCase();
+    if (pos.has(s)) { y[i] = 1; hasAny = true; }
+    else if (neg.has(s)) { y[i] = 0; hasAny = true; }
+    else if (s === '') { y[i] = null; }
+    else if (!isNaN(+s)) { y[i] = (+s >= 0.5) ? 1 : 0; hasAny = true; }
+    else { y[i] = null; }
+  }
+  if (!hasAny) return null;
+  return y;
+}
+
+// --------- Prediction / Metrics ----------
+function predictProba(X) {
+  const t = tf.tensor2d(X);
+  const probs = state.model.predict(t).dataSync();
+  t.dispose();
+  return Array.from(probs);
+}
+
+function computeRocAuc(y, p) {
+  const pairs = [];
+  for (let i=0;i<y.length;i++) if (y[i]===0 || y[i]===1) pairs.push([p[i], y[i]]);
+  if (!pairs.length) return {auc:null, fpr:[], tpr:[]};
+
+  pairs.sort((a,b)=>b[0]-a[0]); // desc by score
+  let P = 0, N = 0;
+  for (const [,yi] of pairs) (yi===1) ? P++ : N++;
+  if (P===0 || N===0) return {auc:null, fpr:[], tpr:[]};
+
+  let tp=0, fp=0, prevScore=Infinity;
+  const roc = [[0,0]];
+  let auc = 0, prevFpr = 0, prevTpr = 0;
+
+  for (const [score, yi] of pairs) {
+    if (score !== prevScore) {
+      const fpr = fp/N, tpr = tp/P;
+      auc += (fpr - prevFpr) * (tpr + prevTpr) / 2; // trapezoid
+      prevFpr = fpr; prevTpr = tpr;
+      roc.push([fpr, tpr]);
+      prevScore = score;
+    }
+    if (yi===1) tp++; else fp++;
+  }
+  // add (1,1)
+  const fpr = fp/N, tpr = tp/P;
+  auc += (fpr - prevFpr) * (tpr + prevTpr) / 2;
+  roc.push([fpr, tpr]);
+
+  const fprs = roc.map(p=>p[0]), tprs = roc.map(p=>p[1]);
+  return {auc, fpr:fprs, tpr:tprs};
+}
+
+function confusionAtThreshold(y, p, thr) {
+  let TP=0, FP=0, TN=0, FN=0;
+  for (let i=0;i<y.length;i++) {
+    if (y[i]!==0 && y[i]!==1) continue;
+    const pred = p[i] >= thr ? 1 : 0;
+    if (pred===1 && y[i]===1) TP++;
+    else if (pred===1 && y[i]===0) FP++;
+    else if (pred===0 && y[i]===1) FN++;
+    else TN++;
+  }
+  const precision = (TP+FP)? TP/(TP+FP) : 0;
+  const recall = (TP+FN)? TP/(TP+FN) : 0;
+  const f1 = (precision+recall)? 2*precision*recall/(precision+recall) : 0;
+  return {TP,FP,TN,FN,precision,recall,f1};
+}
+
+function renderConfusion(metrics) {
+  el('mTP').textContent = metrics.TP;
+  el('mFP').textContent = metrics.FP;
+  el('mTN').textContent = metrics.TN;
+  el('mFN').textContent = metrics.FN;
+  el('mP').textContent  = metrics.precision.toFixed(3);
+  el('mR').textContent  = metrics.recall.toFixed(3);
+  el('mF1').textContent = metrics.f1.toFixed(3);
+}
+
+// --------- ROC Chart ----------
+function renderRoc(roc) {
+  const ctx = document.getElementById('rocChart').getContext('2d');
+  if (state.rocChart) { state.rocChart.destroy(); state.rocChart=null; }
+  if (!roc || !roc.fpr.length) return;
+
+  state.rocChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: roc.fpr,
+      datasets: [
+        { label:'ROC', data: roc.tpr, fill: false, borderWidth: 2 },
+        { label:'Chance', data: roc.fpr, fill: false, borderWidth: 1, borderDash: [6,6] }
+      ]
     },
-    options:{
-      responsive:true, maintainAspectRatio:false,
-      scales:{
-        x:{type:'linear', min:0, max:1, title:{display:true, text:'FPR'}},
-        y:{type:'linear', min:0, max:1, title:{display:true, text:'TPR'}}
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { type:'linear', min:0, max:1, title:{display:true,text:'FPR'} },
+        y: { type:'linear', min:0, max:1, title:{display:true,text:'TPR'} }
       },
-      plugins:{legend:{display:false}}
+      plugins: { legend: {display:true, position:'bottom'} }
     }
   });
 }
+function clearRoc(){ if(state.rocChart){ state.rocChart.destroy(); state.rocChart=null; } }
 
-function clearConfusion(){
-  const rows = $('cmTable').querySelectorAll('tr td:nth-child(2)');
-  rows.forEach(td=> td.textContent='—');
+// --------- Ranking Table ----------
+function renderRanking(rows, probs, idCol, extras=['age','purchase_frequency','unit_price','country','preferred_category']) {
+  const T = el('rankTable');
+  if (!rows.length) { T.innerHTML=''; return; }
+  const items = rows.map((r,i)=>({i, id: idCol? r[idCol] : (i+1), p: probs[i], row:r}));
+  items.sort((a,b)=>b.p - a.p);
+
+  const cols = ['#','id','prob'].concat(extras.filter(c=>c in rows[0]));
+  const thead = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`;
+  const body = items.slice(0,100).map((it,rank)=>{
+    const cells = [
+      `<td>${rank+1}</td>`,
+      `<td>${toStr(it.id)}</td>`,
+      `<td>${it.p.toFixed(4)}</td>`
+    ];
+    for (const c of extras) if (c in it.row) cells.push(`<td>${toStr(it.row[c])}</td>`);
+    return `<tr>${cells.join('')}</tr>`;
+  }).join('');
+  T.innerHTML = thead + `<tbody>${body}</tbody>`;
 }
 
-function updateConfusion(){
-  if(!YTRUE){ clearConfusion(); return; }
-  const th = +$('thSlider').value; $('thVal').textContent = th.toFixed(2);
-  const cleanIdx = YTRUE.map((v,i)=> v!=null ? i : -1).filter(i=>i>=0);
-  const yC = cleanIdx.map(i=> YTRUE[i]);
-  const pC = cleanIdx.map(i=> PROBS[i]);
-  const {TN,FP,FN,TP,prec,rec,f1} = confusion(yC,pC,th);
-  const vals = [TN,FP,FN,TP,prec,rec,f1];
-  const tds = $('cmTable').querySelectorAll('tr td:nth-child(2)');
-  tds[0].textContent = TN; tds[1].textContent = FP; tds[2].textContent = FN; tds[3].textContent = TP;
-  tds[4].textContent = (Math.round(prec*1000)/1000).toFixed(3);
-  tds[5].textContent = (Math.round(rec*1000)/1000).toFixed(3);
-  tds[6].textContent = (Math.round(f1*1000)/1000).toFixed(3);
+// --------- Main Predict Handler ----------
+async function runPredict() {
+  if (!state.model || !state.spec || !state.rows.length) {
+    alert('Load model/spec and CSV first.');
+    return;
+  }
+  // Transform and predict
+  const X = transformRows(state.rows, state.spec);
+  const probs = predictProba(X);
+  state.probs = probs;
+
+  // Labels (optional)
+  const y = binarizeLabelVector(state.rows, state.targetCol);
+  state.yTrue = y;
+
+  // KPIs
+  el('scoredRows').textContent = `Scored Rows: ${probs.length}`;
+  el('hasLabels').textContent = `Has Labels: ${y ? 'Yes' : 'No'}`;
+
+  // ROC + AUC if labels exist
+  clearRoc();
+  if (y) {
+    const roc = computeRocAuc(y, probs);
+    el('aucPill').textContent = `AUC: ${roc.auc == null ? '—' : roc.auc.toFixed(4)}`;
+    renderRoc(roc);
+  } else {
+    el('aucPill').textContent = 'AUC: —';
+  }
+
+  // Threshold default
+  const defThr = +(state.spec.threshold_default ?? 0.5);
+  el('thr').value = String(defThr);
+  el('thrVal').textContent = defThr.toFixed(2);
+
+  // Confusion (if labels)
+  if (y) {
+    renderConfusion(confusionAtThreshold(y, probs, defThr));
+  } else {
+    renderConfusion({TP:0,FP:0,TN:0,FN:0,precision:0,recall:0,f1:0});
+  }
+
+  // Ranking
+  renderRanking(state.rows, probs, state.idCol);
+
+  // Enable downloads
+  el('btnDownloadSubmit').disabled = false;
+  el('btnDownloadProbs').disabled = false;
 }
 
-// ------------ Downloads
-function downloadSubmission(){
-  if(!PROBS.length){ alert('No predictions yet.'); return; }
-  const th = +$('thSlider').value;
-  const header = ['customer_id','Survived'].join(','); // “Survived” name is conventional; you can rename to Label
-  const lines = [header].concat(IDS.map((id,i)=> `${id},${PROBS[i]>=th?1:0}` ));
-  download('submission.csv', lines.join('\n'));
-}
-function downloadProbabilities(){
-  if(!PROBS.length){ alert('No predictions yet.'); return; }
-  const header = ['customer_id','probability'].join(',');
-  const lines = [header].concat(IDS.map((id,i)=> `${id},${PROBS[i].toFixed(6)}` ));
-  download('probabilities.csv', lines.join('\n'));
-}
+el('btnPredict').addEventListener('click', runPredict);
 
-// ------------ Wire up
-window.addEventListener('DOMContentLoaded', async ()=>{
-  await loadModelAndSpec();
-
-  $('btnLoad').addEventListener('click', async ()=>{
-    const f = $('csvFile').files?.[0];
-    if(!f){ alert('Choose a CSV first.'); return; }
-    RAW_ROWS = await parseCsvFile(f);
-    renderPreview(RAW_ROWS);
-    $('prepNote').textContent = `Ready. Spec expects ${SPEC.input_order?.length||'—'} features.`;
-  });
-
-  $('btnPredict').addEventListener('click', runPredict);
-  $('thSlider').addEventListener('input', updateConfusion);
-  $('btnDownloadPred').addEventListener('click', downloadSubmission);
-  $('btnDownloadProb').addEventListener('click', downloadProbabilities);
+// Update threshold live
+el('thr').addEventListener('input', (e)=>{
+  const thr = +e.target.value;
+  el('thrVal').textContent = thr.toFixed(2);
+  if (!state.yTrue || !state.yTrue.length) return;
+  renderConfusion(confusionAtThreshold(state.yTrue, state.probs, thr));
 });
+
+// --------- Downloads ----------
+el('btnDownloadSubmit').addEventListener('click', ()=>{
+  if (!state.rows.length || !state.probs.length) return;
+  const thr = +el('thr').value;
+  const idCol = state.idCol || 'id';
+  const header = [idCol, 'Churn'];
+  const out = state.rows.map((r,i)=>{
+    const id = r[idCol] ?? (i+1);
+    const yhat = state.probs[i] >= thr ? 1 : 0;
+    return [id, yhat];
+  });
+  downloadCsv('submission.csv', header, out);
+});
+
+el('btnDownloadProbs').addEventListener('click', ()=>{
+  if (!state.rows.length || !state.probs.length) return;
+  const idCol = state.idCol || 'id';
+  const header = [idCol, 'probability'];
+  const out = state.rows.map((r,i)=> [ r[idCol] ?? (i+1), state.probs[i] ]);
+  downloadCsv('probabilities.csv', header, out);
+});
+
+// --------- Boot ----------
+(async function(){
+  await loadSpec();
+  await loadModel();
+  // If CSV already chosen before model/spec finished, enable Predict now
+  el('btnPredict').disabled = !(state.model && state.spec && state.rows.length);
+})();
