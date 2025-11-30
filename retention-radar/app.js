@@ -1,329 +1,304 @@
-/* Final — robust loader that works on GitHub Pages subpaths.
-   - Auto-detects absolute URLs for model.json and preprocess.json
-   - Shows the exact URL it used (or failed) in the UI
-   - Feature vector follows preprocess.json exactly
+/* AI Retention Radar — robust loader + scorer
+   Works from any subfolder on GitHub Pages.
+   Expects:
+     web_model/model.json
+     web_model/group1-shard1of1.bin
+     web_model/preprocess.json
 */
 
-const $ = (id)=>document.getElementById(id);
-const state = {
-  spec:null, model:null,
-  rows:[], header:[],
-  idCol:null, targetCol:null,
-  probs:[], yTrue:null,
-  rocChart:null
+const UI = {
+  bModel: document.getElementById('bModel'),
+  bSpec:  document.getElementById('bSpec'),
+  csv:    document.getElementById('csvFile'),
+  preview:document.getElementById('preview'),
+  shape:  document.getElementById('shape'),
+  run:    document.getElementById('btnRun'),
+  scored: document.getElementById('scored'),
+  hasY:   document.getElementById('hasY'),
+  aucTxt: document.getElementById('aucTxt'),
+  roc:    document.getElementById('roc'),
+  thr:    document.getElementById('thr'),
+  thrVal: document.getElementById('thrVal'),
+  cmBody: document.getElementById('cmBody'),
+  btnSub: document.getElementById('btnSub'),
+  btnProbs:document.getElementById('btnProbs'),
+  rank:   document.getElementById('rank'),
+  defaultThr: document.getElementById('defaultThr'),
+  specTarget: document.getElementById('specTarget'),
 };
 
-// ---------- URL Resolver (fixes your 404) ----------
-async function pickFirstReachable(urls){
-  for (const u of urls){
+const STATE = {
+  spec: null,
+  model: null,
+  rows: [],
+  header: [],
+  probs: null,
+  yTrue: null,
+  idCol: null,
+};
+
+function okBadge(el, text){ el.classList.remove('fail'); el.classList.add('ok'); el.textContent = text; }
+function failBadge(el, text){ el.classList.remove('ok'); el.classList.add('fail'); el.textContent = text; }
+function pct(x){ return Math.round(x*1000)/10; }
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+// ---------- Resilient path candidates ----------
+const ROOT   = window.location.origin + window.location.pathname.replace(/[^/]*$/, '');
+const CANDS  = (rel) => ([
+  rel,                       // "web_model/model.json"
+  './'+rel,                  // "./web_model/model.json"
+  ROOT + rel,                // ".../retention-radar/web_model/model.json"
+  window.location.origin + '/NeuralNetwork/retention-radar/' + rel // fallback for your repo
+]);
+
+async function tryFetchJSON(cands){
+  let lastErr = null;
+  for(const u of cands){
     try{
-      const res = await fetch(u, {method:'HEAD', cache:'no-store'});
-      if (res.ok) return u;
-    }catch(_){/* ignore */}
+      const r = await fetch(u, {cache:'no-store'});
+      if(!r.ok) { lastErr = new Error(`HTTP ${r.status} @ ${u}`); continue; }
+      return await r.json();
+    }catch(e){ lastErr = e; }
   }
-  return null;
-}
-function candidates(rel){
-  // Build several absolute candidates that work for /user/repo/subdir/
-  const baseNoIndex = location.href.replace(/index\.html?$/i,'');
-  const dir = location.origin + location.pathname.replace(/[^/]*$/,''); // directory containing index
-  return [
-    new URL(rel, document.baseURI).toString(),
-    new URL('./'+rel, document.baseURI).toString(),
-    new URL(rel, baseNoIndex).toString(),
-    new URL(rel, dir).toString(),
-    // last resort: absolute path keeping repo root segment, e.g. /NeuralNetwork/retention-radar/web_model/...
-    location.origin + location.pathname.replace(/[^/]*$/,'') + rel
-  ];
+  throw lastErr || new Error('All JSON fetch attempts failed.');
 }
 
-// ---------- Badges ----------
-function setBadge(el, ok, url, err=''){
-  el.textContent = ok ? 'OK' : 'failed to load';
-  el.className = 'badge ' + (ok?'':'err');
-  const small = (el.id==='modelStatus') ? $('modelUrlShown') : $('specUrlShown');
-  if (url){
-    small.innerHTML = ok
-      ? `&nbsp;<a href="${url}" target="_blank" class="mut tiny">${url}</a>`
-      : `&nbsp;<a href="${url}" target="_blank" class="mut tiny">${url}</a> <span class="mut tiny">(${err||'HTTP error'})</span>`;
+async function tryLoadModel(cands){
+  let lastErr = null;
+  for(const u of cands){
+    try{
+      const m = await tf.loadLayersModel(u);
+      return m;
+    }catch(e){ lastErr = e; }
   }
+  throw lastErr || new Error('All model load attempts failed.');
 }
 
-// ---------- Load spec & model ----------
-async function loadSpec(){
-  const rel = 'web_model/preprocess.json?v=4';
-  const url = await pickFirstReachable(candidates(rel));
-  if(!url){ setBadge($('specStatus'), false, candidates(rel)[0], 'not found'); return; }
-  try{
-    const res = await fetch(url, {cache:'no-store'});
-    const spec = await res.json();
-    if(!spec || !Array.isArray(spec.input_order)) throw new Error('invalid spec');
-    state.spec = spec;
-    state.idCol = spec.id_col || null;
-    state.targetCol = spec.target_col || null;
-    $('kTarget').textContent = state.targetCol || '—';
-    $('kDefThr').textContent = (spec.threshold_default ?? 0.5).toFixed(2);
-    setBadge($('specStatus'), true, url);
-  }catch(e){
-    console.error('spec load', e);
-    setBadge($('specStatus'), false, url, e.message);
-  }
-}
-
-async function loadModel(){
-  const rel = 'web_model/model.json?v=4';
-  const url = await pickFirstReachable(candidates(rel));
-  if(!url){ setBadge($('modelStatus'), false, candidates(rel)[0], 'not found'); return; }
-  try{
-    const model = await tf.loadLayersModel(url);
-    state.model = model;
-    setBadge($('modelStatus'), true, url);
-  }catch(e){
-    console.error('model load', e);
-    setBadge($('modelStatus'), false, url, e.message);
-  }
-}
-
-// ---------- CSV ----------
-function parseCsvFile(file){
+// ---------- CSV helpers ----------
+function parseCSV(file){
   return new Promise((resolve,reject)=>{
-    Papa.parse(file,{
-      header:true, dynamicTyping:false, skipEmptyLines:'greedy',
-      delimiter:',', quoteChar:'"', // Kaggle-style
-      complete:r=>resolve(r.data.filter(x=>x&&Object.keys(x).length)),
-      error:reject
+    Papa.parse(file, {
+      header:true, dynamicTyping:true, skipEmptyLines:'greedy',
+      quoteChar:'"', delimiter:',',
+      complete:r=>resolve(r), error:reject
     });
   });
 }
-function toStr(v){ return (v==null? '' : String(v)); }
-function toNum(v){ const x = +v; return Number.isFinite(x)? x : null; }
-
-function renderPreview(rows){
-  const T = $('preview'); T.innerHTML='';
-  if(!rows.length){ $('shape').textContent='Rows: — | Cols: —'; return; }
-  const cols = Object.keys(rows[0]);
-  const thead = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`;
-  const body = rows.slice(0,10).map(r=>`<tr>${cols.map(c=>`<td>${toStr(r[c])}</td>`).join('')}</tr>`).join('');
-  T.innerHTML = thead + `<tbody>${body}</tbody>`;
-  $('shape').textContent = `Rows: ${rows.length} | Cols: ${cols.length}`;
-}
-
-$('csvFile').addEventListener('change', async (e)=>{
-  const f = e.target.files?.[0]; if(!f) return;
-  try{
-    const rows = await parseCsvFile(f);
-    state.rows = rows; state.header = rows.length? Object.keys(rows[0]) : [];
-    renderPreview(rows);
-    $('btnPredict').disabled = !(state.model && state.spec && state.rows.length);
-    $('scoredRows').textContent = 'Scored Rows: —';
-    $('hasLabels').textContent = 'Has Labels: —';
-    $('aucPill').textContent = 'AUC: —';
-    $('btnDownloadSubmit').disabled = true;
-    $('btnDownloadProbs').disabled = true;
-    $('rankTable').innerHTML=''; clearRoc();
-  }catch(err){
-    console.error('CSV error', err); alert('Failed to parse CSV.');
+const normalize = (row)=> {
+  const out = {};
+  for(const [k,v] of Object.entries(row)){
+    if(v===undefined || v===null || v==='') out[k]=null;
+    else out[k]=v;
   }
-});
+  return out;
+};
 
-// ---------- Transform exactly per spec ----------
-function transformRows(rows, spec){
-  const means = spec.numeric_mean || {};
-  const scales = spec.numeric_scale || {};
-  const order = spec.input_order || [];
-  const X = new Array(rows.length);
+// ---------- Preprocess based on spec ----------
+function z(x, mean, scale){ if(x==null) return 0; return (Number(x)-mean)/ (scale||1); }
 
-  for (let i=0;i<rows.length;i++){
+function buildMatrix(rows, spec){
+  const N = rows.length;
+  const numeric = spec.numeric || [];
+  const cats    = spec.categorical || {}; // {col: [levels]}
+  const numMeans = spec.numeric_mean || {};
+  const numScales= spec.numeric_scale || {};
+
+  const catOrder = [];
+  const inputOrder = [];
+  // numeric first
+  for(const c of numeric){ inputOrder.push(`num:${c}`); }
+  // categorical by (col, each level)
+  for(const col of Object.keys(cats)){
+    for(const lvl of cats[col]){ catOrder.push([col, String(lvl)]); inputOrder.push(`cat:${col}=${lvl}`); }
+  }
+
+  const X = new Array(N);
+  for(let i=0;i<N;i++){
     const r = rows[i];
-    const v = new Array(order.length);
-    for (let j=0;j<order.length;j++){
-      const tok = order[j];
-      if (tok.startsWith('num:')){
-        const col = tok.slice(4);
-        const raw = toNum(r[col]);
-        const mean = means[col] ?? 0;
-        const scale = (scales[col] ?? 1) || 1;
-        const z = (raw==null) ? 0 : (raw - mean) / scale;
-        v[j] = Number.isFinite(z)? z : 0;
-      }else if (tok.startsWith('cat:')){
-        const [left, val] = tok.split('=');
-        const col = left.slice(4);
-        v[j] = (toStr(r[col]) === val) ? 1 : 0;
-      }else{
-        v[j] = 0;
-      }
+    const v = [];
+    // numeric
+    for(const c of numeric){
+      v.push(z(r[c], numMeans[c]??0, numScales[c]??1));
     }
-    X[i]=v;
+    // categorical one-hot
+    for(const [col,lvl] of catOrder){
+      const val = r[col]==null ? '' : String(r[col]);
+      v.push(val===String(lvl) ? 1 : 0);
+    }
+    X[i] = v;
   }
-  return X;
+  return tf.tensor2d(X, [N, inputOrder.length]);
 }
 
-// ---------- Labels, ROC, metrics ----------
-function binLabels(rows, col){
-  if(!col || !rows.length || !(col in rows[0])) return null;
-  const pos = new Set(['churn','churned','cancelled','canceled','inactive','terminated','closed','ended','lost','paused','1','yes','true']);
-  const neg = new Set(['active','current','subscribed','renewed','retained','open','live','0','no','false']);
-  const y = new Array(rows.length).fill(null); let any=false;
-  for(let i=0;i<rows.length;i++){
-    const s = String(rows[i][col] ?? '').trim().toLowerCase();
-    if (pos.has(s)) {y[i]=1; any=true;}
-    else if (neg.has(s)) {y[i]=0; any=true;}
-    else if (s!=='' && !isNaN(+s)) {y[i]=(+s>=0.5?1:0); any=true;}
-  }
-  return any? y : null;
-}
-
-function predictProba(X){
-  const t = tf.tensor2d(X);
-  const p = state.model.predict(t).dataSync();
-  t.dispose();
-  return Array.from(p);
-}
-
-function computeRocAuc(y, p){
-  const pairs=[]; for(let i=0;i<y.length;i++) if(y[i]===0||y[i]===1) pairs.push([p[i], y[i]]);
-  if(!pairs.length) return {auc:null,fpr:[],tpr:[]};
+// ---------- Metrics ----------
+function rocAuc(yTrue, yProb){
+  // trapezoidal ROC AUC
+  const pairs = yProb.map((p,i)=>[p, yTrue[i]]);
   pairs.sort((a,b)=>b[0]-a[0]);
-  let P=0,N=0; for(const [,yi] of pairs){ (yi===1)?P++:N++; }
-  if(!P||!N) return {auc:null,fpr:[],tpr:[]};
-  let tp=0,fp=0,prev=Infinity,prevF=0,prevT=0,auc=0;
-  const roc=[[0,0]];
-  for(const [s,ytrue] of pairs){
-    if(s!==prev){
-      const f=fp/N,t=tp/P;
-      auc += (f-prevF)*(t+prevT)/2;
-      prevF=f; prevT=t; roc.push([f,t]); prev=s;
+  let tp=0, fp=0; const P = yTrue.reduce((s,y)=>s+(y===1),0), N = yTrue.length-P;
+  let prevP=-1, auc=0, lastTPR=0, lastFPR=0;
+  for(const [p,y] of pairs){
+    if(p!==prevP){
+      auc += ( (lastTPR + tp/P) * ( (fp/N) - lastFPR ) )/2;
+      lastTPR = tp/P; lastFPR = fp/N; prevP = p;
     }
-    if(ytrue===1) tp++; else fp++;
+    if(y===1) tp++; else fp++;
   }
-  const f=fp/N,t=tp/P; auc += (f-prevF)*(t+prevT)/2; roc.push([f,t]);
-  return {auc,fpr:roc.map(z=>z[0]),tpr:roc.map(z=>z[1])};
+  auc += ( (lastTPR + tp/P) * ( (fp/N) - lastFPR ) )/2;
+  return {auc: isFinite(auc)?auc:NaN, P, N};
 }
 
-function confusionAt(y,p,thr){
-  let TP=0,FP=0,TN=0,FN=0;
-  for(let i=0;i<y.length;i++){
-    if(y[i]!==0 && y[i]!==1) continue;
-    const yh = p[i]>=thr?1:0;
-    if(yh===1 && y[i]===1) TP++;
-    else if(yh===1 && y[i]===0) FP++;
-    else if(yh===0 && y[i]===1) FN++;
-    else TN++;
+function confMat(yTrue, yProb, thr){
+  let TP=0, TN=0, FP=0, FN=0;
+  for(let i=0;i<yTrue.length;i++){
+    const y = yTrue[i]; const pred = yProb[i]>=thr ? 1:0;
+    if(y===1 && pred===1) TP++;
+    else if(y===0 && pred===0) TN++;
+    else if(y===0 && pred===1) FP++;
+    else if(y===1 && pred===0) FN++;
   }
-  const precision=(TP+FP)?TP/(TP+FP):0;
-  const recall=(TP+FN)?TP/(TP+FN):0;
-  const f1=(precision+recall)?2*precision*recall/(precision+recall):0;
-  return {TP,FP,TN,FN,precision,recall,f1};
+  const prec = (TP+FP)? TP/(TP+FP) : 0;
+  const rec  = (TP+FN)? TP/(TP+FN) : 0;
+  const f1   = (prec+rec)? 2*prec*rec/(prec+rec) : 0;
+  return {TN,FP,FN,TP,prec,rec,f1};
 }
 
-function renderConf(m){
-  $('mTP').textContent=m.TP; $('mFP').textContent=m.FP;
-  $('mTN').textContent=m.TN; $('mFN').textContent=m.FN;
-  $('mP').textContent=m.precision.toFixed(3);
-  $('mR').textContent=m.recall.toFixed(3);
-  $('mF1').textContent=m.f1.toFixed(3);
+// ---------- UI helpers ----------
+function setCM(cm){
+  const rows = UI.cmBody.querySelectorAll('tr td:last-child');
+  const vals = [cm.TN,cm.FP,cm.FN,cm.TP, cm.prec.toFixed(3), cm.rec.toFixed(3), cm.f1.toFixed(3)];
+  rows.forEach((td,i)=> td.textContent = String(vals[i]));
 }
 
-// ---------- ROC chart ----------
-function clearRoc(){ if(state.rocChart){ state.rocChart.destroy(); state.rocChart=null; } }
-function renderRoc(roc){
-  const ctx = document.getElementById('rocChart').getContext('2d');
-  if(state.rocChart) state.rocChart.destroy();
-  if(!roc || !roc.fpr.length) return;
-  state.rocChart = new Chart(ctx,{
-    type:'line',
-    data:{
-      labels:roc.fpr,
-      datasets:[
-        {label:'ROC', data:roc.tpr, borderWidth:2, fill:false},
-        {label:'Chance', data:roc.fpr, borderWidth:1, borderDash:[6,6], fill:false}
-      ]
-    },
-    options:{
-      responsive:true, maintainAspectRatio:false,
-      scales:{
-        x:{type:'linear',min:0,max:1,title:{display:true,text:'FPR'}},
-        y:{type:'linear',min:0,max:1,title:{display:true,text:'TPR'}}
-      },
-      plugins:{legend:{display:true,position:'bottom'}}
-    }
-  });
+function showPreview(res){
+  const rows = res.data.slice(0,12);
+  const head = res.meta.fields || Object.keys(rows[0]||{});
+  const lines = [head.join('\t')].concat(rows.map(r=> head.map(c=> r[c]).join('\t')));
+  UI.preview.textContent = lines.join('\n');
+  UI.shape.textContent = `Rows: ${res.data.length} | Cols: ${head.length}`;
+  STATE.rows = res.data.map(normalize);
+  STATE.header = head;
 }
 
-// ---------- Ranking + Downloads ----------
-function renderRanking(rows, probs, idCol, extras=['age','purchase_frequency','unit_price','country','preferred_category']){
-  const T=$('rankTable'); if(!rows.length){T.innerHTML='';return;}
-  const items = rows.map((r,i)=>({i, id: (idCol && r[idCol]!=null)? r[idCol] : (i+1), p: probs[i], row:r}))
-                    .sort((a,b)=>b.p-a.p).slice(0,100);
-  const cols = ['#','id','prob'].concat(extras.filter(c=>c in rows[0]));
-  const thead = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`;
-  const body = items.map((it,rank)=>{
-    const cells=[ `<td>${rank+1}</td>`,`<td>${String(it.id)}</td>`,`<td>${it.p.toFixed(4)}</td>` ];
-    for(const c of extras) if(c in it.row) cells.push(`<td>${String(it.row[c])}</td>`);
-    return `<tr>${cells.join('')}</tr>`;
-  }).join('');
-  T.innerHTML = thead + `<tbody>${body}</tbody>`;
+// ---------- Downloads ----------
+function download(name, text){
+  const blob = new Blob([text], {type:'text/csv;charset=utf-8;'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
 }
 
-function downloadCsv(name, header, rows){
-  const esc=v=>{const s=v==null?'':String(v); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
-  const csv=[header.map(esc).join(',')].concat(rows.map(r=>r.map(esc).join(','))).join('\n');
-  const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
-  const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
+// ---------- Main flow ----------
+async function boot(){
+  try{
+    // load SPEC first (preprocess.json)
+    STATE.spec = await tryFetchJSON(CANDS('web_model/preprocess.json'));
+    okBadge(UI.bSpec, 'Spec: loaded');
+    UI.defaultThr.textContent = `Default Threshold ${STATE.spec.threshold_default ?? 0.5}`;
+    UI.specTarget.textContent = `Spec Target ${STATE.spec.target_col ?? '—'}`;
+    STATE.idCol = STATE.spec.id_col || null;
+  }catch(e){
+    failBadge(UI.bSpec, 'Spec: failed to load');
+    console.error('Spec load error:', e);
+  }
+
+  try{
+    // then MODEL
+    STATE.model = await tryLoadModel(CANDS('web_model/model.json'));
+    okBadge(UI.bModel, 'Model: loaded');
+  }catch(e){
+    failBadge(UI.bModel, 'Model: failed to load');
+    console.error('Model load error:', e);
+  }
 }
 
-// ---------- Predict flow ----------
-async function runPredict(){
-  if(!state.model || !state.spec || !state.rows.length){ alert('Load model/spec and CSV first.'); return; }
-  const X = transformRows(state.rows, state.spec);
-  state.probs = predictProba(X);
-  state.yTrue = binLabels(state.rows, state.targetCol);
+UI.csv.addEventListener('change', async (ev)=>{
+  const f = ev.target.files?.[0];
+  if(!f){ UI.preview.textContent='Preview'; UI.shape.textContent='Rows: — | Cols: —'; return; }
+  try{
+    const res = await parseCSV(f);
+    showPreview(res);
+    UI.hasY.textContent = `Has Labels: ${STATE.header.includes(STATE.spec?.target_col||'subscription_status')?'yes':'no'}`;
+  }catch(e){
+    UI.preview.textContent = 'Failed to parse CSV. Make sure it is comma + double-quote CSV.';
+    console.error(e);
+  }
+});
 
-  $('scoredRows').textContent = `Scored Rows: ${state.probs.length}`;
-  $('hasLabels').textContent  = `Has Labels: ${state.yTrue? 'Yes':'No'}`;
+UI.run.addEventListener('click', async ()=>{
+  if(!STATE.model || !STATE.spec){ alert('Model/spec not loaded yet.'); return; }
+  if(!STATE.rows.length){ alert('Upload a CSV first.'); return; }
 
-  clearRoc();
-  if(state.yTrue){
-    const roc = computeRocAuc(state.yTrue, state.probs);
-    $('aucPill').textContent = `AUC: ${roc.auc==null?'—':roc.auc.toFixed(4)}`;
-    renderRoc(roc);
+  // Build X
+  const X = buildMatrix(STATE.rows, STATE.spec);
+  const probT = STATE.model.predict(X);
+  const probs = Array.from((await probT.data())); probT.dispose(); X.dispose();
+  STATE.probs = probs;
+
+  // yTrue if present
+  const yCol = (STATE.spec.target_col || 'subscription_status');
+  STATE.yTrue = STATE.header.includes(yCol)
+      ? STATE.rows.map(r => (String(r[yCol]??'').toLowerCase().match(/^(1|yes|true|churn|churned|cancelled|canceled|inactive|terminated|closed|ended|lost|paused)$/)?1:0))
+      : null;
+
+  UI.scored.textContent = `Scored Rows: ${probs.length}`;
+  UI.hasY.textContent = `Has Labels: ${STATE.yTrue? 'yes':'no'}`;
+
+  // AUC
+  if(STATE.yTrue){
+    const {auc} = rocAuc(STATE.yTrue, probs);
+    UI.aucTxt.textContent = `AUC: ${isFinite(auc)?auc.toFixed(4):'—'}`;
+    UI.roc.textContent = `ROC AUC: ${isFinite(auc)?auc.toFixed(4):'—'} (simple)`;
   }else{
-    $('aucPill').textContent = 'AUC: —';
+    UI.roc.textContent = 'Upload a CSV with the label column to display ROC/AUC.';
+    UI.aucTxt.textContent = 'AUC: —';
   }
 
-  const thr = +(state.spec.threshold_default ?? 0.5);
-  $('thr').value = String(thr); $('thrVal').textContent = thr.toFixed(2);
-  if(state.yTrue) renderConf(confusionAt(state.yTrue, state.probs, thr));
-  else renderConf({TP:0,FP:0,TN:0,FN:0,precision:0,recall:0,f1:0});
+  // threshold block refresh
+  const thr = Number(UI.thr.value);
+  UI.thrVal.textContent = thr.toFixed(2);
+  if(STATE.yTrue){
+    setCM(confMat(STATE.yTrue, probs, thr));
+  }
 
-  renderRanking(state.rows, state.probs, state.idCol);
-  $('btnDownloadSubmit').disabled=false; $('btnDownloadProbs').disabled=false;
-}
-$('btnPredict').addEventListener('click', runPredict);
-
-$('thr').addEventListener('input', e=>{
-  const thr=+e.target.value; $('thrVal').textContent=thr.toFixed(2);
-  if(state.yTrue) renderConf(confusionAt(state.yTrue, state.probs, thr));
+  // ranking preview text
+  const idC = STATE.idCol || (STATE.header.includes('customer_id') ? 'customer_id' : STATE.header[0]);
+  const top = probs
+    .map((p,i)=>({id:STATE.rows[i][idC], p, age:STATE.rows[i].age, spend:STATE.rows[i].monetary||STATE.rows[i].unit_price}))
+    .sort((a,b)=>b.p-a.p)
+    .slice(0,10);
+  UI.rank.textContent = top.map(r=>`${idC}=${r.id}  prob=${r.p.toFixed(4)}`).join('\n');
 });
 
-$('btnDownloadSubmit').addEventListener('click', ()=>{
-  if(!state.rows.length || !state.probs.length) return;
-  const thr=+$('thr').value, idCol=state.idCol || 'id';
-  const header=[idCol,'Churn'];
-  const out = state.rows.map((r,i)=>[ r[idCol] ?? (i+1), (state.probs[i]>=thr?1:0) ]);
-  downloadCsv('submission.csv', header, out);
-});
-$('btnDownloadProbs').addEventListener('click', ()=>{
-  if(!state.rows.length || !state.probs.length) return;
-  const idCol=state.idCol || 'id';
-  const header=[idCol,'probability'];
-  const out = state.rows.map((r,i)=>[ r[idCol] ?? (i+1), state.probs[i] ]);
-  downloadCsv('probabilities.csv', header, out);
+UI.thr.addEventListener('input', ()=>{
+  const thr = Number(UI.thr.value);
+  UI.thrVal.textContent = thr.toFixed(2);
+  if(STATE.yTrue && STATE.probs){
+    setCM(confMat(STATE.yTrue, STATE.probs, thr));
+  }
 });
 
-// ---------- Boot ----------
-(async function(){
-  await loadSpec();
-  await loadModel();
-  $('btnPredict').disabled = !(state.model && state.spec && state.rows.length);
-})();
+UI.btnSub.addEventListener('click', ()=>{
+  if(!STATE.probs){ alert('Run predictions first.'); return; }
+  const idC = STATE.idCol || (STATE.header.includes('customer_id') ? 'customer_id' : STATE.header[0]);
+  const thr = Number(UI.thr.value);
+  const lines = ['customer_id,Churn'];
+  for(let i=0;i<STATE.rows.length;i++){
+    const id = STATE.rows[i][idC];
+    const lab = STATE.probs[i] >= thr ? 1 : 0;
+    lines.push(`${id},${lab}`);
+  }
+  download('submission.csv', lines.join('\n'));
+});
+
+UI.btnProbs.addEventListener('click', ()=>{
+  if(!STATE.probs){ alert('Run predictions first.'); return; }
+  const idC = STATE.idCol || (STATE.header.includes('customer_id') ? 'customer_id' : STATE.header[0]);
+  const lines = ['customer_id,prob'];
+  for(let i=0;i<STATE.rows.length;i++){
+    const id = STATE.rows[i][idC];
+    lines.push(`${id},${STATE.probs[i]}`);
+  }
+  download('probabilities.csv', lines.join('\n'));
+});
+
+boot();
