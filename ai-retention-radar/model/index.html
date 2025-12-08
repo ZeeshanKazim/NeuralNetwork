@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Retention Radar – Churn Risk Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+  <!-- PapaParse for CSV parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.5.3/papaparse.min.js"></script>
+  <!-- Chart.js for ROC curve -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <div class="brand-text">
+        <span class="brand-title">AI Retention Radar</span>
+        <span class="brand-subtitle">E-commerce churn & revenue risk</span>
+      </div>
+    </div>
+    <div class="top-status">
+      <span id="model-status">Loading model…</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- left: data -->
+    <section class="panel">
+      <h2>1. Data</h2>
+      <p class="muted">
+        Use your own CSVs, or quickly load the sample data included in this repo.
+      </p>
+
+      <div class="field-group">
+        <div class="field">
+          <label>Train CSV (with churn label)</label>
+          <input type="file" id="train-upload" accept=".csv" />
+          <button id="load-sample-train" class="btn ghost small">
+            Use sample train_web.csv
+          </button>
+          <small id="train-summary" class="muted">No train file loaded.</small>
+        </div>
+
+        <div class="field">
+          <label>Scoring CSV (customers to score)</label>
+          <input type="file" id="score-upload" accept=".csv" />
+          <button id="load-sample-score" class="btn ghost small">
+            Use sample scoring_web.csv
+          </button>
+          <small id="score-summary" class="muted">No scoring file loaded.</small>
+        </div>
+      </div>
+
+      <button id="preprocess-btn" class="btn primary wide">
+        2. Run preprocessing
+      </button>
+
+      <div class="info-row">
+        <span id="feature-info" class="tag">Features: –</span>
+        <span id="shape-info" class="tag">Train rows: –</span>
+      </div>
+
+      <div class="note">
+        Preprocessing applies the same scaling and feature selection you used in
+        Google Colab, based on <code>preprocessing_config.json</code>.
+      </div>
+    </section>
+
+    <!-- middle: training + metrics -->
+    <section class="panel">
+      <h2>3. Train</h2>
+      <p class="muted">
+        Optionally fine-tune the loaded TensorFlow.js model in the browser.
+      </p>
+
+      <button id="train-btn" class="btn">
+        Start in-browser training
+      </button>
+
+      <div id="training-log" class="training-log"></div>
+
+      <h2>4. Metrics</h2>
+      <p class="muted">
+        Evaluate on the labeled train data, adjust the decision threshold, and
+        inspect trade-offs.
+      </p>
+
+      <button id="metrics-btn" class="btn">
+        Compute metrics on train data
+      </button>
+
+      <div class="threshold-row">
+        <label>
+          Decision threshold:
+          <span id="threshold-value">0.50</span>
+        </label>
+        <input
+          type="range"
+          id="threshold-slider"
+          min="0"
+          max="1"
+          step="0.01"
+          value="0.5"
+        />
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <span class="metric-label">AUC</span>
+          <span class="metric-value" id="auc-value">–</span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Precision</span>
+          <span class="metric-value" id="precision-value">–</span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Recall</span>
+          <span class="metric-value" id="recall-value">–</span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">F1 Score</span>
+          <span class="metric-value" id="f1-value">–</span>
+        </div>
+      </div>
+
+      <div class="conf-matrix">
+        <h3>Confusion Matrix</h3>
+        <table>
+          <thead>
+            <tr>
+              <th></th>
+              <th>Pred 0</th>
+              <th>Pred 1</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th>True 0</th>
+              <td id="cm-tn">–</td>
+              <td id="cm-fp">–</td>
+            </tr>
+            <tr>
+              <th>True 1</th>
+              <td id="cm-fn">–</td>
+              <td id="cm-tp">–</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="chart-wrapper">
+        <h3>ROC Curve</h3>
+        <canvas id="rocChart"></canvas>
+      </div>
+    </section>
+
+    <!-- right: prediction + export -->
+    <section class="panel">
+      <h2>5. Predict & Export</h2>
+      <p class="muted">
+        Score your customers, rank them by churn risk, and export CSVs for the
+        Marketing / CRM team.
+      </p>
+
+      <button id="predict-btn" class="btn primary wide">
+        Run prediction on scoring data
+      </button>
+
+      <div class="export-row">
+        <button id="export-proba-btn" class="btn ghost small">
+          Export probabilities.csv
+        </button>
+        <button id="export-submission-btn" class="btn ghost small">
+          Export submission.csv
+        </button>
+      </div>
+
+      <h3>Top at-risk customers</h3>
+      <div class="table-wrapper">
+        <table id="ranking-table">
+          <thead>
+            <tr>
+              <th>Customer ID</th>
+              <th>Churn probability</th>
+              <th>Recency</th>
+              <th>Frequency</th>
+              <th>Monetary</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- filled by app.js -->
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>
+      Deployed on GitHub Pages · In-browser inference with TensorFlow.js ·
+      Data stays in your browser
+    </span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
