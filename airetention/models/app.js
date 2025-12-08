@@ -15,6 +15,8 @@ const thrValue = document.getElementById("threshold-value");
 const metricsDiv = document.getElementById("metrics");
 const tableEl = document.getElementById("ranking-table");
 
+let trainingStartTime = null;  // will store performance.now() at start
+
 console.log("app.js loaded");
 
 if (fileInput) {
@@ -119,6 +121,7 @@ async function trainAndPredict() {
     const nSamples = featureMatrix.length;
     const nFeatures = featureMatrix[0].length;
 
+    trainingStartTime = performance.now();  // start timer
     modelStatus.textContent = "Preparing training data…";
 
     // Select a random subset for training
@@ -166,15 +169,16 @@ async function trainAndPredict() {
       verbose: 0,
       callbacks: {
         onEpochEnd: (epoch, logs) => {
+          const elapsed = ((performance.now() - trainingStartTime) / 1000).toFixed(1);
           modelStatus.textContent =
-            `Epoch ${epoch + 1}/${EPOCHS} – loss: ${logs.loss.toFixed(4)}, val_acc: ${logs.val_accuracy.toFixed(4)}`;
+            `Epoch ${epoch + 1}/${EPOCHS} – loss: ${logs.loss.toFixed(4)}, ` +
+            `val_acc: ${logs.val_accuracy.toFixed(4)} (elapsed: ${elapsed}s)`;
         },
       },
     });
 
-    modelStatus.textContent = "Training finished. Scoring all customers…";
-
     // Predict on ALL rows (normalize with same mean/std from subset)
+    modelStatus.textContent = "Training finished. Scoring all customers…";
     const Xall = tf.tensor2d(featureMatrix);     // [N_all, D]
     const XallNorm = Xall.sub(mean).div(std);
     const preds = model.predict(XallNorm);
@@ -192,14 +196,19 @@ async function trainAndPredict() {
     variance.dispose();
     std.dispose();
 
+    const totalElapsed = ((performance.now() - trainingStartTime) / 1000).toFixed(1);
     modelStatus.textContent =
-      `Model trained on ${indices.length} rows; scored all ${nSamples} customers.`;
+      `Model trained on ${indices.length} rows; scored all ${nSamples} customers ` +
+      `in ${totalElapsed}s.`;
 
     computeMetrics();
     renderRankingTable();
   } catch (err) {
     console.error("Error in trainAndPredict:", err);
-    modelStatus.textContent = "Error during training: " + err;
+    const totalElapsed = trainingStartTime
+      ? ` (elapsed: ${((performance.now() - trainingStartTime) / 1000).toFixed(1)}s)`
+      : "";
+    modelStatus.textContent = "Error during training: " + err + totalElapsed;
   }
 }
 
