@@ -2,7 +2,7 @@
 ASSUMPTIONS:
 1) train_web.csv contains 'CustomerID', 'Churn' and all numeric_cols from config/preprocessing_config.json.
 2) scoring_web.csv contains 'CustomerID' and the same numeric_cols (label column optional).
-3) All preprocessing uses the numeric means/stds from preprocessing_config.json for standardization. :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1}
+3) All preprocessing uses the numeric means/stds from preprocessing_config.json for standardization.
 */
 
 const CONFIG_URL = "config/preprocessing_config.json";
@@ -18,16 +18,18 @@ let rawScoreRows = [];
 let trainSet = null;
 let scoreSet = null;
 
-let lastEval = null; // { yTrue, yScore }
-let lastMetrics = null; // { threshold, auc, accuracy, precision, recall, f1, cm }
-let lastScorePreds = null; // [{ id, prob, pred, row }]
+let lastEval = null;        // { yTrue, yScore }
+let lastMetrics = null;     // { threshold, auc, accuracy, precision, recall, f1, cm, ... }
+let lastScorePreds = null;  // [{ id, prob, pred, row }]
 let datasetSummary = null;
 let rocChart = null;
+
 let baseStatusText = "Initializing…";
 
 const BUTTON_IDS = [
   "btn-load-data",
   "btn-preprocess",
+  "btn-reset",
   "btn-train",
   "btn-evaluate",
   "btn-score",
@@ -37,7 +39,7 @@ const BUTTON_IDS = [
   "btn-export-scores",
 ];
 
-/* ---------- Utility helpers ---------- */
+/* ---------- DOM + status helpers ---------- */
 
 function $(id) {
   return document.getElementById(id);
@@ -82,6 +84,8 @@ function log(message, level = "info") {
   consoleEl.appendChild(line);
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
+
+/* ---------- Generic helpers ---------- */
 
 function downloadBlob(filename, content, mimeType) {
   const blob = new Blob([content], { type: mimeType });
@@ -155,26 +159,26 @@ function parseCsvFile(file) {
 /* ---------- Dataset summary ---------- */
 
 function updateDatasetSummary() {
-  const targetElRows = $("summary-rows");
-  const targetElCols = $("summary-cols");
-  const targetElMissing = $("summary-missing");
+  const rowsEl = $("summary-rows");
+  const colsEl = $("summary-cols");
+  const missEl = $("summary-missing");
 
   if (!rawTrainRows || rawTrainRows.length === 0) {
     datasetSummary = null;
-    if (targetElRows) targetElRows.textContent = "–";
-    if (targetElCols) targetElCols.textContent = "–";
-    if (targetElMissing) targetElMissing.textContent = "–";
+    if (rowsEl) rowsEl.textContent = "–";
+    if (colsEl) colsEl.textContent = "–";
+    if (missEl) missEl.textContent = "–";
     return;
   }
 
   const rows = rawTrainRows.length;
   const cols = Object.keys(rawTrainRows[0]).length;
-  let missing = 0;
   const colNames = Object.keys(rawTrainRows[0]);
+  let missing = 0;
 
-  rawTrainRows.forEach((row) => {
+  rawTrainRows.forEach((r) => {
     colNames.forEach((c) => {
-      const v = row[c];
+      const v = r[c];
       if (
         v === null ||
         v === undefined ||
@@ -189,17 +193,11 @@ function updateDatasetSummary() {
   const totalCells = rows * cols;
   const missingPct = totalCells ? (missing / totalCells) * 100 : 0;
 
-  datasetSummary = {
-    rows,
-    cols,
-    missing,
-    missingPct,
-  };
+  datasetSummary = { rows, cols, missing, missingPct };
 
-  if (targetElRows) targetElRows.textContent = rows.toString();
-  if (targetElCols) targetElCols.textContent = cols.toString();
-  if (targetElMissing)
-    targetElMissing.textContent = `${missing} (${missingPct.toFixed(1)}%)`;
+  if (rowsEl) rowsEl.textContent = rows.toString();
+  if (colsEl) colsEl.textContent = cols.toString();
+  if (missEl) missEl.textContent = `${missing} (${missingPct.toFixed(1)}%)`;
 }
 
 /* ---------- Preprocessing ---------- */
@@ -216,20 +214,17 @@ function transformRow(row) {
   for (let i = 0; i < cols.length; i++) {
     const col = cols[i];
     if (!(col in row)) {
-      // if column missing entirely we'll handle at dataset-building stage
-      return null;
+      return null; // missing column
     }
     let v = Number(row[col]);
     if (Number.isNaN(v)) v = means[col];
 
     const mean = means[col] != null ? means[col] : 0;
     const std = stds[col] != null && stds[col] !== 0 ? stds[col] : 1;
-
     const scaled = (v - mean) / std;
     if (Number.isNaN(scaled)) return null;
     features.push(scaled);
   }
-
   return features;
 }
 
@@ -261,9 +256,7 @@ function buildDataset(rows, isTrain) {
 
     ids.push(cfg.id_col ? row[cfg.id_col] : null);
     X.push(feats);
-    if (isTrain) {
-      y.push(Number(row[cfg.target]));
-    }
+    if (isTrain) y.push(Number(row[cfg.target]));
   }
 
   if (!X.length) return null;
@@ -271,16 +264,88 @@ function buildDataset(rows, isTrain) {
   const X_tensor = tf.tensor2d(X);
   const y_tensor = isTrain ? tf.tensor2d(y, [y.length, 1]) : null;
 
-  return {
-    ids,
-    X,
-    y,
-    X_tensor,
-    y_tensor,
-  };
+  return { ids, X, y, X_tensor, y_tensor };
 }
 
-/* ---------- Metrics ---------- */
+/* ---------- Model ---------- */
+
+function createDefaultModel() {
+  if (!preprocessingConfig || !preprocessingConfig.numeric_cols) {
+    throw new Error("Preprocessing config not loaded; cannot build model.");
+  }
+
+  const inputDim = preprocessingConfig.numeric_cols.length;
+
+  const m = tf.sequential();
+  m.add(
+    tf.layers.dense({
+      units: 16,
+      activation: "relu",
+      inputShape: [inputDim],
+    })
+  );
+  m.add(
+    tf.layers.dense({
+      units: 1,
+      activation: "sigmoid",
+    })
+  );
+
+  m.compile({
+    optimizer: tf.train.adam(0.001),
+    loss: "binaryCrossentropy",
+    metrics: ["accuracy"],
+  });
+
+  return m;
+}
+
+async function loadConfigAndModel() {
+  try {
+    preprocessingConfig = await fetchJSON(CONFIG_URL);
+    log("Preprocessing config loaded.", "success");
+  } catch (err) {
+    log(`Failed to load preprocessing config: ${err.message}`, "error");
+    setStatus("Config failed to load – app limited.");
+    return;
+  }
+
+  // try to load pretrained model.json first
+  try {
+    model = await tf.loadLayersModel(MODEL_URL);
+    model.compile({
+      optimizer: tf.train.adam(0.001),
+      loss: "binaryCrossentropy",
+      metrics: ["accuracy"],
+    });
+    setStatus("Pretrained model loaded and ready.");
+    log("TF.js model loaded from model.json.", "success");
+  } catch (err) {
+    log(
+      `Failed to load TF.js model from model.json (${err.message}). Falling back to a fresh model.`,
+      "error"
+    );
+    try {
+      model = createDefaultModel();
+      setStatus("Fresh model created – ready to train.");
+      log(
+        `New shallow NN model created with input dim ${preprocessingConfig.numeric_cols.length}.`,
+        "success"
+      );
+    } catch (innerErr) {
+      model = null;
+      setStatus("Could not create model – training disabled.");
+      log(`Also failed to create fresh model: ${innerErr.message}`, "error");
+    }
+  }
+
+  const slider = $("threshold-slider");
+  if (slider) {
+    $("threshold-display").textContent = Number(slider.value || 0.5).toFixed(2);
+  }
+}
+
+/* ---------- Metrics & ROC ---------- */
 
 function computeConfusion(yTrue, yScore, threshold) {
   let tp = 0,
@@ -354,7 +419,7 @@ function renderRocCurve(fprs, tprs) {
   const data = {
     datasets: [
       {
-        label: "ROC",
+        label: "ROC curve",
         data: fprs.map((fpr, i) => ({ x: fpr, y: tprs[i] })),
         fill: false,
         tension: 0.25,
@@ -414,13 +479,12 @@ function updateMetricsUI(auc, metrics, cm) {
 function renderScoreTable(items) {
   const tbody = $("score-table").querySelector("tbody");
   tbody.innerHTML = "";
-
   if (!items || !items.length) return;
 
   const maxRows = 200;
-  const displayItems = items.slice(0, maxRows);
+  const toShow = items.slice(0, maxRows);
 
-  displayItems.forEach((item) => {
+  toShow.forEach((item) => {
     const row = item.row || {};
     const tr = document.createElement("tr");
 
@@ -457,30 +521,7 @@ function renderScoreTable(items) {
   });
 }
 
-/* ---------- Core actions ---------- */
-
-async function loadConfigAndModel() {
-  try {
-    preprocessingConfig = await fetchJSON(CONFIG_URL);
-    log("Preprocessing config loaded.", "success");
-  } catch (err) {
-    log(`Failed to load preprocessing config: ${err.message}`, "error");
-  }
-
-  try {
-    model = await tf.loadLayersModel(MODEL_URL);
-    model.compile({
-      optimizer: tf.train.adam(0.001),
-      loss: "binaryCrossentropy",
-      metrics: ["accuracy"],
-    });
-    setStatus("Model loaded and ready.");
-    log("TF.js model loaded.", "success");
-  } catch (err) {
-    setStatus("Model failed to load – training disabled.");
-    log(`Failed to load TF.js model: ${err.message}`, "error");
-  }
-}
+/* ---------- Action handlers ---------- */
 
 async function handleLoadSampleData() {
   setBusy(true, "Loading sample data…");
@@ -550,16 +591,14 @@ function handlePreprocess() {
 
   setBusy(true, "Building datasets…");
   try {
-    // Check that all required numeric columns exist
     const cols = preprocessingConfig.numeric_cols;
-    const firstRow = rawTrainRows[0];
-    const missingCols = cols.filter((c) => !(c in firstRow));
+    const firstTrainRow = rawTrainRows[0];
+    const missingCols = cols.filter((c) => !(c in firstTrainRow));
     if (missingCols.length) {
       log(
         `Train data is missing required numeric columns: ${missingCols.join(", ")}`,
         "error"
       );
-      setBusy(false);
       return;
     }
 
@@ -569,8 +608,10 @@ function handlePreprocess() {
     }
     trainSet = buildDataset(rawTrainRows, true);
     if (!trainSet) {
-      log("Could not build training dataset – check that label and numeric columns are valid.", "error");
-      setBusy(false);
+      log(
+        "Could not build training dataset – check numeric columns and label column.",
+        "error"
+      );
       return;
     }
 
@@ -613,7 +654,6 @@ async function handleTrain() {
 
   setBusy(true, "Training model in browser…");
   log("Starting training (15 epochs, validation split 0.2)…", "info");
-
   try {
     await model.fit(trainSet.X_tensor, trainSet.y_tensor, {
       epochs: 15,
@@ -657,10 +697,7 @@ async function handleEvaluate() {
     const predsArr = Array.from(await predsTensor.data());
     predsTensor.dispose();
 
-    lastEval = {
-      yTrue: trainSet.y,
-      yScore: predsArr,
-    };
+    lastEval = { yTrue: trainSet.y, yScore: predsArr };
 
     const { fprs, tprs, auc } = computeRocAuc(lastEval.yTrue, lastEval.yScore);
     renderRocCurve(fprs, tprs);
@@ -882,7 +919,7 @@ function handleReset() {
   }
 
   $("log-console").innerHTML = "";
-  setStatus("Model loaded and ready.");
+  setStatus("Model ready (you can reload data).");
   log("State reset. You can reload data and start over.", "info");
 }
 
@@ -891,7 +928,9 @@ function handleReset() {
 document.addEventListener("DOMContentLoaded", () => {
   setStatus("Loading model & config…");
   loadConfigAndModel().then(() => {
-    if (model) setStatus("Model loaded and ready.");
+    if (model) {
+      setStatus("Model ready – load data to begin.");
+    }
   });
 
   $("btn-load-data").addEventListener("click", handleLoadSampleData);
