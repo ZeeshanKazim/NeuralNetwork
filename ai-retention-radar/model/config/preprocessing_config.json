@@ -1,1 +1,49 @@
-
+{
+  "target": "Churn",
+  "id_col": "CustomerID",
+  "numeric_cols": [
+    "Tenure",
+    "CityTier",
+    "WarehouseToHome",
+    "HourSpendOnApp",
+    "NumberOfDeviceRegistered",
+    "SatisfactionScore",
+    "NumberOfAddress",
+    "Complain",
+    "OrderAmountHikeFromlastYear",
+    "CouponUsed",
+    "OrderCount",
+    "DaySinceLastOrder",
+    "CashbackAmount"
+  ],
+  "numeric_means": {
+    "Tenure": 10.130328596802842,
+    "CityTier": 1.6649644760213145,
+    "WarehouseToHome": 15.642317939609237,
+    "HourSpendOnApp": 2.935612788632327,
+    "NumberOfDeviceRegistered": 3.6962699822380105,
+    "SatisfactionScore": 3.0672735346358793,
+    "NumberOfAddress": 4.197380106571936,
+    "Complain": 0.2801953818827709,
+    "OrderAmountHikeFromlastYear": 15.683836589698046,
+    "CouponUsed": 1.7184724689165187,
+    "OrderCount": 2.924511545293073,
+    "DaySinceLastOrder": 4.4560390763765545,
+    "CashbackAmount": 177.38532193605684
+  },
+  "numeric_stds": {
+    "Tenure": 8.348169850721783,
+    "CityTier": 0.9184597156011235,
+    "WarehouseToHome": 8.284017737000738,
+    "HourSpendOnApp": 0.7057439590107345,
+    "NumberOfDeviceRegistered": 1.030021958208662,
+    "SatisfactionScore": 1.3841124753291374,
+    "NumberOfAddress": 2.564770593703341,
+    "Complain": 0.4490945667165648,
+    "OrderAmountHikeFromlastYear": 3.591353567851317,
+    "CouponUsed": 1.854799298446904,
+    "OrderCount": 2.8153795275183993,
+    "DaySinceLastOrder": 3.55423894898274,
+    "CashbackAmount": 49.09117621416259
+  }
+}
