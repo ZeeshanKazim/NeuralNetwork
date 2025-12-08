@@ -19,9 +19,7 @@ thrSlider.addEventListener("input", () => {
   if (predictions.length) computeMetrics();
 });
 
-/**
- * Handle CSV upload
- */
+// Handle CSV upload
 async function handleFile(evt) {
   const file = evt.target.files[0];
   if (!file) return;
@@ -70,13 +68,11 @@ async function handleFile(evt) {
     `Loaded ${rawData.length} rows, using ${numericCols.length} numeric features.`;
 }
 
-/**
- * Load TF.js model from models/tfjs_main_model/model.json
- */
+// Load TF.js model (path adjusted for your repo)
 async function loadModel() {
   try {
     modelStatus.textContent = "Loading model…";
-    model = await tf.loadLayersModel("models/tfjs_main_model/model.json");
+    model = await tf.loadLayersModel("tfjs_main_model/model.json");
     modelStatus.textContent = "Model loaded and ready.";
   } catch (err) {
     console.error(err);
@@ -84,9 +80,7 @@ async function loadModel() {
   }
 }
 
-/**
- * Run predictions on uploaded data
- */
+// Run predictions
 async function predict() {
   if (!model) {
     alert("Load the model first.");
@@ -108,10 +102,7 @@ async function predict() {
   renderRankingTable();
 }
 
-/**
- * Compute confusion matrix + precision/recall/F1 if labels present.
- * If target_class is missing, only show summary of probabilities.
- */
+// Compute metrics (if target_class available)
 function computeMetrics() {
   const thr = parseFloat(thrSlider.value);
   thrValue.textContent = thr.toFixed(2);
@@ -121,7 +112,9 @@ function computeMetrics() {
     return;
   }
 
-  const hasLabels = rawData.some(r => r["target_class"] !== undefined && r["target_class"] !== "");
+  const hasLabels = rawData.some(
+    r => r["target_class"] !== undefined && r["target_class"] !== ""
+  );
   const n = predictions.length;
   const avgProb =
     predictions.reduce((s, p) => s + p, 0) / (predictions.length || 1);
@@ -164,9 +157,7 @@ function computeMetrics() {
   `;
 }
 
-/**
- * Show top-risk customers in a table
- */
+// Show top-risk customers
 function renderRankingTable() {
   if (!rawData.length || !predictions.length) {
     tableEl.innerHTML = "";
@@ -175,7 +166,10 @@ function renderRankingTable() {
 
   const rows = rawData.map((r, i) => ({
     visitorid: r["visitorid"] || `row_${i}`,
-    label: r["target_class"] !== undefined && r["target_class"] !== "" ? parseInt(r["target_class"]) : null,
+    label:
+      r["target_class"] !== undefined && r["target_class"] !== ""
+        ? parseInt(r["target_class"])
+        : null,
     prob: predictions[i]
   }));
 
@@ -206,7 +200,6 @@ function renderRankingTable() {
     const pCell = document.createElement("td");
     pCell.textContent = r.prob.toFixed(3);
 
-    // Color-code probability
     if (r.prob >= 0.8) pCell.classList.add("prob-high");
     else if (r.prob >= 0.5) pCell.classList.add("prob-med");
     else pCell.classList.add("prob-low");
