@@ -1,10 +1,8 @@
 :root {
   --bg: #020617;
-  --bg-alt: #020617;
   --card-bg: rgba(15, 23, 42, 0.92);
   --accent: #38bdf8;
   --accent-2: #22c55e;
-  --accent-soft: rgba(56, 189, 248, 0.12);
   --text: #e5e7eb;
   --muted: #9ca3af;
   --border-subtle: 1px solid rgba(148, 163, 184, 0.35);
@@ -88,7 +86,7 @@ body {
   color: var(--muted);
 }
 
-/* main layout */
+/* layout */
 
 .layout {
   display: grid;
@@ -141,7 +139,7 @@ body {
   font-size: 0.95rem;
 }
 
-/* text */
+/* text & small elements */
 
 .muted {
   color: var(--muted);
@@ -226,7 +224,7 @@ input[type="file"] {
   box-shadow: none;
 }
 
-/* tags */
+/* info chips */
 
 .info-row {
   display: flex;
@@ -313,6 +311,7 @@ input[type="file"] {
 
 .chart-wrapper {
   margin-top: 10px;
+  height: 220px;
 }
 
 /* ranking table */
