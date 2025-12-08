@@ -7,11 +7,9 @@
 
   <link rel="stylesheet" href="style.css" />
 
-  <!-- TensorFlow.js – version aligned with your converted model -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
-  <!-- PapaParse for CSV parsing -->
+  <!-- Client-side libraries (no backend required) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.5.3/papaparse.min.js"></script>
-  <!-- Chart.js for ROC curve -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -20,84 +18,88 @@
       <span class="logo-dot"></span>
       <div class="brand-text">
         <span class="brand-title">AI Retention Radar</span>
-        <span class="brand-subtitle">E-commerce churn &amp; revenue risk</span>
+        <span class="brand-subtitle">E‑commerce churn &amp; revenue risk</span>
       </div>
     </div>
     <div class="top-status">
-      <span id="model-status">Loading model…</span>
+      <span id="app-status">Initializing…</span>
     </div>
   </header>
 
   <main class="layout">
-    <!-- LEFT: DATA -->
+    <!-- DATA + CONTROLS -->
     <section class="panel">
-      <h2>1. Data</h2>
+      <h2>1. Data &amp; Controls</h2>
       <p class="muted">
-        Use your own CSVs, or quickly load the sample data included in this repo.
+        Load the sample churn dataset from the repo or upload your own CSVs. Then preprocess, train and evaluate – entirely in the browser.
       </p>
+
+      <div class="controls-grid">
+        <button id="btn-load-data" class="btn primary">
+          Load sample data
+        </button>
+        <button id="btn-preprocess" class="btn">
+          Preprocess
+        </button>
+        <button id="btn-reset" class="btn ghost">
+          Reset / Clear
+        </button>
+      </div>
 
       <div class="field-group">
         <div class="field">
-          <label>Train CSV (with churn label)</label>
-          <input type="file" id="train-upload" accept=".csv" />
-          <button id="load-sample-train" class="btn ghost small">
-            Use sample train_web.csv
-          </button>
-          <small id="train-summary" class="muted">No train file loaded.</small>
+          <label for="file-train">Train CSV (must contain label column)</label>
+          <input type="file" id="file-train" accept=".csv" />
+          <small id="train-summary" class="muted">No train file loaded (using sample is fine).</small>
         </div>
 
         <div class="field">
-          <label>Scoring CSV (customers to score)</label>
-          <input type="file" id="score-upload" accept=".csv" />
-          <button id="load-sample-score" class="btn ghost small">
-            Use sample scoring_web.csv
-          </button>
-          <small id="score-summary" class="muted">No scoring file loaded.</small>
+          <label for="file-score">Scoring CSV (customers to score)</label>
+          <input type="file" id="file-score" accept=".csv" />
+          <small id="score-summary" class="muted">No scoring file loaded (using sample is fine).</small>
         </div>
       </div>
 
-      <button id="preprocess-btn" class="btn primary wide">
-        2. Run preprocessing
-      </button>
-
-      <div class="info-row">
-        <span id="feature-info" class="tag">Features: –</span>
-        <span id="shape-info" class="tag">Train rows: –</span>
+      <h3>Dataset summary (train)</h3>
+      <div class="summary-grid">
+        <div class="summary-card">
+          <div class="summary-label">Rows</div>
+          <div class="summary-value" id="summary-rows">–</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Columns</div>
+          <div class="summary-value" id="summary-cols">–</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-label">Missing values</div>
+          <div class="summary-value" id="summary-missing">–</div>
+        </div>
       </div>
 
-      <div class="note">
-        Preprocessing applies the same scaling and feature selection you used in
-        Google Colab, based on <code>preprocessing_config.json</code>.
-      </div>
+      <h3>Log console</h3>
+      <div id="log-console" class="log-console"></div>
     </section>
 
-    <!-- MIDDLE: TRAIN + METRICS -->
+    <!-- TRAINING + METRICS -->
     <section class="panel">
-      <h2>3. Train</h2>
+      <h2>2. Train &amp; Evaluate</h2>
       <p class="muted">
-        Optionally fine-tune the loaded TensorFlow.js model in the browser.
+        Train the TensorFlow.js model in the browser and inspect performance on the labeled training data.
       </p>
 
-      <button id="train-btn" class="btn">
-        Start in-browser training
-      </button>
+      <div class="controls-grid">
+        <button id="btn-train" class="btn">
+          Train in browser
+        </button>
+        <button id="btn-evaluate" class="btn">
+          Evaluate (metrics &amp; ROC)
+        </button>
+      </div>
 
-      <div id="training-log" class="training-log"></div>
-
-      <h2>4. Metrics</h2>
-      <p class="muted">
-        Evaluate on the labeled train data, adjust the decision threshold, and
-        inspect trade-offs.
-      </p>
-
-      <button id="metrics-btn" class="btn">
-        Compute metrics on train data
-      </button>
-
-      <div class="threshold-row">
-        <label>
+      <div class="threshold-container">
+        <label for="threshold-slider">
           Decision threshold:
-          <span id="threshold-value">0.50</span>
+          <span id="threshold-display">0.50</span>
         </label>
         <input
           type="range"
@@ -109,84 +111,95 @@
         />
       </div>
 
+      <h3>Metrics</h3>
       <div class="metrics-grid">
         <div class="metric-card">
           <span class="metric-label">AUC</span>
-          <span class="metric-value" id="auc-value">–</span>
+          <span class="metric-value" id="metric-auc">–</span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Accuracy</span>
+          <span class="metric-value" id="metric-accuracy">–</span>
         </div>
         <div class="metric-card">
           <span class="metric-label">Precision</span>
-          <span class="metric-value" id="precision-value">–</span>
+          <span class="metric-value" id="metric-precision">–</span>
         </div>
         <div class="metric-card">
           <span class="metric-label">Recall</span>
-          <span class="metric-value" id="recall-value">–</span>
+          <span class="metric-value" id="metric-recall">–</span>
         </div>
         <div class="metric-card">
-          <span class="metric-label">F1 Score</span>
-          <span class="metric-value" id="f1-value">–</span>
+          <span class="metric-label">F1</span>
+          <span class="metric-value" id="metric-f1">–</span>
         </div>
       </div>
 
-      <div class="conf-matrix">
-        <h3>Confusion Matrix</h3>
-        <table>
-          <thead>
-            <tr>
-              <th></th>
-              <th>Pred 0</th>
-              <th>Pred 1</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th>True 0</th>
-              <td id="cm-tn">–</td>
-              <td id="cm-fp">–</td>
-            </tr>
-            <tr>
-              <th>True 1</th>
-              <td id="cm-fn">–</td>
-              <td id="cm-tp">–</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+      <h3>Confusion matrix</h3>
+      <table class="confusion-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Pred 0</th>
+            <th>Pred 1</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>True 0</th>
+            <td id="cm-tn">–</td>
+            <td id="cm-fp">–</td>
+          </tr>
+          <tr>
+            <th>True 1</th>
+            <td id="cm-fn">–</td>
+            <td id="cm-tp">–</td>
+          </tr>
+        </tbody>
+      </table>
 
+      <h3>ROC curve</h3>
       <div class="chart-wrapper">
-        <h3>ROC Curve</h3>
         <canvas id="rocChart"></canvas>
       </div>
     </section>
 
-    <!-- RIGHT: PREDICT + EXPORT -->
+    <!-- SCORING + EXPORTS -->
     <section class="panel">
-      <h2>5. Predict &amp; Export</h2>
+      <h2>3. Score &amp; Export</h2>
       <p class="muted">
-        Score your customers, rank them by churn risk, and export CSVs for the
-        Marketing / CRM team.
+        Predict churn risk for new customers, inspect top‑risk cases, and export the model and metrics.
       </p>
 
-      <button id="predict-btn" class="btn primary wide">
-        Run prediction on scoring data
-      </button>
-
-      <div class="export-row">
-        <button id="export-proba-btn" class="btn ghost small">
-          Export probabilities.csv
-        </button>
-        <button id="export-submission-btn" class="btn ghost small">
-          Export submission.csv
+      <div class="controls-grid">
+        <button id="btn-score" class="btn primary">
+          Score / Predict
         </button>
       </div>
 
-      <h3>Top at-risk customers</h3>
+      <div class="controls-grid exports">
+        <button id="btn-export-model" class="btn ghost small">
+          Export model (TF.js)
+        </button>
+        <button id="btn-export-metrics-json" class="btn ghost small">
+          Export metrics (JSON)
+        </button>
+        <button id="btn-export-metrics-csv" class="btn ghost small">
+          Export metrics (CSV)
+        </button>
+        <button id="btn-export-scores" class="btn ghost small">
+          Export scores (CSV)
+        </button>
+      </div>
+
+      <h3>Scored customers</h3>
       <div class="table-wrapper">
-        <table id="ranking-table">
+        <table id="score-table">
           <thead>
             <tr>
               <th>Customer ID</th>
               <th>Churn probability</th>
+              <th>Prediction</th>
               <th>Recency</th>
               <th>Frequency</th>
               <th>Monetary</th>
@@ -202,8 +215,7 @@
 
   <footer class="footer">
     <span>
-      Deployed on GitHub Pages · In-browser inference with TensorFlow.js ·
-      Data stays in your browser
+      Deployed on GitHub Pages · All data &amp; inference run client‑side in your browser.
     </span>
   </footer>
 
