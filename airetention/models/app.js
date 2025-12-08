@@ -11,6 +11,10 @@ const thrValue = document.getElementById("threshold-value");
 const metricsDiv = document.getElementById("metrics");
 const tableEl = document.getElementById("ranking-table");
 
+// IMPORTANT: load directly from raw GitHub URL
+const MODEL_URL =
+  "https://raw.githubusercontent.com/ZeeshanKazim/NeuralNetwork/main/airetention/models/tfjs_main_model/model.json";
+
 fileInput.addEventListener("change", handleFile);
 document.getElementById("btn-load-model").addEventListener("click", loadModel);
 document.getElementById("btn-predict").addEventListener("click", predict);
@@ -68,15 +72,16 @@ async function handleFile(evt) {
     `Loaded ${rawData.length} rows, using ${numericCols.length} numeric features.`;
 }
 
-// Load TF.js model (path adjusted for your repo)
+// Load TF.js model from GitHub (raw content)
 async function loadModel() {
   try {
     modelStatus.textContent = "Loading model…";
-    model = await tf.loadLayersModel("tfjs_main_model/model.json");
-    modelStatus.textContent = "Model loaded and ready.";
+    model = await tf.loadLayersModel(MODEL_URL);
+    modelStatus.textContent = "Model loaded from GitHub.";
   } catch (err) {
     console.error(err);
-    modelStatus.textContent = "Error loading model. Check console.";
+    const msg = err && err.message ? err.message : String(err);
+    modelStatus.textContent = "Error loading model: " + msg;
   }
 }
 
