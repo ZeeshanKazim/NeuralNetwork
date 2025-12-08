@@ -1,4 +1,4 @@
-// paths based on your current repo layout (inside ai-retention-radar/model/)
+// Paths relative to ai-retention-radar/model/
 const CONFIG_URL = "config/preprocessing_config.json";
 const MODEL_URL = "model.json";
 const SAMPLE_TRAIN_URL = "sample_data/train_web.csv";
@@ -13,12 +13,11 @@ let rawScoreRows = [];
 let trainSet = null;
 let scoreSet = null;
 
-let lastEval = null; // { yTrue, yScore }
-let lastScorePreds = null;
-
+let lastEval = null;        // { yTrue, yScore }
+let lastScorePreds = null;  // [{ id, prob, label, row }, ...]
 let rocChart = null;
 
-/* basic helpers */
+/* ------------ helpers: fetch & CSV ------------ */
 
 async function fetchJSON(path) {
   const res = await fetch(path);
@@ -61,7 +60,7 @@ function logTrain(msg) {
   el.scrollTop = el.scrollHeight;
 }
 
-/* preprocessing */
+/* ------------ preprocessing ------------ */
 
 function transformRow(row) {
   const cfg = preprocessingConfig;
@@ -92,6 +91,7 @@ function buildDataset(rows, isTrain) {
   const ids = [];
   const X = [];
   const y = [];
+  const keptRows = [];
 
   for (const row of rows) {
     if (!row) continue;
@@ -106,6 +106,7 @@ function buildDataset(rows, isTrain) {
 
     ids.push(cfg.id_col ? row[cfg.id_col] : null);
     X.push(feats);
+    keptRows.push(row);
     if (isTrain) y.push(Number(row[cfg.target]));
   }
 
@@ -114,10 +115,10 @@ function buildDataset(rows, isTrain) {
   const X_tensor = tf.tensor2d(X);
   const y_tensor = isTrain ? tf.tensor2d(y, [y.length, 1]) : null;
 
-  return { ids, X, y, X_tensor, y_tensor };
+  return { ids, X, y, rows: keptRows, X_tensor, y_tensor };
 }
 
-/* metrics */
+/* ------------ metrics & ROC ------------ */
 
 function computeConfusion(yTrue, yScore, threshold) {
   let tp = 0,
@@ -225,7 +226,7 @@ function renderRocCurve(fprs, tprs) {
   }
 }
 
-/* UI helpers */
+/* ------------ UI helpers ------------ */
 
 function updateMetricsDisplay(auc, metrics, cm) {
   document.getElementById("auc-value").textContent = auc.toFixed(3);
@@ -273,7 +274,7 @@ function renderRankingTable(items) {
   }
 }
 
-/* CSV export */
+/* ------------ CSV export ------------ */
 
 function downloadCsv(filename, rows, header) {
   const lines = [];
@@ -302,7 +303,7 @@ function downloadCsv(filename, rows, header) {
   URL.revokeObjectURL(url);
 }
 
-/* actions */
+/* ------------ actions ------------ */
 
 async function init() {
   const statusEl = document.getElementById("model-status");
@@ -513,7 +514,7 @@ async function handlePredict() {
     id,
     prob: predsArr[idx],
     label: predsArr[idx] >= threshold ? 1 : 0,
-    row: rawScoreRows[idx],
+    row: scoreSet.rows[idx],
   }));
 
   items.sort((a, b) => b.prob - a.prob);
@@ -560,7 +561,7 @@ function handleExportSubmission() {
   ]);
 }
 
-/* wiring */
+/* ------------ wiring ------------ */
 
 document.addEventListener("DOMContentLoaded", () => {
   init();
