@@ -124,20 +124,19 @@ async function trainAndPredict() {
     trainingStartTime = performance.now();  // start timer
     modelStatus.textContent = "Preparing training data…";
 
-    // Select a random subset for training
-    const indices = tf.util
-      .createShuffledIndices(nSamples)
-      .slice(0, Math.min(MAX_TRAIN_ROWS, nSamples));
+    // --- FIX HERE: convert indices to a normal array ---
+    const shuffled = Array.from(tf.util.createShuffledIndices(nSamples));
+    const indices = shuffled.slice(0, Math.min(MAX_TRAIN_ROWS, nSamples));
 
-    const featSubset = indices.map(i => featureMatrix[i]);
-    const labelSubset = indices.map(i => labels[i]);
+    const featSubset = indices.map(i => featureMatrix[i]);     // number[][]
+    const labelSubset = indices.map(i => labels[i]);           // number[]
 
     // Allow UI to update before heavy work
     await tf.nextFrame();
 
     // Convert subset to tensors
-    const Xtrain = tf.tensor2d(featSubset);               // [N_sub, D]
-    const ytrain = tf.tensor2d(labelSubset.map(v => [v])); // [N_sub, 1]
+    const Xtrain = tf.tensor2d(featSubset);                    // [N_sub, D]
+    const ytrain = tf.tensor2d(labelSubset.map(v => [v]));     // [N_sub, 1]
 
     // Normalize features: (x - mean) / std  (computed on subset)
     const moments = tf.moments(Xtrain, 0);
@@ -198,8 +197,7 @@ async function trainAndPredict() {
 
     const totalElapsed = ((performance.now() - trainingStartTime) / 1000).toFixed(1);
     modelStatus.textContent =
-      `Model trained on ${indices.length} rows; scored all ${nSamples} customers ` +
-      `in ${totalElapsed}s.`;
+      `Model trained on ${indices.length} rows; scored all ${nSamples} customers in ${totalElapsed}s.`;
 
     computeMetrics();
     renderRankingTable();
