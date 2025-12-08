@@ -4,6 +4,9 @@ let labels = [];
 let predictions = [];
 let model = null;
 
+const MAX_TRAIN_ROWS = 8000;   // cap training size for speed
+const EPOCHS = 5;
+
 const fileInput = document.getElementById("file-input");
 const dataStatus = document.getElementById("data-status");
 const modelStatus = document.getElementById("model-status");
@@ -14,19 +17,16 @@ const tableEl = document.getElementById("ranking-table");
 
 console.log("app.js loaded");
 
-// Attach listeners safely
 if (fileInput) {
   fileInput.addEventListener("change", handleFile);
 }
 const trainBtn = document.getElementById("btn-train");
 if (trainBtn) {
   trainBtn.addEventListener("click", () => {
-    // immediate feedback
     modelStatus.textContent = "Train button clicked…";
     trainAndPredict();
   });
 }
-
 if (thrSlider) {
   thrSlider.addEventListener("input", () => {
     thrValue.textContent = parseFloat(thrSlider.value).toFixed(2);
@@ -71,7 +71,7 @@ async function handleFile(evt) {
       return;
     }
 
-    // Detect numeric feature columns (exclude IDs + target)
+    // Numeric feature columns (exclude IDs + target)
     const sample = rawData[0];
     const numericCols = Object.keys(sample).filter(k => {
       if (k === "target_class" || k === "visitorid") return false;
@@ -106,7 +106,7 @@ async function handleFile(evt) {
 }
 
 /**
- * Train shallow NN in browser and run predictions
+ * Train shallow NN in browser on a subset for speed, then predict on all rows
  */
 async function trainAndPredict() {
   try {
@@ -119,18 +119,32 @@ async function trainAndPredict() {
     const nSamples = featureMatrix.length;
     const nFeatures = featureMatrix[0].length;
 
-    modelStatus.textContent = "Training model in browser…";
+    modelStatus.textContent = "Preparing training data…";
 
-    // Convert to tensors
-    const X = tf.tensor2d(featureMatrix);          // [N, D]
-    const y = tf.tensor2d(labels.map(v => [v]));   // [N, 1]
+    // Select a random subset for training
+    const indices = tf.util
+      .createShuffledIndices(nSamples)
+      .slice(0, Math.min(MAX_TRAIN_ROWS, nSamples));
 
-    // Normalize features: (x - mean) / std
-    const moments = tf.moments(X, 0);
+    const featSubset = indices.map(i => featureMatrix[i]);
+    const labelSubset = indices.map(i => labels[i]);
+
+    // Allow UI to update before heavy work
+    await tf.nextFrame();
+
+    // Convert subset to tensors
+    const Xtrain = tf.tensor2d(featSubset);               // [N_sub, D]
+    const ytrain = tf.tensor2d(labelSubset.map(v => [v])); // [N_sub, 1]
+
+    // Normalize features: (x - mean) / std  (computed on subset)
+    const moments = tf.moments(Xtrain, 0);
     const mean = moments.mean;
     const variance = moments.variance;
     const std = tf.sqrt(variance).add(1e-6);
-    const Xnorm = X.sub(mean).div(std);
+    const XtrainNorm = Xtrain.sub(mean).div(std);
+
+    modelStatus.textContent =
+      `Training on ${indices.length} rows × ${nFeatures} features…`;
 
     // Build model: Dense(16, relu) -> Dense(1, sigmoid)
     model = tf.sequential();
@@ -143,8 +157,9 @@ async function trainAndPredict() {
       metrics: ["accuracy"],
     });
 
-    await model.fit(Xnorm, y, {
-      epochs: 10,
+    // Train (few epochs)
+    await model.fit(XtrainNorm, ytrain, {
+      epochs: EPOCHS,
       batchSize: 256,
       validationSplit: 0.2,
       shuffle: true,
@@ -152,29 +167,33 @@ async function trainAndPredict() {
       callbacks: {
         onEpochEnd: (epoch, logs) => {
           modelStatus.textContent =
-            `Training… epoch ${epoch + 1}/10 – loss: ${logs.loss.toFixed(4)}, val_acc: ${logs.val_accuracy.toFixed(4)}`;
+            `Epoch ${epoch + 1}/${EPOCHS} – loss: ${logs.loss.toFixed(4)}, val_acc: ${logs.val_accuracy.toFixed(4)}`;
         },
       },
     });
 
-    modelStatus.textContent = "Training finished. Running predictions…";
+    modelStatus.textContent = "Training finished. Scoring all customers…";
 
-    // Predict on all rows
-    const preds = model.predict(Xnorm);
+    // Predict on ALL rows (normalize with same mean/std from subset)
+    const Xall = tf.tensor2d(featureMatrix);     // [N_all, D]
+    const XallNorm = Xall.sub(mean).div(std);
+    const preds = model.predict(XallNorm);
     const probs = await preds.data();
     predictions = Array.from(probs);
 
     // Clean up tensors
-    X.dispose();
-    y.dispose();
-    Xnorm.dispose();
+    Xtrain.dispose();
+    ytrain.dispose();
+    XtrainNorm.dispose();
+    Xall.dispose();
+    XallNorm.dispose();
     preds.dispose();
     mean.dispose();
     variance.dispose();
     std.dispose();
 
     modelStatus.textContent =
-      `Model trained on ${nSamples} rows with ${nFeatures} features. Predictions ready.`;
+      `Model trained on ${indices.length} rows; scored all ${nSamples} customers.`;
 
     computeMetrics();
     renderRankingTable();
