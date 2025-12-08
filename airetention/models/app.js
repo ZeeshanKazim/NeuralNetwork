@@ -12,153 +12,180 @@ const thrValue = document.getElementById("threshold-value");
 const metricsDiv = document.getElementById("metrics");
 const tableEl = document.getElementById("ranking-table");
 
-fileInput.addEventListener("change", handleFile);
-document.getElementById("btn-train").addEventListener("click", trainAndPredict);
-thrSlider.addEventListener("input", () => {
-  thrValue.textContent = parseFloat(thrSlider.value).toFixed(2);
-  if (predictions.length) computeMetrics();
-});
+console.log("app.js loaded");
+
+// Attach listeners safely
+if (fileInput) {
+  fileInput.addEventListener("change", handleFile);
+}
+const trainBtn = document.getElementById("btn-train");
+if (trainBtn) {
+  trainBtn.addEventListener("click", () => {
+    // immediate feedback
+    modelStatus.textContent = "Train button clicked…";
+    trainAndPredict();
+  });
+}
+
+if (thrSlider) {
+  thrSlider.addEventListener("input", () => {
+    thrValue.textContent = parseFloat(thrSlider.value).toFixed(2);
+    if (predictions.length) computeMetrics();
+  });
+}
 
 /**
  * Handle CSV upload: parse, grab numeric features, and target_class
  */
 async function handleFile(evt) {
-  const file = evt.target.files[0];
-  if (!file) return;
+  try {
+    const file = evt.target.files[0];
+    if (!file) return;
 
-  const text = await file.text();
-  const rows = text.trim().split("\n").map(r => r.split(","));
+    const text = await file.text();
+    const rows = text.trim().split("\n").map(r => r.split(","));
 
-  if (rows.length < 2) {
-    dataStatus.textContent = "File is empty.";
-    return;
-  }
+    if (rows.length < 2) {
+      dataStatus.textContent = "File is empty.";
+      return;
+    }
 
-  const header = rows[0].map(h => h.trim());
-  const dataRows = rows.slice(1);
+    const header = rows[0].map(h => h.trim());
+    const dataRows = rows.slice(1);
 
-  rawData = dataRows.map(cols => {
-    const obj = {};
-    header.forEach((h, i) => {
-      obj[h] = cols[i] !== undefined ? cols[i].trim() : "";
+    rawData = dataRows.map(cols => {
+      const obj = {};
+      header.forEach((h, i) => {
+        obj[h] = cols[i] !== undefined ? cols[i].trim() : "";
+      });
+      return obj;
     });
-    return obj;
-  });
 
-  if (!rawData.length) {
-    dataStatus.textContent = "No rows found in CSV.";
-    return;
+    if (!rawData.length) {
+      dataStatus.textContent = "No rows found in CSV.";
+      return;
+    }
+
+    if (!header.includes("target_class")) {
+      dataStatus.textContent = "CSV must contain a 'target_class' column.";
+      return;
+    }
+
+    // Detect numeric feature columns (exclude IDs + target)
+    const sample = rawData[0];
+    const numericCols = Object.keys(sample).filter(k => {
+      if (k === "target_class" || k === "visitorid") return false;
+      const v = sample[k];
+      return v !== "" && !isNaN(parseFloat(v));
+    });
+
+    featureMatrix = rawData.map(row =>
+      numericCols.map(c => {
+        const v = row[c];
+        const num = parseFloat(v);
+        return isNaN(num) ? 0 : num;
+      })
+    );
+
+    labels = rawData.map(row => {
+      const v = parseInt(row["target_class"]);
+      return isNaN(v) ? 0 : v;
+    });
+
+    dataStatus.textContent =
+      `Loaded ${rawData.length} rows, using ${numericCols.length} numeric features.`;
+    modelStatus.textContent = "Model not trained yet.";
+    predictions = [];
+    metricsDiv.innerHTML =
+      '<p class="muted">Upload data, train the model, and run predictions to see metrics.</p>';
+    tableEl.innerHTML = "";
+  } catch (err) {
+    console.error("Error in handleFile:", err);
+    dataStatus.textContent = "Error reading file: " + err;
   }
-
-  // Check that target_class exists
-  if (!header.includes("target_class")) {
-    dataStatus.textContent = "CSV must contain a 'target_class' column.";
-    return;
-  }
-
-  // Numeric feature columns (exclude IDs + target)
-  const sample = rawData[0];
-  const numericCols = Object.keys(sample).filter(k => {
-    if (k === "target_class" || k === "visitorid") return false;
-    const v = sample[k];
-    return v !== "" && !isNaN(parseFloat(v));
-  });
-
-  featureMatrix = rawData.map(row =>
-    numericCols.map(c => {
-      const v = row[c];
-      const num = parseFloat(v);
-      return isNaN(num) ? 0 : num;
-    })
-  );
-
-  labels = rawData.map(row => {
-    const v = parseInt(row["target_class"]);
-    return isNaN(v) ? 0 : v;
-  });
-
-  dataStatus.textContent =
-    `Loaded ${rawData.length} rows, using ${numericCols.length} numeric features.`;
-  modelStatus.textContent = "Model not trained yet.";
-  predictions = [];
-  metricsDiv.innerHTML =
-    '<p class="muted">Upload data, train the model, and run predictions to see metrics.</p>';
-  tableEl.innerHTML = "";
 }
 
 /**
  * Train shallow NN in browser and run predictions
  */
 async function trainAndPredict() {
-  if (!featureMatrix.length || !labels.length) {
-    alert("Upload a CSV with 'visitorid' and 'target_class' first.");
-    return;
-  }
+  try {
+    if (!featureMatrix.length || !labels.length) {
+      alert("Upload a CSV with 'visitorid' and 'target_class' first.");
+      modelStatus.textContent = "No data available to train.";
+      return;
+    }
 
-  const nSamples = featureMatrix.length;
-  const nFeatures = featureMatrix[0].length;
+    const nSamples = featureMatrix.length;
+    const nFeatures = featureMatrix[0].length;
 
-  modelStatus.textContent = "Training model in browser…";
+    modelStatus.textContent = "Training model in browser…";
 
-  // Convert to tensors
-  const X = tf.tensor2d(featureMatrix);          // [N, D]
-  const y = tf.tensor2d(labels.map(v => [v]));   // [N, 1]
+    // Convert to tensors
+    const X = tf.tensor2d(featureMatrix);          // [N, D]
+    const y = tf.tensor2d(labels.map(v => [v]));   // [N, 1]
 
-  // Standardize features: (x - mean) / std
-  const { mean, variance } = tf.moments(X, 0);
-  const std = tf.sqrt(variance).add(1e-6);
-  const Xnorm = X.sub(mean).div(std);
+    // Normalize features: (x - mean) / std
+    const moments = tf.moments(X, 0);
+    const mean = moments.mean;
+    const variance = moments.variance;
+    const std = tf.sqrt(variance).add(1e-6);
+    const Xnorm = X.sub(mean).div(std);
 
-  // Build model: Dense(16, relu) -> Dense(1, sigmoid)
-  model = tf.sequential();
-  model.add(tf.layers.dense({ units: 16, activation: "relu", inputShape: [nFeatures] }));
-  model.add(tf.layers.dense({ units: 1, activation: "sigmoid" }));
+    // Build model: Dense(16, relu) -> Dense(1, sigmoid)
+    model = tf.sequential();
+    model.add(tf.layers.dense({ units: 16, activation: "relu", inputShape: [nFeatures] }));
+    model.add(tf.layers.dense({ units: 1, activation: "sigmoid" }));
 
-  model.compile({
-    optimizer: tf.train.adam(0.001),
-    loss: "binaryCrossentropy",
-    metrics: ["accuracy"],
-  });
+    model.compile({
+      optimizer: tf.train.adam(0.001),
+      loss: "binaryCrossentropy",
+      metrics: ["accuracy"],
+    });
 
-  // Train
-  await model.fit(Xnorm, y, {
-    epochs: 10,
-    batchSize: 256,
-    validationSplit: 0.2,
-    shuffle: true,
-    verbose: 0,
-    callbacks: {
-      onEpochEnd: (epoch, logs) => {
-        modelStatus.textContent =
-          `Training… epoch ${epoch + 1}/10 – loss: ${logs.loss.toFixed(4)}, val_acc: ${logs.val_accuracy.toFixed(4)}`;
+    await model.fit(Xnorm, y, {
+      epochs: 10,
+      batchSize: 256,
+      validationSplit: 0.2,
+      shuffle: true,
+      verbose: 0,
+      callbacks: {
+        onEpochEnd: (epoch, logs) => {
+          modelStatus.textContent =
+            `Training… epoch ${epoch + 1}/10 – loss: ${logs.loss.toFixed(4)}, val_acc: ${logs.val_accuracy.toFixed(4)}`;
+        },
       },
-    },
-  });
+    });
 
-  modelStatus.textContent = "Training finished. Running predictions…";
+    modelStatus.textContent = "Training finished. Running predictions…";
 
-  // Predict on all rows
-  const preds = model.predict(Xnorm);
-  const probs = await preds.data();
-  predictions = Array.from(probs);
+    // Predict on all rows
+    const preds = model.predict(Xnorm);
+    const probs = await preds.data();
+    predictions = Array.from(probs);
 
-  // Clean up big tensors
-  X.dispose();
-  y.dispose();
-  Xnorm.dispose();
-  preds.dispose();
-  mean.dispose();
-  std.dispose();
+    // Clean up tensors
+    X.dispose();
+    y.dispose();
+    Xnorm.dispose();
+    preds.dispose();
+    mean.dispose();
+    variance.dispose();
+    std.dispose();
 
-  modelStatus.textContent =
-    `Model trained on ${nSamples} rows with ${nFeatures} features. Predictions ready.`;
+    modelStatus.textContent =
+      `Model trained on ${nSamples} rows with ${nFeatures} features. Predictions ready.`;
 
-  computeMetrics();
-  renderRankingTable();
+    computeMetrics();
+    renderRankingTable();
+  } catch (err) {
+    console.error("Error in trainAndPredict:", err);
+    modelStatus.textContent = "Error during training: " + err;
+  }
 }
 
 /**
- * Compute confusion matrix + precision/recall/F1 vs. ground truth
+ * Compute confusion matrix + precision/recall/F1
  */
 function computeMetrics() {
   const thr = parseFloat(thrSlider.value);
