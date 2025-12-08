@@ -1,8 +1,8 @@
-// paths based on your current repo layout
-const CONFIG_URL = "model/config/preprocessing_config.json";
-const MODEL_URL = "model/model.json";
-const SAMPLE_TRAIN_URL = "model/sample_data/train_web.csv";
-const SAMPLE_SCORE_URL = "model/sample_data/scoring_web.csv";
+// paths based on your current repo layout (inside ai-retention-radar/model/)
+const CONFIG_URL = "config/preprocessing_config.json";
+const MODEL_URL = "model.json";
+const SAMPLE_TRAIN_URL = "sample_data/train_web.csv";
+const SAMPLE_SCORE_URL = "sample_data/scoring_web.csv";
 
 let preprocessingConfig = null;
 let model = null;
@@ -250,8 +250,6 @@ function renderRankingTable(items) {
   const tbody = document.querySelector("#ranking-table tbody");
   tbody.innerHTML = "";
 
-  const cfg = preprocessingConfig;
-
   for (const item of items) {
     const tr = document.createElement("tr");
 
@@ -314,7 +312,7 @@ async function init() {
     statusEl.textContent = "Preprocessing config loaded ✓";
   } catch (err) {
     console.error(err);
-    statusEl.textContent = "Config missing – check model/config/";
+    statusEl.textContent = "Config missing – check config/";
   }
 
   try {
@@ -327,7 +325,7 @@ async function init() {
     statusEl.textContent = "Model loaded ✓";
   } catch (err) {
     console.error(err);
-    statusEl.textContent = "Model missing – check model/model.json";
+    statusEl.textContent = "Model missing – check model.json";
   }
 
   const thresholdSlider = document.getElementById("threshold-slider");
