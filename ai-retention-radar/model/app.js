@@ -2,13 +2,18 @@
 ASSUMPTIONS:
 1) train_web.csv contains 'CustomerID', 'Churn' and all numeric_cols from config/preprocessing_config.json.
 2) scoring_web.csv contains 'CustomerID' and the same numeric_cols (label column optional).
-3) All preprocessing uses the numeric means/stds from preprocessing_config.json for standardization.
+3) We start from the built-in CSVs; uploads are optional for the data team, not required for end users.
 */
 
 const CONFIG_URL = "config/preprocessing_config.json";
 const MODEL_URL = "model.json";
 const SAMPLE_TRAIN_URL = "sample_data/train_web.csv";
 const SAMPLE_SCORE_URL = "sample_data/scoring_web.csv";
+
+const RISK_THRESHOLDS = {
+  high: 0.7,
+  medium: 0.4, // [medium, high) = medium, < medium = low
+};
 
 let preprocessingConfig = null;
 let model = null;
@@ -18,11 +23,12 @@ let rawScoreRows = [];
 let trainSet = null;
 let scoreSet = null;
 
-let lastEval = null;        // { yTrue, yScore }
-let lastMetrics = null;     // { threshold, auc, accuracy, precision, recall, f1, cm, ... }
-let lastScorePreds = null;  // [{ id, prob, pred, row }]
+let lastEval = null; // { yTrue, yScore }
+let lastMetrics = null; // { threshold, auc, accuracy, precision, recall, f1, cm, ... }
+let lastScorePreds = null; // [{ id, prob, pred, row }]
 let datasetSummary = null;
 let rocChart = null;
+let lastSegments = null; // { high, medium, low, highRevenue }
 
 let baseStatusText = "Initializing…";
 
@@ -39,7 +45,7 @@ const BUTTON_IDS = [
   "btn-export-scores",
 ];
 
-/* ---------- DOM + status helpers ---------- */
+/* ---------- DOM & status ---------- */
 
 function $(id) {
   return document.getElementById(id);
@@ -310,7 +316,7 @@ async function loadConfigAndModel() {
     return;
   }
 
-  // try to load pretrained model.json first
+  // Try to load the pre-trained model.json first.
   try {
     model = await tf.loadLayersModel(MODEL_URL);
     model.compile({
@@ -474,7 +480,84 @@ function updateMetricsUI(auc, metrics, cm) {
   $("cm-tp").textContent = cm ? cm.tp : "–";
 }
 
-/* ---------- Scored table ---------- */
+/* ---------- Overview & segments ---------- */
+
+function computeSegmentsFromScores(items) {
+  if (!items || !items.length) return null;
+
+  let high = 0;
+  let medium = 0;
+  let low = 0;
+  let highRevenue = 0;
+
+  items.forEach((item) => {
+    const p = item.prob;
+    const row = item.row || {};
+    if (p >= RISK_THRESHOLDS.high) {
+      high++;
+      const revenue = Number(row["CashbackAmount"]);
+      if (!Number.isNaN(revenue)) {
+        highRevenue += revenue;
+      }
+    } else if (p >= RISK_THRESHOLDS.medium) {
+      medium++;
+    } else {
+      low++;
+    }
+  });
+
+  return { high, medium, low, highRevenue };
+}
+
+function updateOverviewUI() {
+  const totalCustomers =
+    (rawScoreRows && rawScoreRows.length) ||
+    (rawTrainRows && rawTrainRows.length) ||
+    0;
+
+  const churnLabel = (() => {
+    if (!rawTrainRows || !rawTrainRows.length) return "–";
+    let count = 0;
+    let valid = 0;
+    rawTrainRows.forEach((r) => {
+      if ("Churn" in r) {
+        const v = Number(r.Churn);
+        if (!Number.isNaN(v)) {
+          valid++;
+          count += v;
+        }
+      }
+    });
+    if (!valid) return "–";
+    const rate = (count / valid) * 100;
+    return `${rate.toFixed(1)}%`;
+  })();
+
+  const seg = lastSegments;
+  let highText = "–";
+  let revenueText = "–";
+
+  if (seg && totalCustomers > 0) {
+    const pct = (seg.high / totalCustomers) * 100;
+    highText = `${seg.high} (${pct.toFixed(1)}%)`;
+    if (seg.highRevenue > 0) {
+      const approx = Math.round(seg.highRevenue);
+      revenueText = approx.toLocaleString();
+    }
+  }
+
+  const totalEl = $("overview-total");
+  const churnEl = $("overview-churn");
+  const highEl = $("overview-high");
+  const revEl = $("overview-revenue");
+
+  if (totalEl) totalEl.textContent = totalCustomers ? totalCustomers.toString() : "–";
+  if (churnEl) churnEl.textContent = churnLabel;
+  if (highEl) highEl.textContent = highText;
+  if (revEl) revEl.textContent = revenueText;
+}
+
+/* ---------- Scored table & filters ---------- */
 
 function renderScoreTable(items) {
   const tbody = $("score-table").querySelector("tbody");
@@ -521,10 +604,45 @@ function renderScoreTable(items) {
   });
 }
 
+function filterAndRenderTable() {
+  if (!lastScorePreds) {
+    renderScoreTable([]);
+    return;
+  }
+
+  const riskFilter = ($("filter-risk") || {}).value || "all";
+  const search = ($("search-id") || {}).value || "";
+  const trimmedSearch = search.trim();
+
+  const filtered = lastScorePreds.filter((item) => {
+    const p = item.prob;
+    let keep = true;
+
+    if (riskFilter === "high") {
+      keep = p >= RISK_THRESHOLDS.high;
+    } else if (riskFilter === "medium") {
+      keep = p >= RISK_THRESHOLDS.medium && p < RISK_THRESHOLDS.high;
+    } else if (riskFilter === "low") {
+      keep = p < RISK_THRESHOLDS.medium;
+    }
+
+    if (!keep) return false;
+
+    if (trimmedSearch) {
+      const idStr = item.id != null ? String(item.id) : "";
+      if (!idStr.includes(trimmedSearch)) return false;
+    }
+
+    return true;
+  });
+
+  renderScoreTable(filtered);
+}
+
 /* ---------- Action handlers ---------- */
 
-async function handleLoadSampleData() {
-  setBusy(true, "Loading sample data…");
+async function handleLoadSampleData(auto = false) {
+  if (!auto) setBusy(true, "Loading sample data…");
   try {
     const [trainText, scoreText] = await Promise.all([
       fetchText(SAMPLE_TRAIN_URL),
@@ -534,15 +652,21 @@ async function handleLoadSampleData() {
     rawTrainRows = parseCsvText(trainText);
     rawScoreRows = parseCsvText(scoreText);
 
-    $("train-summary").textContent = `Loaded sample train_web.csv · ${rawTrainRows.length} rows`;
-    $("score-summary").textContent = `Loaded sample scoring_web.csv · ${rawScoreRows.length} rows`;
+    const trainSummary = $("train-summary");
+    const scoreSummary = $("score-summary");
+    if (trainSummary) {
+      trainSummary.textContent = `Using sample train_web.csv · ${rawTrainRows.length} rows`;
+    }
+    if (scoreSummary) {
+      scoreSummary.textContent = `Using sample scoring_web.csv · ${rawScoreRows.length} rows`;
+    }
 
     updateDatasetSummary();
     log("Sample train & scoring data loaded.", "success");
   } catch (err) {
     log(`Failed to load sample data: ${err.message}`, "error");
   } finally {
-    setBusy(false);
+    if (!auto) setBusy(false);
   }
 }
 
@@ -553,7 +677,10 @@ async function handleTrainFileChange(e) {
   setBusy(true, "Parsing train CSV…");
   try {
     rawTrainRows = await parseCsvFile(file);
-    $("train-summary").textContent = `${file.name} · ${rawTrainRows.length} rows`;
+    const trainSummary = $("train-summary");
+    if (trainSummary) {
+      trainSummary.textContent = `${file.name} · ${rawTrainRows.length} rows`;
+    }
     updateDatasetSummary();
     log(`Train file "${file.name}" loaded.`, "success");
   } catch (err) {
@@ -570,7 +697,10 @@ async function handleScoreFileChange(e) {
   setBusy(true, "Parsing scoring CSV…");
   try {
     rawScoreRows = await parseCsvFile(file);
-    $("score-summary").textContent = `${file.name} · ${rawScoreRows.length} rows`;
+    const scoreSummary = $("score-summary");
+    if (scoreSummary) {
+      scoreSummary.textContent = `${file.name} · ${rawScoreRows.length} rows`;
+    }
     log(`Scoring file "${file.name}" loaded.`, "success");
   } catch (err) {
     log(`Failed to parse scoring CSV: ${err.message}`, "error");
@@ -579,17 +709,17 @@ async function handleScoreFileChange(e) {
   }
 }
 
-function handlePreprocess() {
+function handlePreprocess(auto = false) {
   if (!preprocessingConfig) {
     log("Preprocessing config not loaded yet.", "error");
     return;
   }
   if (!rawTrainRows || rawTrainRows.length === 0) {
-    log("No train data loaded. Load sample data or upload a train CSV first.", "error");
+    log("No train data loaded. Using sample data or upload a train CSV first.", "error");
     return;
   }
 
-  setBusy(true, "Building datasets…");
+  if (!auto) setBusy(true, "Building datasets…");
   try {
     const cols = preprocessingConfig.numeric_cols;
     const firstTrainRow = rawTrainRows[0];
@@ -638,11 +768,11 @@ function handlePreprocess() {
       "success"
     );
   } finally {
-    setBusy(false);
+    if (!auto) setBusy(false);
   }
 }
 
-async function handleTrain() {
+async function handleTrain(auto = false) {
   if (!model) {
     log("Model is not loaded; training is unavailable.", "error");
     return;
@@ -652,8 +782,11 @@ async function handleTrain() {
     return;
   }
 
-  setBusy(true, "Training model in browser…");
-  log("Starting training (15 epochs, validation split 0.2)…", "info");
+  if (!auto) {
+    setBusy(true, "Training model in browser…");
+    log("Starting training (15 epochs, validation split 0.2)…", "info");
+  }
+
   try {
     await model.fit(trainSet.X_tensor, trainSet.y_tensor, {
       epochs: 15,
@@ -677,11 +810,11 @@ async function handleTrain() {
   } catch (err) {
     log(`Training failed: ${err.message}`, "error");
   } finally {
-    setBusy(false);
+    if (!auto) setBusy(false);
   }
 }
 
-async function handleEvaluate() {
+async function handleEvaluate(auto = false) {
   if (!model) {
     log("Model is not loaded.", "error");
     return;
@@ -691,7 +824,7 @@ async function handleEvaluate() {
     return;
   }
 
-  setBusy(true, "Running evaluation…");
+  if (!auto) setBusy(true, "Running evaluation…");
   try {
     const predsTensor = model.predict(trainSet.X_tensor);
     const predsArr = Array.from(await predsTensor.data());
@@ -725,7 +858,7 @@ async function handleEvaluate() {
   } catch (err) {
     log(`Evaluation failed: ${err.message}`, "error");
   } finally {
-    setBusy(false);
+    if (!auto) setBusy(false);
   }
 }
 
@@ -751,7 +884,7 @@ function handleThresholdChange(e) {
   updateMetricsUI(auc, metrics, cm);
 }
 
-async function handleScore() {
+async function handleScore(auto = false) {
   if (!model) {
     log("Model is not loaded.", "error");
     return;
@@ -761,7 +894,7 @@ async function handleScore() {
     return;
   }
 
-  setBusy(true, "Scoring customers…");
+  if (!auto) setBusy(true, "Scoring customers…");
   try {
     const predsTensor = model.predict(scoreSet.X_tensor);
     const predsArr = Array.from(await predsTensor.data());
@@ -781,7 +914,10 @@ async function handleScore() {
 
     items.sort((a, b) => b.prob - a.prob);
     lastScorePreds = items;
-    renderScoreTable(items);
+
+    lastSegments = computeSegmentsFromScores(items);
+    updateOverviewUI();
+    filterAndRenderTable();
 
     log(
       `Scoring complete. ${items.length} customers scored (threshold=${threshold.toFixed(
@@ -792,7 +928,7 @@ async function handleScore() {
   } catch (err) {
     log(`Scoring failed: ${err.message}`, "error");
   } finally {
-    setBusy(false);
+    if (!auto) setBusy(false);
   }
 }
 
@@ -897,56 +1033,128 @@ function handleReset() {
   lastMetrics = null;
   lastScorePreds = null;
   datasetSummary = null;
+  lastSegments = null;
 
-  $("file-train").value = "";
-  $("file-score").value = "";
-  $("train-summary").textContent =
-    "No train file loaded (using sample is fine).";
-  $("score-summary").textContent =
-    "No scoring file loaded (using sample is fine).";
+  const trainSummary = $("train-summary");
+  const scoreSummary = $("score-summary");
+  if (trainSummary) {
+    trainSummary.textContent =
+      "Using built-in train_web.csv (5630 rows) by default.";
+  }
+  if (scoreSummary) {
+    scoreSummary.textContent =
+      "Using built-in scoring_web.csv (5630 rows) by default.";
+  }
 
   updateDatasetSummary();
   updateMetricsUI(null, null, null);
   const tbody = $("score-table").querySelector("tbody");
   tbody.innerHTML = "";
 
-  $("threshold-slider").value = 0.5;
-  $("threshold-display").textContent = "0.50";
+  const slider = $("threshold-slider");
+  if (slider) {
+    slider.value = 0.5;
+    $("threshold-display").textContent = "0.50";
+  }
 
   if (rocChart) {
     rocChart.destroy();
     rocChart = null;
   }
 
-  $("log-console").innerHTML = "";
-  setStatus("Model ready (you can reload data).");
+  const consoleEl = $("log-console");
+  if (consoleEl) consoleEl.innerHTML = "";
+
+  updateOverviewUI();
+
+  setStatus("Dashboard reset – reload to start again.");
   log("State reset. You can reload data and start over.", "info");
+}
+
+/* ---------- Auto pipeline ---------- */
+
+async function runAutoPipeline() {
+  try {
+    setBusy(true, "Loading data & building dashboard…");
+    await handleLoadSampleData(true);
+    handlePreprocess(true);
+    if (model) {
+      await handleTrain(true);
+      await handleEvaluate(true);
+    }
+    await handleScore(true);
+    setStatus("Dashboard ready – data loaded.");
+  } catch (err) {
+    log(`Auto-init pipeline failed: ${err.message}`, "error");
+    setStatus("Dashboard error – see log.");
+  } finally {
+    setBusy(false);
+  }
 }
 
 /* ---------- Init ---------- */
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+  const slider = $("threshold-slider");
+  if (slider) {
+    slider.value = 0.5;
+    $("threshold-display").textContent = "0.50";
+  }
+
+  log("App initializing…", "info");
   setStatus("Loading model & config…");
-  loadConfigAndModel().then(() => {
-    if (model) {
-      setStatus("Model ready – load data to begin.");
-    }
-  });
 
-  $("btn-load-data").addEventListener("click", handleLoadSampleData);
-  $("file-train").addEventListener("change", handleTrainFileChange);
-  $("file-score").addEventListener("change", handleScoreFileChange);
-  $("btn-preprocess").addEventListener("click", handlePreprocess);
-  $("btn-train").addEventListener("click", handleTrain);
-  $("btn-evaluate").addEventListener("click", handleEvaluate);
-  $("btn-score").addEventListener("click", handleScore);
-  $("btn-export-model").addEventListener("click", handleExportModel);
-  $("btn-export-metrics-json").addEventListener("click", handleExportMetricsJson);
-  $("btn-export-metrics-csv").addEventListener("click", handleExportMetricsCsv);
-  $("btn-export-scores").addEventListener("click", handleExportScores);
-  $("btn-reset").addEventListener("click", handleReset);
-  $("threshold-slider").addEventListener("input", handleThresholdChange);
+  await loadConfigAndModel();
+  await runAutoPipeline();
 
-  $("threshold-display").textContent = "0.50";
-  log("App initialized. Load sample data or upload your own CSVs to begin.", "info");
+  // Wire manual/advanced controls
+  const loadBtn = $("btn-load-data");
+  if (loadBtn) loadBtn.addEventListener("click", () => handleLoadSampleData());
+
+  const preBtn = $("btn-preprocess");
+  if (preBtn) preBtn.addEventListener("click", () => handlePreprocess());
+
+  const resetBtn = $("btn-reset");
+  if (resetBtn) resetBtn.addEventListener("click", handleReset);
+
+  const trainBtn = $("btn-train");
+  if (trainBtn) trainBtn.addEventListener("click", () => handleTrain());
+
+  const evalBtn = $("btn-evaluate");
+  if (evalBtn) evalBtn.addEventListener("click", () => handleEvaluate());
+
+  const scoreBtn = $("btn-score");
+  if (scoreBtn) scoreBtn.addEventListener("click", () => handleScore());
+
+  const exportModelBtn = $("btn-export-model");
+  if (exportModelBtn)
+    exportModelBtn.addEventListener("click", handleExportModel);
+
+  const exportMetricsJsonBtn = $("btn-export-metrics-json");
+  if (exportMetricsJsonBtn)
+    exportMetricsJsonBtn.addEventListener("click", handleExportMetricsJson);
+
+  const exportMetricsCsvBtn = $("btn-export-metrics-csv");
+  if (exportMetricsCsvBtn)
+    exportMetricsCsvBtn.addEventListener("click", handleExportMetricsCsv);
+
+  const exportScoresBtn = $("btn-export-scores");
+  if (exportScoresBtn)
+    exportScoresBtn.addEventListener("click", handleExportScores);
+
+  const fileTrain = $("file-train");
+  if (fileTrain) fileTrain.addEventListener("change", handleTrainFileChange);
+
+  const fileScore = $("file-score");
+  if (fileScore) fileScore.addEventListener("change", handleScoreFileChange);
+
+  const riskFilter = $("filter-risk");
+  if (riskFilter) riskFilter.addEventListener("change", filterAndRenderTable);
+
+  const searchId = $("search-id");
+  if (searchId) searchId.addEventListener("input", filterAndRenderTable);
+
+  if (slider) slider.addEventListener("input", handleThresholdChange);
+
+  log("Dashboard initialized. Data has been loaded and scored automatically.", "info");
 });
